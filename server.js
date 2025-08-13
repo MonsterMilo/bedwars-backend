@@ -117,13 +117,29 @@ app.get('/sweats', async (req, res) => {
   }
 });
 
-// POST add a sweat
+// POST add a sweat (with Urchin tags)
 app.post('/sweats', async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.username) return res.status(400).json({ error: 'username required' });
 
-    const dateAdded = body.dateAdded || new Date().toISOString().slice(0, 10);
+    const dateAdded = body.dateAdded || (new Date().toISOString().slice(0, 10));
+
+    // --- Fetch Urchin tags ---
+    let urchinTags = [];
+    try {
+      // Replace this URL with your actual Urchin API endpoint
+      const urchinRes = await axios.get(`https://api.urchin.com/tags/${encodeURIComponent(body.username)}`, {
+        timeout: 10_000
+      });
+      if (urchinRes.data && Array.isArray(urchinRes.data.tags)) {
+        urchinTags = urchinRes.data.tags;
+      }
+    } catch (err) {
+      console.warn('Urchin API fetch failed for', body.username, err.message);
+      // optional: you can leave urchinTags empty if fetch fails
+    }
+
     const doc = new Sweat({
       username: body.username,
       uuid: body.uuid || null,
@@ -143,15 +159,18 @@ app.post('/sweats', async (req, res) => {
       aballs: !!body.aballs,
       zoiv: !!body.zoiv,
       dateAdded,
-      urchin: [] // start empty; GET will fetch tags later
+      urchin: urchinTags
     });
+
     const saved = await doc.save();
     return res.status(201).json(saved);
+
   } catch (err) {
     console.error('/sweats POST error', err);
     return res.status(500).json({ error: 'DB write error' });
   }
 });
+
 
 // DELETE a sweat
 app.delete('/sweats/:id', async (req, res) => {
