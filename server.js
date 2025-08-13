@@ -18,9 +18,9 @@ const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
 const URCHIN_KEY = process.env.URCHIN_KEY;
 const PORT = process.env.PORT || 3000;
 
-if (!MONGODB_URI) console.warn('Warning: MONGODB_URI not set. DB features will fail until set.');
-if (!HYPIXEL_API_KEY) console.warn('Warning: HYPIXEL_API_KEY not set. Hypixel requests will fail until set.');
-if (!URCHIN_KEY) console.warn('Warning: URCHIN_KEY not set. Blacklist check will not work.');
+if (!MONGODB_URI) console.warn('Warning: MONGODB_URI not set.');
+if (!HYPIXEL_API_KEY) console.warn('Warning: HYPIXEL_API_KEY not set.');
+if (!URCHIN_KEY) console.warn('Warning: URCHIN_KEY not set.');
 
 // --- MongoDB setup ---
 mongoose.set('strictQuery', false);
@@ -50,32 +50,30 @@ const sweatSchema = new mongoose.Schema({
   potat: { type: Boolean, default: false },
   aballs: { type: Boolean, default: false },
   zoiv: { type: Boolean, default: false },
-  urchin: { type: [String], default: [] }, // <-- added
+  urchin: { type: [String], default: [] }, // array of tags
   dateAdded: String,
   createdAt: { type: Date, default: Date.now }
 });
 
 const Sweat = mongoose.model('Sweat', sweatSchema);
 
-// --- Health ---
+// --- Health check ---
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// --- Mojang proxy ---
+// --- Mojang UUID proxy ---
 app.get('/mojang/:username', async (req, res) => {
   try {
     const username = req.params.username;
     const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`, { timeout: 10_000 });
     return res.json(mojangRes.data);
   } catch (err) {
-    if (err.response && (err.response.status === 204 || err.response.status === 404)) {
-      return res.status(404).json({ error: 'Not found' });
-    }
+    if (err.response && (err.response.status === 204 || err.response.status === 404)) return res.status(404).json({ error: 'Not found' });
     console.error('/mojang error', err.message);
     return res.status(500).json({ error: 'Mojang proxy error', details: err.message });
   }
 });
 
-// --- Hypixel proxy with Urchin check ---
+// --- Hypixel player data with urchin tags ---
 app.get('/player/:uuid', async (req, res) => {
   try {
     const uuid = req.params.uuid;
@@ -88,11 +86,18 @@ app.get('/player/:uuid', async (req, res) => {
 
     const playerData = hypRes.data;
 
-    // Check for Urchin tag
-    const tags = (playerData?.player?.tags) || [];
-    const blacklisted = URCHIN_KEY ? tags.includes(URCHIN_KEY) : false;
+    // Fetch urchin tags from external API
+    let urchinTags = [];
+    if (URCHIN_KEY && playerData?.player?.displayname) {
+      try {
+        const urchinRes = await axios.get(`https://api.urchin.gg/tags/${encodeURIComponent(playerData.player.displayname)}`, { timeout: 10_000 });
+        urchinTags = Array.isArray(urchinRes.data.tags) ? urchinRes.data.tags : [];
+      } catch (err) {
+        console.warn('Urchin API fetch failed for', playerData.player.displayname);
+      }
+    }
 
-    return res.json({ ...playerData, blacklisted });
+    return res.json({ ...playerData, urchin: urchinTags.length ? urchinTags : ['none'] });
   } catch (err) {
     console.error('/player error', err.message);
     return res.status(500).json({ error: 'Hypixel proxy error', details: err.message });
@@ -100,24 +105,32 @@ app.get('/player/:uuid', async (req, res) => {
 });
 
 // --- Sweats API ---
-// GET all sweats
 app.get('/sweats', async (req, res) => {
   try {
     const docs = await Sweat.find({}).sort({ createdAt: -1 }).lean();
-    return res.json(docs);
+    return res.json(docs.map(d => ({ ...d, urchin: d.urchin.length ? d.urchin : ['none'] })));
   } catch (err) {
     console.error('/sweats GET error', err);
     return res.status(500).json({ error: 'DB read error' });
   }
 });
 
-// POST add a sweat
 app.post('/sweats', async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.username) return res.status(400).json({ error: 'username required' });
 
-    const dateAdded = body.dateAdded || (new Date().toISOString().slice(0, 10));
+    let urchinTags = [];
+    if (URCHIN_KEY) {
+      try {
+        const urchinRes = await axios.get(`https://api.urchin.gg/tags/${encodeURIComponent(body.username)}`, { timeout: 10_000 });
+        urchinTags = Array.isArray(urchinRes.data.tags) ? urchinRes.data.tags : [];
+      } catch {
+        urchinTags = [];
+      }
+    }
+
+    const dateAdded = body.dateAdded || new Date().toISOString().slice(0, 10);
     const doc = new Sweat({
       username: body.username,
       uuid: body.uuid || null,
@@ -136,7 +149,7 @@ app.post('/sweats', async (req, res) => {
       potat: !!body.potat,
       aballs: !!body.aballs,
       zoiv: !!body.zoiv,
-      urchin: Array.isArray(body.urchin) ? body.urchin : [], // <-- fixed
+      urchin: urchinTags.length ? urchinTags : ['none'],
       dateAdded
     });
     const saved = await doc.save();
@@ -147,7 +160,22 @@ app.post('/sweats', async (req, res) => {
   }
 });
 
-// DELETE sweat by id
+app.patch('/sweats/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const updates = req.body || {};
+    const allowedFlags = ['milo', 'potat', 'aballs', 'zoiv', 'urchin'];
+    const set = {};
+    allowedFlags.forEach(k => { if (k in updates) set[k] = updates[k]; });
+    const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    return res.json(updated);
+  } catch (err) {
+    console.error('/sweats PATCH error', err);
+    return res.status(500).json({ error: 'DB update error' });
+  }
+});
+
 app.delete('/sweats/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -157,25 +185,6 @@ app.delete('/sweats/:id', async (req, res) => {
   } catch (err) {
     console.error('/sweats DELETE error', err);
     return res.status(500).json({ error: 'DB delete error' });
-  }
-});
-
-// PATCH update flags or urchin
-app.patch('/sweats/:id', async (req, res) => {
-  try {
-    const id = req.params.id;
-    const updates = req.body || {};
-    const allowed = ['milo','potat','aballs','zoiv','urchin'];
-    const set = {};
-    allowed.forEach(k => {
-      if (k in updates) set[k] = (k === 'urchin' ? updates[k] : !!updates[k]);
-    });
-    const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
-    if (!updated) return res.status(404).json({ error: 'Not found' });
-    return res.json(updated);
-  } catch (err) {
-    console.error('/sweats PATCH error', err);
-    return res.status(500).json({ error: 'DB update error' });
   }
 });
 
