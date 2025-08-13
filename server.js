@@ -15,14 +15,12 @@ app.use(express.json({ limit: '1mb' }));
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
-const URCHIN_KEY = process.env.URCHIN_KEY;
+const URCHIN_KEY = process.env.URCHIN_KEY; // optional, for fetching your community API
 const PORT = process.env.PORT || 3000;
 
 if (!MONGODB_URI) console.warn('Warning: MONGODB_URI not set.');
 if (!HYPIXEL_API_KEY) console.warn('Warning: HYPIXEL_API_KEY not set.');
-if (!URCHIN_KEY) console.warn('Warning: URCHIN_KEY not set.');
 
-// --- MongoDB setup ---
 mongoose.set('strictQuery', false);
 mongoose
   .connect(MONGODB_URI || 'mongodb://localhost:27017/bedwars', {
@@ -50,30 +48,30 @@ const sweatSchema = new mongoose.Schema({
   potat: { type: Boolean, default: false },
   aballs: { type: Boolean, default: false },
   zoiv: { type: Boolean, default: false },
-  urchin: { type: [String], default: [] }, // array of tags
   dateAdded: String,
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+  urchin: { type: [String], default: [] } // store Urchin tags
 });
 
 const Sweat = mongoose.model('Sweat', sweatSchema);
 
-// --- Health check ---
+// --- Health ---
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// --- Mojang UUID proxy ---
+// --- Mojang proxy ---
 app.get('/mojang/:username', async (req, res) => {
   try {
     const username = req.params.username;
     const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`, { timeout: 10_000 });
     return res.json(mojangRes.data);
   } catch (err) {
-    if (err.response && (err.response.status === 204 || err.response.status === 404)) return res.status(404).json({ error: 'Not found' });
+    if (err.response && [204, 404].includes(err.response.status)) return res.status(404).json({ error: 'Not found' });
     console.error('/mojang error', err.message);
     return res.status(500).json({ error: 'Mojang proxy error', details: err.message });
   }
 });
 
-// --- Hypixel player data with urchin tags ---
+// --- Hypixel proxy ---
 app.get('/player/:uuid', async (req, res) => {
   try {
     const uuid = req.params.uuid;
@@ -83,21 +81,7 @@ app.get('/player/:uuid', async (req, res) => {
       params: { key: HYPIXEL_API_KEY, uuid },
       timeout: 15_000
     });
-
-    const playerData = hypRes.data;
-
-    // Fetch urchin tags from external API
-    let urchinTags = [];
-    if (URCHIN_KEY && playerData?.player?.displayname) {
-      try {
-        const urchinRes = await axios.get(`https://api.urchin.gg/tags/${encodeURIComponent(playerData.player.displayname)}`, { timeout: 10_000 });
-        urchinTags = Array.isArray(urchinRes.data.tags) ? urchinRes.data.tags : [];
-      } catch (err) {
-        console.warn('Urchin API fetch failed for', playerData.player.displayname);
-      }
-    }
-
-    return res.json({ ...playerData, urchin: urchinTags.length ? urchinTags : ['none'] });
+    return res.json(hypRes.data);
   } catch (err) {
     console.error('/player error', err.message);
     return res.status(500).json({ error: 'Hypixel proxy error', details: err.message });
@@ -105,30 +89,39 @@ app.get('/player/:uuid', async (req, res) => {
 });
 
 // --- Sweats API ---
+// GET all sweats with Urchin tags
 app.get('/sweats', async (req, res) => {
   try {
     const docs = await Sweat.find({}).sort({ createdAt: -1 }).lean();
-    return res.json(docs.map(d => ({ ...d, urchin: d.urchin.length ? d.urchin : ['none'] })));
+
+    // fetch Urchin tags for each player (safe handling)
+    for (let doc of docs) {
+      try {
+        if (!URCHIN_KEY) {
+          doc.urchin = []; // no key configured, return empty
+        } else {
+          const resp = await axios.get(`https://api.urchin.example/tags/${encodeURIComponent(doc.username)}`, { timeout: 5000 });
+          doc.urchin = Array.isArray(resp.data.tags) ? resp.data.tags : [];
+        }
+      } catch (err) {
+        console.warn(`Urchin API fetch failed for ${doc.username}`);
+        doc.urchin = [];
+      }
+      if (!doc.urchin || doc.urchin.length === 0) doc.urchin = ['none']; // default fallback
+    }
+
+    return res.json(docs);
   } catch (err) {
     console.error('/sweats GET error', err);
     return res.status(500).json({ error: 'DB read error' });
   }
 });
 
+// POST add a sweat
 app.post('/sweats', async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.username) return res.status(400).json({ error: 'username required' });
-
-    let urchinTags = [];
-    if (URCHIN_KEY) {
-      try {
-        const urchinRes = await axios.get(`https://api.urchin.gg/tags/${encodeURIComponent(body.username)}`, { timeout: 10_000 });
-        urchinTags = Array.isArray(urchinRes.data.tags) ? urchinRes.data.tags : [];
-      } catch {
-        urchinTags = [];
-      }
-    }
 
     const dateAdded = body.dateAdded || new Date().toISOString().slice(0, 10);
     const doc = new Sweat({
@@ -149,8 +142,8 @@ app.post('/sweats', async (req, res) => {
       potat: !!body.potat,
       aballs: !!body.aballs,
       zoiv: !!body.zoiv,
-      urchin: urchinTags.length ? urchinTags : ['none'],
-      dateAdded
+      dateAdded,
+      urchin: [] // start empty; GET will fetch tags later
     });
     const saved = await doc.save();
     return res.status(201).json(saved);
@@ -160,22 +153,7 @@ app.post('/sweats', async (req, res) => {
   }
 });
 
-app.patch('/sweats/:id', async (req, res) => {
-  try {
-    const id = req.params.id;
-    const updates = req.body || {};
-    const allowedFlags = ['milo', 'potat', 'aballs', 'zoiv', 'urchin'];
-    const set = {};
-    allowedFlags.forEach(k => { if (k in updates) set[k] = updates[k]; });
-    const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
-    if (!updated) return res.status(404).json({ error: 'Not found' });
-    return res.json(updated);
-  } catch (err) {
-    console.error('/sweats PATCH error', err);
-    return res.status(500).json({ error: 'DB update error' });
-  }
-});
-
+// DELETE a sweat
 app.delete('/sweats/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -185,6 +163,23 @@ app.delete('/sweats/:id', async (req, res) => {
   } catch (err) {
     console.error('/sweats DELETE error', err);
     return res.status(500).json({ error: 'DB delete error' });
+  }
+});
+
+// PATCH update beaten-by flags
+app.patch('/sweats/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const updates = req.body || {};
+    const allowed = ['milo','potat','aballs','zoiv'];
+    const set = {};
+    allowed.forEach(k => { if (k in updates) set[k] = !!updates[k]; });
+    const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    return res.json(updated);
+  } catch (err) {
+    console.error('/sweats PATCH error', err);
+    return res.status(500).json({ error: 'DB update error' });
   }
 });
 
