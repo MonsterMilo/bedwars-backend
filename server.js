@@ -58,6 +58,7 @@ const sweatSchema = new mongoose.Schema({
   zoiv: { type: Boolean, default: false },
   dateAdded: String, // e.g. "2025-08-09" (YYYY-MM-DD)
   createdAt: { type: Date, default: Date.now }
+  urchin: { type: [String], default: [] },
 });
 
 const Sweat = mongoose.model('Sweat', sweatSchema);
