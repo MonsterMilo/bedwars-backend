@@ -2,6 +2,7 @@
 require('dotenv').config();
 console.log('MONGODB_URI:', process.env.MONGODB_URI);
 console.log('HYPIXEL_API_KEY:', process.env.HYPIXEL_API_KEY);
+console.log('URCHIN_KEY:', process.env.URCHIN_KEY);
 
 const express = require('express');
 const cors = require('cors');
@@ -14,6 +15,7 @@ app.use(express.json({ limit: '1mb' }));
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
+const URCHIN_KEY = process.env.URCHIN_KEY;
 const PORT = process.env.PORT || 3000;
 
 if (!MONGODB_URI) {
@@ -21,6 +23,9 @@ if (!MONGODB_URI) {
 }
 if (!HYPIXEL_API_KEY) {
   console.warn('Warning: HYPIXEL_API_KEY not set. Hypixel requests will fail until set.');
+}
+if (!URCHIN_KEY) {
+  console.warn('Warning: URCHIN_KEY not set. Blacklist check will not work.');
 }
 
 // --- MongoDB (Mongoose) setup ---
@@ -65,7 +70,6 @@ app.get('/mojang/:username', async (req, res) => {
   try {
     const username = req.params.username;
     const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`, { timeout: 10_000 });
-    // returns { id, name }
     return res.json(mojangRes.data);
   } catch (err) {
     if (err.response && err.response.status === 204) return res.status(404).json({ error: 'Not found' });
@@ -75,7 +79,7 @@ app.get('/mojang/:username', async (req, res) => {
   }
 });
 
-// --- Hypixel proxy: get player data by UUID ---
+// --- Hypixel proxy: get player data by UUID with urchin blacklist check ---
 app.get('/player/:uuid', async (req, res) => {
   try {
     const uuid = req.params.uuid;
@@ -85,7 +89,14 @@ app.get('/player/:uuid', async (req, res) => {
       params: { key: HYPIXEL_API_KEY, uuid },
       timeout: 15_000
     });
-    return res.json(hypRes.data);
+
+    const playerData = hypRes.data;
+
+    // Check for Urchin tag
+    const tags = (playerData?.player?.tags) || [];
+    const blacklisted = URCHIN_KEY ? tags.includes(URCHIN_KEY) : false;
+
+    return res.json({ ...playerData, blacklisted });
   } catch (err) {
     console.error('/player error', err.message);
     return res.status(500).json({ error: 'Hypixel proxy error', details: err.message });
