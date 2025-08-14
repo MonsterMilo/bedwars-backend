@@ -92,6 +92,14 @@ app.get('/player/:uuid', async (req, res) => {
   }
 });
 
+app.get('/urchin/:username', async (req, res) => {
+  const username = req.params.username;
+  const urchinKey = process.env.URCHIN_KEY;
+  const response = await fetch(`https://urchin.ws/player/${username}?key=${urchinKey}&sources=MANUAL`);
+  const data = await response.json();
+  res.json(data);
+});
+
 // --- Sweats API: shared DB ---
 // GET all sweats (sorted newest first)
 app.get('/sweats', async (req, res) => {
