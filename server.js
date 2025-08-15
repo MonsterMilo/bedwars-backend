@@ -7,10 +7,10 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
-// const fetch = require('node-fetch'); // Needed for Urchin API fetch
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 const app = express();
-app.use(cors()); // allow any origin; you can tighten this later
+app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -18,24 +18,16 @@ const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
 const URCHIN_KEY = process.env.URCHIN_KEY;
 const PORT = process.env.PORT || 3000;
 
-if (!MONGODB_URI) {
-  console.warn('Warning: MONGODB_URI not set. DB features will fail until set.');
-}
-if (!HYPIXEL_API_KEY) {
-  console.warn('Warning: HYPIXEL_API_KEY not set. Hypixel requests will fail until set.');
-}
-if (!URCHIN_KEY) {
-  console.warn('Warning: URCHIN_KEY not set. Urchin requests will fail until set.');
-}
+if (!MONGODB_URI) console.warn('Warning: MONGODB_URI not set.');
+if (!HYPIXEL_API_KEY) console.warn('Warning: HYPIXEL_API_KEY not set.');
+if (!URCHIN_KEY) console.warn('Warning: URCHIN_KEY not set.');
 
-// --- MongoDB (Mongoose) setup ---
+// --- MongoDB setup ---
 mongoose.set('strictQuery', false);
-mongoose
-  .connect(MONGODB_URI || 'mongodb://localhost:27017/bedwars', {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-  })
-  .then(() => console.log('Connected to MongoDB'))
+mongoose.connect(MONGODB_URI || 'mongodb://localhost:27017/bedwars', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => console.log('Connected to MongoDB'))
   .catch(err => console.warn('MongoDB connection error:', err.message));
 
 const sweatSchema = new mongoose.Schema({
@@ -56,9 +48,9 @@ const sweatSchema = new mongoose.Schema({
   potat: { type: Boolean, default: false },
   aballs: { type: Boolean, default: false },
   zoiv: { type: Boolean, default: false },
-  dateAdded: String, // e.g. "2025-08-09" (YYYY-MM-DD)
+  dateAdded: String,
   createdAt: { type: Date, default: Date.now },
-  urchinTag: String // NEW field for Urchin tag
+  urchinTag: String
 });
 
 const Sweat = mongoose.model('Sweat', sweatSchema);
@@ -66,21 +58,20 @@ const Sweat = mongoose.model('Sweat', sweatSchema);
 // --- Health ---
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// --- Mojang proxy: get UUID and corrected name ---
+// --- Mojang proxy ---
 app.get('/mojang/:username', async (req, res) => {
   try {
     const username = req.params.username;
     const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`, { timeout: 10_000 });
     return res.json(mojangRes.data);
   } catch (err) {
-    if (err.response && err.response.status === 204) return res.status(404).json({ error: 'Not found' });
-    if (err.response && err.response.status === 404) return res.status(404).json({ error: 'Not found' });
+    if (err.response?.status === 204 || err.response?.status === 404) return res.status(404).json({ error: 'Not found' });
     console.error('/mojang error', err.message);
     return res.status(500).json({ error: 'Mojang proxy error', details: err.message });
   }
 });
 
-// --- Hypixel proxy: get player data by UUID ---
+// --- Hypixel proxy ---
 app.get('/player/:uuid', async (req, res) => {
   try {
     const uuid = req.params.uuid;
@@ -112,39 +103,18 @@ app.get('/urchin/:username', async (req, res) => {
   }
 });
 
-// --- Sweats API ---
-// GET all sweats (sorted newest first) + include Urchin tags
+// --- GET all sweats ---
 app.get('/sweats', async (req, res) => {
   try {
     const docs = await Sweat.find({}).sort({ createdAt: -1 }).lean();
-
-    // Fetch Urchin tags for each player
-    const sweatsWithTags = await Promise.all(
-      docs.map(async (s) => {
-        try {
-          const response = await fetch(`https://urchin.ws/player/${s.username}?key=${URCHIN_KEY}&sources=MANUAL`);
-          const data = await response.json();
-          if (data.tags && data.tags.length > 0) {
-            s.urchinTag = data.tags.map(tag => tag.type).join(", ");
-          } else {
-            s.urchinTag = null;
-          }
-        } catch (err) {
-          console.error(`Failed to fetch Urchin tag for ${s.username}:`, err.message);
-          s.urchinTag = null;
-        }
-        return s;
-      })
-    );
-
-    return res.json(sweatsWithTags);
+    return res.json(docs); // Already stored tag, no external fetch
   } catch (err) {
     console.error('/sweats GET error', err);
     return res.status(500).json({ error: 'DB read error' });
   }
 });
 
-// POST add a sweat
+// --- POST add a sweat ---
 app.post('/sweats', async (req, res) => {
   try {
     const body = req.body || {};
@@ -152,16 +122,16 @@ app.post('/sweats', async (req, res) => {
 
     const dateAdded = body.dateAdded || (new Date().toISOString().slice(0, 10));
 
-    // --- Fetch Urchin tag for this player ---
+    // Fetch Urchin tag once
     let urchinTag = null;
     try {
       const response = await fetch(`https://urchin.ws/player/${body.username}?key=${URCHIN_KEY}&sources=MANUAL`);
       const data = await response.json();
-      if (data.tags && data.tags.length > 0) {
+      if (data.tags?.length > 0) {
         urchinTag = data.tags.map(tag => tag.type).join(", ");
       }
     } catch (err) {
-      console.error(`Failed to fetch Urchin tag for ${body.username}:`, err.message);
+      console.warn(`Failed to fetch Urchin tag for ${body.username}:`, err.message);
     }
 
     const doc = new Sweat({
@@ -183,7 +153,7 @@ app.post('/sweats', async (req, res) => {
       aballs: !!body.aballs,
       zoiv: !!body.zoiv,
       dateAdded,
-      urchinTag // store the tag fetched from Urchin
+      urchinTag
     });
 
     const saved = await doc.save();
@@ -194,8 +164,7 @@ app.post('/sweats', async (req, res) => {
   }
 });
 
-
-// DELETE remove a sweat by id
+// --- DELETE a sweat ---
 app.delete('/sweats/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -208,7 +177,7 @@ app.delete('/sweats/:id', async (req, res) => {
   }
 });
 
-// optional: update beaten-by flags (PATCH)
+// --- PATCH update flags ---
 app.patch('/sweats/:id', async (req, res) => {
   try {
     const id = req.params.id;
