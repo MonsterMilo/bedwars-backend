@@ -109,25 +109,12 @@ app.get('/urchin/:username', async (req, res) => {
 });
 
 // --- Sweats API ---
-// GET all sweats
+// GET all sweats (sorted newest first, no external API calls)
 app.get('/sweats', async (req, res) => {
   try {
     const docs = await Sweat.find({}).sort({ createdAt: -1 }).lean();
-    const sweatsWithTags = await Promise.all(docs.map(async (s) => {
-      try {
-        const response = await axios.get(`https://urchin.ws/player/${s.username}`, {
-          params: { key: URCHIN_KEY, sources: 'MANUAL' },
-          timeout: 10000
-        });
-        const data = response.data;
-        s.urchinTag = data.tags?.length > 0 ? data.tags.map(tag => tag.type).join(", ") : null;
-      } catch (err) {
-        console.error(`Failed to fetch Urchin tag for ${s.username}:`, err.message);
-        s.urchinTag = null;
-      }
-      return s;
-    }));
-    return res.json(sweatsWithTags);
+    // Return stored urchinTag directly
+    return res.json(docs);
   } catch (err) {
     console.error('/sweats GET error', err);
     return res.status(500).json({ error: 'DB read error' });
@@ -142,17 +129,20 @@ app.post('/sweats', async (req, res) => {
 
     const dateAdded = body.dateAdded || (new Date().toISOString().slice(0, 10));
 
-    // Fetch Urchin tag
+    // Fetch Urchin tag once using Axios
     let urchinTag = null;
     try {
       const response = await axios.get(`https://urchin.ws/player/${body.username}`, {
         params: { key: URCHIN_KEY, sources: 'MANUAL' },
-        timeout: 10000
+        timeout: 5000 // shorter timeout to avoid blocking
       });
       const data = response.data;
-      if (data.tags?.length > 0) urchinTag = data.tags.map(tag => tag.type).join(", ");
+      if (data.tags?.length > 0) {
+        urchinTag = data.tags.map(tag => tag.type).join(", ");
+      }
     } catch (err) {
       console.warn(`Failed to fetch Urchin tag for ${body.username}:`, err.message);
+      urchinTag = null; // store null if API fails
     }
 
     const doc = new Sweat({
