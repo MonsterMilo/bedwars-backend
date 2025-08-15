@@ -122,11 +122,14 @@ app.post('/sweats', async (req, res) => {
 
     const dateAdded = body.dateAdded || (new Date().toISOString().slice(0, 10));
 
-    // Fetch Urchin tag once
+    // Fetch Urchin tag using Axios
     let urchinTag = null;
     try {
-      const response = await fetch(`https://urchin.ws/player/${body.username}?key=${URCHIN_KEY}&sources=MANUAL`);
-      const data = await response.json();
+      const response = await axios.get(`https://urchin.ws/player/${body.username}`, {
+        params: { key: URCHIN_KEY, sources: 'MANUAL' },
+        timeout: 10000
+      });
+      const data = response.data;
       if (data.tags?.length > 0) {
         urchinTag = data.tags.map(tag => tag.type).join(", ");
       }
