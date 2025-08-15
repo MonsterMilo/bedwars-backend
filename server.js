@@ -137,6 +137,7 @@ app.post('/sweats', async (req, res) => {
         timeout: 5000 // shorter timeout to avoid blocking
       });
       const data = response.data;
+      console.log(`Urchin response for ${body.username}:`, data); // <-- log it
       if (data.tags?.length > 0) {
         urchinTag = data.tags.map(tag => tag.type).join(", ");
       }
