@@ -151,6 +151,19 @@ app.post('/sweats', async (req, res) => {
     if (!body.username) return res.status(400).json({ error: 'username required' });
 
     const dateAdded = body.dateAdded || (new Date().toISOString().slice(0, 10));
+
+    // --- Fetch Urchin tag for this player ---
+    let urchinTag = null;
+    try {
+      const response = await fetch(`https://urchin.ws/player/${body.username}?key=${URCHIN_KEY}&sources=MANUAL`);
+      const data = await response.json();
+      if (data.tags && data.tags.length > 0) {
+        urchinTag = data.tags.map(tag => tag.type).join(", ");
+      }
+    } catch (err) {
+      console.error(`Failed to fetch Urchin tag for ${body.username}:`, err.message);
+    }
+
     const doc = new Sweat({
       username: body.username,
       uuid: body.uuid || null,
@@ -170,8 +183,9 @@ app.post('/sweats', async (req, res) => {
       aballs: !!body.aballs,
       zoiv: !!body.zoiv,
       dateAdded,
-      urchinTag: body.urchinTag || null
+      urchinTag // store the tag fetched from Urchin
     });
+
     const saved = await doc.save();
     return res.status(201).json(saved);
   } catch (err) {
@@ -179,6 +193,7 @@ app.post('/sweats', async (req, res) => {
     return res.status(500).json({ error: 'DB write error' });
   }
 });
+
 
 // DELETE remove a sweat by id
 app.delete('/sweats/:id', async (req, res) => {
