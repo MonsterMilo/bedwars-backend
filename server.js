@@ -7,7 +7,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
-const fetch = require('node-fetch'); // Needed for Urchin API fetch
+// const fetch = require('node-fetch'); // Needed for Urchin API fetch
 
 const app = express();
 app.use(cors()); // allow any origin; you can tighten this later
