@@ -98,7 +98,7 @@ app.get('/urchin/:username', async (req, res) => {
   const urchinKey = process.env.URCHIN_KEY;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
+  const timeout = setTimeout(() => controller.abort(), 3500); // 3.5s timeout
 
   try {
     const response = await fetch(
