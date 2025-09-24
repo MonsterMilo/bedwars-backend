@@ -97,10 +97,16 @@ app.get('/urchin/:username', async (req, res) => {
   const username = req.params.username;
   const urchinKey = process.env.URCHIN_KEY;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
+
   try {
     const response = await fetch(
-      `https://urchin.ws/player/${username}?key=${urchinKey}&sources=MANUAL`
+      `https://urchin.ws/player/${username}?key=${urchinKey}&sources=MANUAL`,
+      { signal: controller.signal }
     );
+
+    clearTimeout(timeout);
 
     if (!response.ok) {
       throw new Error(`Urchin API error: ${response.status}`);
@@ -112,7 +118,7 @@ app.get('/urchin/:username', async (req, res) => {
   } catch (err) {
     console.error("Urchin fetch failed:", err.message);
 
-    // Send a fallback response instead of crashing
+    // Always respond with safe fallback
     res.json({ error: "Urchin service unavailable", username });
   }
 });
