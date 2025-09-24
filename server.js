@@ -96,9 +96,25 @@ app.get('/player/:uuid', async (req, res) => {
 app.get('/urchin/:username', async (req, res) => {
   const username = req.params.username;
   const urchinKey = process.env.URCHIN_KEY;
-  const response = await fetch(`https://urchin.ws/player/${username}?key=${urchinKey}&sources=MANUAL`);
-  const data = await response.json();
-  res.json(data);
+
+  try {
+    const response = await fetch(
+      `https://urchin.ws/player/${username}?key=${urchinKey}&sources=MANUAL`
+    );
+
+    if (!response.ok) {
+      throw new Error(`Urchin API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    res.json(data);
+
+  } catch (err) {
+    console.error("Urchin fetch failed:", err.message);
+
+    // Send a fallback response instead of crashing
+    res.json({ error: "Urchin service unavailable", username });
+  }
 });
 
 // --- Sweats API: shared DB ---
