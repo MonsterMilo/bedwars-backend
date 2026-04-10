@@ -279,8 +279,13 @@ app.get('/stats/uuid/:uuid', async (req, res) => {
 
     const star = player.achievements?.bedwars_level || 0;
 
+    // 🔥 NEW: get original Mongo name
+    const sweatDoc = await Sweat.findOne({ uuid }).lean();
+
     res.json({
-      username: player.displayname,
+      currentName: player.displayname,
+      originalName: sweatDoc?.username || player.displayname,
+
       star,
       fkdr: finals / finalDeaths,
       wlr: wins / losses,
