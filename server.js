@@ -201,4 +201,54 @@ app.patch('/sweats/:id', async (req, res) => {
   }
 });
 
+app.get('/stats/:username', async (req, res) => {
+  try {
+    const username = req.params.username;
+
+    const mojangRes = await axios.get(
+      `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`
+    );
+
+    if (!mojangRes.data) {
+      return res.status(404).json({ error: 'Player not found' });
+    }
+
+    const uuid = mojangRes.data.id;
+
+    const hypRes = await axios.get('https://api.hypixel.net/player', {
+      params: { key: HYPIXEL_API_KEY, uuid }
+    });
+
+    const player = hypRes.data.player;
+    if (!player) {
+      return res.status(404).json({ error: 'No Hypixel data' });
+    }
+
+    const bw = player.stats?.Bedwars || {};
+
+    const finals = bw.final_kills_bedwars || 0;
+    const finalDeaths = bw.final_deaths_bedwars || 1;
+
+    const wins = bw.wins_bedwars || 0;
+    const losses = bw.losses_bedwars || 1;
+
+    const star = player.achievements?.bedwars_level || 0;
+
+    res.json({
+      username,
+      star,
+      fkdr: finals / finalDeaths,
+      wlr: wins / losses,
+      finals,
+      finalDeaths,
+      wins,
+      losses
+    });
+
+  } catch (err) {
+    console.error('/stats error', err.message);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
