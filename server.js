@@ -251,4 +251,49 @@ app.get('/stats/:username', async (req, res) => {
   }
 });
 
+// --- UUID-based stats (for modal only) ---
+app.get('/stats/uuid/:uuid', async (req, res) => {
+  try {
+    const uuid = req.params.uuid;
+
+    if (!HYPIXEL_API_KEY) {
+      return res.status(500).json({ error: 'HYPIXEL_API_KEY not configured' });
+    }
+
+    const hypRes = await axios.get('https://api.hypixel.net/player', {
+      params: { key: HYPIXEL_API_KEY, uuid }
+    });
+
+    const player = hypRes.data.player;
+    if (!player) {
+      return res.status(404).json({ error: 'No Hypixel data' });
+    }
+
+    const bw = player.stats?.Bedwars || {};
+
+    const finals = bw.final_kills_bedwars || 0;
+    const finalDeaths = bw.final_deaths_bedwars || 1;
+
+    const wins = bw.wins_bedwars || 0;
+    const losses = bw.losses_bedwars || 1;
+
+    const star = player.achievements?.bedwars_level || 0;
+
+    res.json({
+      username: player.displayname,
+      star,
+      fkdr: finals / finalDeaths,
+      wlr: wins / losses,
+      finals,
+      finalDeaths,
+      wins,
+      losses
+    });
+
+  } catch (err) {
+    console.error('/stats/uuid error', err.message);
+    res.status(500).json({ error: 'Failed to fetch stats by UUID' });
+  }
+});
+
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
