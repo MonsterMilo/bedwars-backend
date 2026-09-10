@@ -1,20 +1,36 @@
 // server.js
 require('dotenv').config();
-console.log('MONGODB_URI:', process.env.MONGODB_URI);
-console.log('HYPIXEL_API_KEY:', process.env.HYPIXEL_API_KEY);
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const mongoose = require('mongoose');
 
 const app = express();
-app.use(cors()); // allow any origin; you can tighten this later
-app.use(express.json({ limit: '1mb' }));
+app.set('trust proxy', 1); // Render sits behind a proxy; needed for correct client IPs in rate limiting
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
+const ADMIN_KEY = process.env.ADMIN_KEY;
 const PORT = process.env.PORT || 3000;
+
+// Comma-separated list of allowed origins, e.g. "https://monstermilo.github.io"
+const ALLOWED_ORIGINS = (process.env.FRONTEND_ORIGIN || 'https://monstermilo.github.io')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+app.use(helmet());
+app.use(cors({
+  origin(origin, callback) {
+    // allow same-origin/non-browser requests (no Origin header, e.g. curl, health checks)
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  }
+}));
+app.use(express.json({ limit: '1mb' }));
 
 if (!MONGODB_URI) {
   console.warn('Warning: MONGODB_URI not set. DB features will fail until set.');
@@ -22,20 +38,37 @@ if (!MONGODB_URI) {
 if (!HYPIXEL_API_KEY) {
   console.warn('Warning: HYPIXEL_API_KEY not set. Hypixel requests will fail until set.');
 }
+if (!ADMIN_KEY) {
+  console.warn('Warning: ADMIN_KEY not set. Write endpoints (add/delete/update sweat) will be disabled.');
+}
+
+// Require a shared secret (sent as the x-admin-key header) for any request that
+// mutates the shared sweats list, so strangers who find the API URL can't spam or wipe it.
+function requireAdminKey(req, res, next) {
+  if (!ADMIN_KEY) return res.status(503).json({ error: 'Write access not configured on server' });
+  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ error: 'Invalid or missing admin key' });
+  next();
+}
+
+// Protects the Hypixel/Mojang/Urchin proxies (and the API key behind them) from being
+// hammered by anyone who finds the backend URL.
+const proxyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
 // --- MongoDB (Mongoose) setup ---
 mongoose.set('strictQuery', false);
 mongoose
-  .connect(MONGODB_URI || 'mongodb://localhost:27017/bedwars', {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-  })
+  .connect(MONGODB_URI || 'mongodb://localhost:27017/bedwars')
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.warn('MongoDB connection error:', err.message));
 
 const sweatSchema = new mongoose.Schema({
   username: { type: String, required: true },
-  uuid: String,
+  uuid: { type: String, index: true },
   star: Number,
   fkdr: Number,
   wlr: Number,
@@ -62,7 +95,7 @@ const Sweat = mongoose.model('Sweat', sweatSchema);
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 // --- Mojang proxy: get UUID and corrected name ---
-app.get('/mojang/:username', async (req, res) => {
+app.get('/mojang/:username', proxyLimiter, async (req, res) => {
   try {
     const username = req.params.username;
     const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`, { timeout: 10_000 });
@@ -77,7 +110,7 @@ app.get('/mojang/:username', async (req, res) => {
 });
 
 // --- Hypixel proxy: get player data by UUID ---
-app.get('/player/:uuid', async (req, res) => {
+app.get('/player/:uuid', proxyLimiter, async (req, res) => {
   try {
     const uuid = req.params.uuid;
     if (!HYPIXEL_API_KEY) return res.status(500).json({ error: 'HYPIXEL_API_KEY not configured' });
@@ -93,7 +126,7 @@ app.get('/player/:uuid', async (req, res) => {
   }
 });
 
-app.get('/urchin/:username', async (req, res) => {
+app.get('/urchin/:username', proxyLimiter, async (req, res) => {
   const username = req.params.username;
   const urchinKey = process.env.URCHIN_KEY;
 
@@ -127,7 +160,8 @@ app.get('/urchin/:username', async (req, res) => {
 // GET all sweats (sorted newest first)
 app.get('/sweats', async (req, res) => {
   try {
-    const docs = await Sweat.find({}).sort({ createdAt: -1 }).lean();
+    const limit = Math.min(parseInt(req.query.limit, 10) || 1000, 1000);
+    const docs = await Sweat.find({}).sort({ createdAt: -1 }).limit(limit).lean();
     return res.json(docs);
   } catch (err) {
     console.error('/sweats GET error', err);
@@ -136,7 +170,7 @@ app.get('/sweats', async (req, res) => {
 });
 
 // POST add a sweat
-app.post('/sweats', async (req, res) => {
+app.post('/sweats', requireAdminKey, async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.username) return res.status(400).json({ error: 'username required' });
@@ -172,7 +206,7 @@ app.post('/sweats', async (req, res) => {
 });
 
 // DELETE remove a sweat by id
-app.delete('/sweats/:id', async (req, res) => {
+app.delete('/sweats/:id', requireAdminKey, async (req, res) => {
   try {
     const id = req.params.id;
     const deleted = await Sweat.findByIdAndDelete(id).lean();
@@ -185,7 +219,7 @@ app.delete('/sweats/:id', async (req, res) => {
 });
 
 // optional: update beaten-by flags (PATCH)
-app.patch('/sweats/:id', async (req, res) => {
+app.patch('/sweats/:id', requireAdminKey, async (req, res) => {
   try {
     const id = req.params.id;
     const updates = req.body || {};
@@ -201,58 +235,8 @@ app.patch('/sweats/:id', async (req, res) => {
   }
 });
 
-app.get('/stats/:username', async (req, res) => {
-  try {
-    const username = req.params.username;
-
-    const mojangRes = await axios.get(
-      `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`
-    );
-
-    if (!mojangRes.data) {
-      return res.status(404).json({ error: 'Player not found' });
-    }
-
-    const uuid = mojangRes.data.id;
-
-    const hypRes = await axios.get('https://api.hypixel.net/player', {
-      params: { key: HYPIXEL_API_KEY, uuid }
-    });
-
-    const player = hypRes.data.player;
-    if (!player) {
-      return res.status(404).json({ error: 'No Hypixel data' });
-    }
-
-    const bw = player.stats?.Bedwars || {};
-
-    const finals = bw.final_kills_bedwars || 0;
-    const finalDeaths = bw.final_deaths_bedwars || 1;
-
-    const wins = bw.wins_bedwars || 0;
-    const losses = bw.losses_bedwars || 1;
-
-    const star = player.achievements?.bedwars_level || 0;
-
-    res.json({
-      username,
-      star,
-      fkdr: finals / finalDeaths,
-      wlr: wins / losses,
-      finals,
-      finalDeaths,
-      wins,
-      losses
-    });
-
-  } catch (err) {
-    console.error('/stats error', err.message);
-    res.status(500).json({ error: 'Failed to fetch stats' });
-  }
-});
-
 // --- UUID-based stats (for modal only) ---
-app.get('/stats/uuid/:uuid', async (req, res) => {
+app.get('/stats/uuid/:uuid', proxyLimiter, async (req, res) => {
   try {
     const uuid = req.params.uuid;
 
