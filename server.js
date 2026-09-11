@@ -135,6 +135,7 @@ const sweatSchema = new mongoose.Schema({
   aballs: { type: Boolean, default: false },
   zoiv: { type: Boolean, default: false },
   cheating: { type: Boolean, default: false },
+  boosting: { type: Boolean, default: false },
   dateAdded: String, // e.g. "2025-08-09" (YYYY-MM-DD)
   createdAt: { type: Date, default: Date.now }
 });
@@ -240,6 +241,7 @@ app.post('/sweats', requireAdminKey, async (req, res) => {
       aballs: !!body.aballs,
       zoiv: !!body.zoiv,
       cheating: !!body.cheating,
+      boosting: !!body.boosting,
       dateAdded
     });
     const saved = await doc.save();
