@@ -182,7 +182,7 @@ app.get('/urchin/:username', proxyLimiter, async (req, res) => {
 
   try {
     const response = await fetch(
-      `https://urchin.ws/player/${username}?key=${URCHIN_KEY}&sources=MANUAL`,
+      `https://urchin.ws/player/${encodeURIComponent(username)}?key=${URCHIN_KEY}&sources=MANUAL`,
       { signal: controller.signal }
     );
 
