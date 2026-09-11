@@ -60,13 +60,29 @@ const proxyLimiter = rateLimit({
   legacyHeaders: false
 });
 
+// --- Coral API (Urchin) ---
+// Our key is locked out of the Player Data/Hypixel-permission endpoints (see
+// Bordic section below, which replaced Coral for those), but still works for
+// basic endpoints like cheater tags, which need no special permission.
+const CORAL_BASE = 'https://api.urchin.gg/v3';
+
+async function coralGet(path, params) {
+  if (!URCHIN_KEY) throw new Error('URCHIN_KEY not configured');
+  const res = await axios.get(`${CORAL_BASE}${path}`, {
+    params,
+    headers: { 'X-API-Key': URCHIN_KEY },
+    timeout: 8_000
+  });
+  return res.data;
+}
+
 // --- Bordic API ---
 // Preferred source for player lookups: a genuinely keyless public proxy that
 // caches Hypixel responses, so it doesn't burn our own (temporary) Hypixel
 // key and keeps working even when that key has expired. Falls back to
 // Mojang/Hypixel directly if Bordic errors or hasn't cached this player yet.
-// (Previously used Coral/Urchin here, but that requires an API key with
-// permissions we can no longer obtain.)
+// (Previously used Coral here too, but that requires permissions we lost -
+// see above.)
 const BORDIC_BASE = 'https://api.bordic.xyz';
 
 async function bordicGet(path, params) {
@@ -195,35 +211,22 @@ app.get('/player/:uuid', proxyLimiter, async (req, res) => {
   }
 });
 
+// urchin.ws (the old legacy tag-lookup domain) has expired and now resolves
+// to an unrelated parking page - Urchin's tag/blacklist system now lives on
+// Coral. Normalizes Coral's `tag_type` field to `type` so the frontend's
+// existing contract (data.tags[].type) doesn't need to change.
 app.get('/urchin/:username', proxyLimiter, async (req, res) => {
   const username = req.params.username;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
-
   try {
-    const response = await fetch(
-      `https://urchin.ws/player/${encodeURIComponent(username)}?key=${URCHIN_KEY}&sources=MANUAL`,
-      { signal: controller.signal }
-    );
-
-    clearTimeout(timeout);
-
-    if (response.status === 404) {
+    const data = await coralGet('/player/tags', { player: username });
+    const tags = (data.tags || []).map(t => ({ type: t.tag_type, reason: t.reason }));
+    return res.json({ tags });
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
       // No tags on record for this player - not an error, just nothing found.
       return res.json({ tags: [] });
     }
-    if (!response.ok) {
-      throw new Error(`Urchin API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    res.json(data);
-
-  } catch (err) {
-    console.error("Urchin fetch failed:", err.message);
-
-    // Always respond with safe fallback
+    console.error("Urchin (Coral) tags fetch failed:", describeAxiosError(err));
     res.json({ error: "Urchin service unavailable", username });
   }
 });
