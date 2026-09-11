@@ -81,15 +81,23 @@ async function resolvePlayer(identifier) {
   try {
     const data = await coralGet(`/resolve/${encodeURIComponent(identifier)}`);
     return { id: data.uuid.replace(/-/g, ''), name: data.username };
-  } catch (err) {
-    if (err.response && err.response.status === 404) {
+  } catch (coralErr) {
+    if (coralErr.response && coralErr.response.status === 404) {
       const notFound = new Error('Not found');
       notFound.status = 404;
       throw notFound;
     }
-    console.warn('Coral resolve failed, falling back to Mojang:', err.message);
-    const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(identifier)}`, { timeout: 10_000 });
-    return mojangRes.data;
+    const coralDetail = coralErr.response
+      ? `${coralErr.response.status} ${JSON.stringify(coralErr.response.data)}`
+      : coralErr.message;
+    console.warn('Coral resolve failed, falling back to Mojang:', coralDetail);
+    try {
+      const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(identifier)}`, { timeout: 10_000 });
+      return mojangRes.data;
+    } catch (mojangErr) {
+      mojangErr.coralDetail = coralDetail;
+      throw mojangErr;
+    }
   }
 }
 
@@ -98,14 +106,27 @@ async function getHypixelPlayer(identifier) {
   try {
     const data = await coralGet('/hypixel/player', { player: identifier, max_cache_age: '2m' });
     return { player: data.player };
-  } catch (err) {
-    console.warn('Coral hypixel/player failed, falling back to direct Hypixel:', err.message);
-    if (!HYPIXEL_API_KEY) throw err;
-    const hypRes = await axios.get('https://api.hypixel.net/player', {
-      params: { key: HYPIXEL_API_KEY, uuid: identifier },
-      timeout: 15_000
-    });
-    return hypRes.data;
+  } catch (coralErr) {
+    const coralDetail = coralErr.response
+      ? `${coralErr.response.status} ${JSON.stringify(coralErr.response.data)}`
+      : coralErr.message;
+    console.warn('Coral hypixel/player failed, falling back to direct Hypixel:', coralDetail);
+    if (!HYPIXEL_API_KEY) {
+      coralErr.coralDetail = coralDetail;
+      throw coralErr;
+    }
+    try {
+      const hypRes = await axios.get('https://api.hypixel.net/player', {
+        params: { key: HYPIXEL_API_KEY, uuid: identifier },
+        timeout: 15_000
+      });
+      return hypRes.data;
+    } catch (hypErr) {
+      // Surface both failure reasons - the fallback failing (often just an
+      // expired temp key) shouldn't hide why the primary source failed too.
+      hypErr.coralDetail = coralDetail;
+      throw hypErr;
+    }
   }
 }
 
@@ -159,7 +180,7 @@ app.get('/mojang/:username', proxyLimiter, async (req, res) => {
     if (err.status === 404) return res.status(404).json({ error: 'Not found' });
     if (err.response && (err.response.status === 204 || err.response.status === 404)) return res.status(404).json({ error: 'Not found' });
     console.error('/mojang error', err.message);
-    return res.status(500).json({ error: 'Mojang proxy error', details: err.message });
+    return res.status(500).json({ error: 'Mojang proxy error', details: err.message, coralDetail: err.coralDetail });
   }
 });
 
@@ -170,7 +191,7 @@ app.get('/player/:uuid', proxyLimiter, async (req, res) => {
     return res.json(data);
   } catch (err) {
     console.error('/player error', err.message);
-    return res.status(500).json({ error: 'Hypixel proxy error', details: err.message });
+    return res.status(500).json({ error: 'Hypixel proxy error', details: err.message, coralDetail: err.coralDetail });
   }
 });
 
@@ -342,7 +363,7 @@ app.get('/stats/uuid/:uuid', proxyLimiter, async (req, res) => {
 
   } catch (err) {
     console.error('/stats/uuid error', err.message);
-    res.status(500).json({ error: 'Failed to fetch stats by UUID' });
+    res.status(500).json({ error: 'Failed to fetch stats by UUID', coralDetail: err.coralDetail });
   }
 });
 
