@@ -1,0 +1,17 @@
+name: Keep Render backend awake
+
+# Render's free tier spins the service down after ~15 minutes of no requests,
+# causing a slow (20-50s) cold start on the next one. Pinging /ping regularly
+# keeps it warm. If this repo goes 60+ days with no commits, GitHub auto-disables
+# scheduled workflows - push anything to re-enable it, or run it manually below.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend health endpoint
+        run: curl -fsS --max-time 20 https://bedwars-backend.onrender.com/ping

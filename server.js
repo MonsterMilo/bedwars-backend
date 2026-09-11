@@ -36,7 +36,7 @@ if (!MONGODB_URI) {
   console.warn('Warning: MONGODB_URI not set. DB features will fail until set.');
 }
 if (!HYPIXEL_API_KEY) {
-  console.warn('Warning: HYPIXEL_API_KEY not set. Hypixel requests will fail until set.');
+  console.warn('Warning: HYPIXEL_API_KEY not set. Player data still works via Coral, but the direct-Hypixel fallback will be unavailable if Coral errors.');
 }
 if (!ADMIN_KEY) {
   console.warn('Warning: ADMIN_KEY not set. Write endpoints (add/delete/update sweat) will be disabled.');
@@ -182,6 +182,10 @@ app.get('/urchin/:username', proxyLimiter, async (req, res) => {
 
     clearTimeout(timeout);
 
+    if (response.status === 404) {
+      // No tags on record for this player - not an error, just nothing found.
+      return res.json({ tags: [] });
+    }
     if (!response.ok) {
       throw new Error(`Urchin API error: ${response.status}`);
     }
@@ -296,7 +300,6 @@ app.get('/stats/uuid/:uuid', proxyLimiter, async (req, res) => {
 
     const star = player.achievements?.bedwars_level || 0;
 
-    // 🔥 NEW: get original Mongo name
     const sweatDoc = await Sweat.findOne({ uuid }).lean();
 
     res.json({
