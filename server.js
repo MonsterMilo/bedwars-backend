@@ -59,6 +59,56 @@ const proxyLimiter = rateLimit({
   legacyHeaders: false
 });
 
+// --- Coral API (Urchin) ---
+// Preferred source for player lookups: it caches Hypixel responses and can serve a
+// stale snapshot when Hypixel itself is down, and doesn't burn our own Hypixel key.
+// Falls back to Mojang/Hypixel directly if Coral errors (e.g. the key lacks permission).
+const CORAL_BASE = 'https://api.urchin.gg/v3';
+const URCHIN_KEY = process.env.URCHIN_KEY;
+
+async function coralGet(path, params) {
+  if (!URCHIN_KEY) throw new Error('URCHIN_KEY not configured');
+  const res = await axios.get(`${CORAL_BASE}${path}`, {
+    params,
+    headers: { 'X-API-Key': URCHIN_KEY },
+    timeout: 8_000
+  });
+  return res.data;
+}
+
+// Resolve a username/UUID to { id, name } (Mojang's shape), trying Coral first.
+async function resolvePlayer(identifier) {
+  try {
+    const data = await coralGet(`/resolve/${encodeURIComponent(identifier)}`);
+    return { id: data.uuid.replace(/-/g, ''), name: data.username };
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      const notFound = new Error('Not found');
+      notFound.status = 404;
+      throw notFound;
+    }
+    console.warn('Coral resolve failed, falling back to Mojang:', err.message);
+    const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(identifier)}`, { timeout: 10_000 });
+    return mojangRes.data;
+  }
+}
+
+// Get Hypixel's raw player payload (wrapped as { player }), trying Coral first.
+async function getHypixelPlayer(identifier) {
+  try {
+    const data = await coralGet('/hypixel/player', { player: identifier, max_cache_age: '2m' });
+    return { player: data.player };
+  } catch (err) {
+    console.warn('Coral hypixel/player failed, falling back to direct Hypixel:', err.message);
+    if (!HYPIXEL_API_KEY) throw err;
+    const hypRes = await axios.get('https://api.hypixel.net/player', {
+      params: { key: HYPIXEL_API_KEY, uuid: identifier },
+      timeout: 15_000
+    });
+    return hypRes.data;
+  }
+}
+
 // --- MongoDB (Mongoose) setup ---
 mongoose.set('strictQuery', false);
 mongoose
@@ -94,32 +144,24 @@ const Sweat = mongoose.model('Sweat', sweatSchema);
 // --- Health ---
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// --- Mojang proxy: get UUID and corrected name ---
+// --- Mojang proxy: get UUID and corrected name (via Coral, falling back to Mojang) ---
 app.get('/mojang/:username', proxyLimiter, async (req, res) => {
   try {
-    const username = req.params.username;
-    const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`, { timeout: 10_000 });
-    // returns { id, name }
-    return res.json(mojangRes.data);
+    const data = await resolvePlayer(req.params.username);
+    return res.json(data);
   } catch (err) {
-    if (err.response && err.response.status === 204) return res.status(404).json({ error: 'Not found' });
-    if (err.response && err.response.status === 404) return res.status(404).json({ error: 'Not found' });
+    if (err.status === 404) return res.status(404).json({ error: 'Not found' });
+    if (err.response && (err.response.status === 204 || err.response.status === 404)) return res.status(404).json({ error: 'Not found' });
     console.error('/mojang error', err.message);
     return res.status(500).json({ error: 'Mojang proxy error', details: err.message });
   }
 });
 
-// --- Hypixel proxy: get player data by UUID ---
+// --- Hypixel proxy: get player data by UUID (via Coral, falling back to Hypixel directly) ---
 app.get('/player/:uuid', proxyLimiter, async (req, res) => {
   try {
-    const uuid = req.params.uuid;
-    if (!HYPIXEL_API_KEY) return res.status(500).json({ error: 'HYPIXEL_API_KEY not configured' });
-
-    const hypRes = await axios.get('https://api.hypixel.net/player', {
-      params: { key: HYPIXEL_API_KEY, uuid },
-      timeout: 15_000
-    });
-    return res.json(hypRes.data);
+    const data = await getHypixelPlayer(req.params.uuid);
+    return res.json(data);
   } catch (err) {
     console.error('/player error', err.message);
     return res.status(500).json({ error: 'Hypixel proxy error', details: err.message });
@@ -128,14 +170,13 @@ app.get('/player/:uuid', proxyLimiter, async (req, res) => {
 
 app.get('/urchin/:username', proxyLimiter, async (req, res) => {
   const username = req.params.username;
-  const urchinKey = process.env.URCHIN_KEY;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
 
   try {
     const response = await fetch(
-      `https://urchin.ws/player/${username}?key=${urchinKey}&sources=MANUAL`,
+      `https://urchin.ws/player/${username}?key=${URCHIN_KEY}&sources=MANUAL`,
       { signal: controller.signal }
     );
 
@@ -240,15 +281,7 @@ app.get('/stats/uuid/:uuid', proxyLimiter, async (req, res) => {
   try {
     const uuid = req.params.uuid;
 
-    if (!HYPIXEL_API_KEY) {
-      return res.status(500).json({ error: 'HYPIXEL_API_KEY not configured' });
-    }
-
-    const hypRes = await axios.get('https://api.hypixel.net/player', {
-      params: { key: HYPIXEL_API_KEY, uuid }
-    });
-
-    const player = hypRes.data.player;
+    const { player } = await getHypixelPlayer(uuid);
     if (!player) {
       return res.status(404).json({ error: 'No Hypixel data' });
     }
