@@ -13,6 +13,7 @@ app.set('trust proxy', 1); // Render sits behind a proxy; needed for correct cli
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
+const URCHIN_KEY = process.env.URCHIN_KEY; // legacy urchin.ws cheater-tag lookup only
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const PORT = process.env.PORT || 3000;
 
@@ -36,7 +37,7 @@ if (!MONGODB_URI) {
   console.warn('Warning: MONGODB_URI not set. DB features will fail until set.');
 }
 if (!HYPIXEL_API_KEY) {
-  console.warn('Warning: HYPIXEL_API_KEY not set. Player data still works via Coral, but the direct-Hypixel fallback will be unavailable if Coral errors.');
+  console.warn('Warning: HYPIXEL_API_KEY not set. Player data still works via Bordic, but the direct-Hypixel fallback will be unavailable if Bordic errors.');
 }
 if (!ADMIN_KEY) {
   console.warn('Warning: ADMIN_KEY not set. Write endpoints (add/delete/update sweat) will be disabled.');
@@ -59,61 +60,60 @@ const proxyLimiter = rateLimit({
   legacyHeaders: false
 });
 
-// --- Coral API (Urchin) ---
-// Preferred source for player lookups: it caches Hypixel responses and can serve a
-// stale snapshot when Hypixel itself is down, and doesn't burn our own Hypixel key.
-// Falls back to Mojang/Hypixel directly if Coral errors (e.g. the key lacks permission).
-const CORAL_BASE = 'https://api.urchin.gg/v3';
-const URCHIN_KEY = process.env.URCHIN_KEY;
+// --- Bordic API ---
+// Preferred source for player lookups: a genuinely keyless public proxy that
+// caches Hypixel responses, so it doesn't burn our own (temporary) Hypixel
+// key and keeps working even when that key has expired. Falls back to
+// Mojang/Hypixel directly if Bordic errors or hasn't cached this player yet.
+// (Previously used Coral/Urchin here, but that requires an API key with
+// permissions we can no longer obtain.)
+const BORDIC_BASE = 'https://api.bordic.xyz';
 
-async function coralGet(path, params) {
-  if (!URCHIN_KEY) throw new Error('URCHIN_KEY not configured');
-  const res = await axios.get(`${CORAL_BASE}${path}`, {
-    params,
-    headers: { 'X-API-Key': URCHIN_KEY },
-    timeout: 8_000
-  });
+async function bordicGet(path, params) {
+  const res = await axios.get(`${BORDIC_BASE}${path}`, { params, timeout: 8_000 });
   return res.data;
 }
 
-// Resolve a username/UUID to { id, name } (Mojang's shape), trying Coral first.
+function describeAxiosError(err) {
+  return err.response
+    ? `${err.response.status} ${JSON.stringify(err.response.data)}`
+    : err.message;
+}
+
+// Resolve a username/UUID to { id, name } (Mojang's shape), trying Bordic first.
 async function resolvePlayer(identifier) {
   try {
-    const data = await coralGet(`/resolve/${encodeURIComponent(identifier)}`);
-    return { id: data.uuid.replace(/-/g, ''), name: data.username };
-  } catch (coralErr) {
-    if (coralErr.response && coralErr.response.status === 404) {
+    const data = await bordicGet('/v2/convert/mojang', { player: identifier });
+    return { id: data.uuid.replace(/-/g, ''), name: data.ign };
+  } catch (bordicErr) {
+    if (bordicErr.response && bordicErr.response.status === 404) {
       const notFound = new Error('Not found');
       notFound.status = 404;
       throw notFound;
     }
-    const coralDetail = coralErr.response
-      ? `${coralErr.response.status} ${JSON.stringify(coralErr.response.data)}`
-      : coralErr.message;
-    console.warn('Coral resolve failed, falling back to Mojang:', coralDetail);
+    const bordicDetail = describeAxiosError(bordicErr);
+    console.warn('Bordic resolve failed, falling back to Mojang:', bordicDetail);
     try {
       const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(identifier)}`, { timeout: 10_000 });
       return mojangRes.data;
     } catch (mojangErr) {
-      mojangErr.coralDetail = coralDetail;
+      mojangErr.bordicDetail = bordicDetail;
       throw mojangErr;
     }
   }
 }
 
-// Get Hypixel's raw player payload (wrapped as { player }), trying Coral first.
+// Get Hypixel's raw player payload (wrapped as { player }), trying Bordic first.
 async function getHypixelPlayer(identifier) {
   try {
-    const data = await coralGet('/hypixel/player', { player: identifier, max_cache_age: '2m' });
+    const data = await bordicGet('/v3/cache/hypixel', { uuid: identifier });
     return { player: data.player };
-  } catch (coralErr) {
-    const coralDetail = coralErr.response
-      ? `${coralErr.response.status} ${JSON.stringify(coralErr.response.data)}`
-      : coralErr.message;
-    console.warn('Coral hypixel/player failed, falling back to direct Hypixel:', coralDetail);
+  } catch (bordicErr) {
+    const bordicDetail = describeAxiosError(bordicErr);
+    console.warn('Bordic hypixel/player failed, falling back to direct Hypixel:', bordicDetail);
     if (!HYPIXEL_API_KEY) {
-      coralErr.coralDetail = coralDetail;
-      throw coralErr;
+      bordicErr.bordicDetail = bordicDetail;
+      throw bordicErr;
     }
     try {
       const hypRes = await axios.get('https://api.hypixel.net/player', {
@@ -124,7 +124,7 @@ async function getHypixelPlayer(identifier) {
     } catch (hypErr) {
       // Surface both failure reasons - the fallback failing (often just an
       // expired temp key) shouldn't hide why the primary source failed too.
-      hypErr.coralDetail = coralDetail;
+      hypErr.bordicDetail = bordicDetail;
       throw hypErr;
     }
   }
@@ -171,7 +171,7 @@ const Sweat = mongoose.model('Sweat', sweatSchema);
 // --- Health ---
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// --- Mojang proxy: get UUID and corrected name (via Coral, falling back to Mojang) ---
+// --- Mojang proxy: get UUID and corrected name (via Bordic, falling back to Mojang) ---
 app.get('/mojang/:username', proxyLimiter, async (req, res) => {
   try {
     const data = await resolvePlayer(req.params.username);
@@ -180,18 +180,18 @@ app.get('/mojang/:username', proxyLimiter, async (req, res) => {
     if (err.status === 404) return res.status(404).json({ error: 'Not found' });
     if (err.response && (err.response.status === 204 || err.response.status === 404)) return res.status(404).json({ error: 'Not found' });
     console.error('/mojang error', err.message);
-    return res.status(500).json({ error: 'Mojang proxy error', details: err.message, coralDetail: err.coralDetail });
+    return res.status(500).json({ error: 'Mojang proxy error', details: err.message, bordicDetail: err.bordicDetail });
   }
 });
 
-// --- Hypixel proxy: get player data by UUID (via Coral, falling back to Hypixel directly) ---
+// --- Hypixel proxy: get player data by UUID (via Bordic, falling back to Hypixel directly) ---
 app.get('/player/:uuid', proxyLimiter, async (req, res) => {
   try {
     const data = await getHypixelPlayer(req.params.uuid);
     return res.json(data);
   } catch (err) {
     console.error('/player error', err.message);
-    return res.status(500).json({ error: 'Hypixel proxy error', details: err.message, coralDetail: err.coralDetail });
+    return res.status(500).json({ error: 'Hypixel proxy error', details: err.message, bordicDetail: err.bordicDetail });
   }
 });
 
@@ -363,7 +363,7 @@ app.get('/stats/uuid/:uuid', proxyLimiter, async (req, res) => {
 
   } catch (err) {
     console.error('/stats/uuid error', err.message);
-    res.status(500).json({ error: 'Failed to fetch stats by UUID', coralDetail: err.coralDetail });
+    res.status(500).json({ error: 'Failed to fetch stats by UUID', bordicDetail: err.bordicDetail });
   }
 });
 
