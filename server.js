@@ -275,14 +275,27 @@ app.delete('/sweats/:id', requireAdminKey, async (req, res) => {
   }
 });
 
-// optional: update beaten-by flags (PATCH)
+// Edit an existing sweat: beaten-by roster, cheating/boosting, and stats.
+// Username/uuid/dateAdded are intentionally not editable here.
+const PATCH_BOOLEAN_FIELDS = ['milo','potat','aballs','zoiv','max','sqoz','kermit','ssent','key','cheating','boosting'];
+const PATCH_NUMERIC_FIELDS = ['star','fkdr','wlr','bblr','kdr','finals','finalDeaths','beds','bedsLost','kills','deaths'];
+
 app.patch('/sweats/:id', requireAdminKey, async (req, res) => {
   try {
     const id = req.params.id;
     const updates = req.body || {};
-    const allowed = ['milo','potat','aballs','zoiv','max','sqoz','kermit','ssent','key'];
     const set = {};
-    allowed.forEach(k => { if (k in updates) set[k] = !!updates[k]; });
+
+    PATCH_BOOLEAN_FIELDS.forEach(k => { if (k in updates) set[k] = !!updates[k]; });
+    PATCH_NUMERIC_FIELDS.forEach(k => {
+      if (k in updates) {
+        const num = Number(updates[k]);
+        if (Number.isFinite(num)) set[k] = num;
+      }
+    });
+
+    if (Object.keys(set).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
+
     const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
     if (!updated) return res.status(404).json({ error: 'Not found' });
     return res.json(updated);
