@@ -134,6 +134,11 @@ const sweatSchema = new mongoose.Schema({
   potat: { type: Boolean, default: false },
   aballs: { type: Boolean, default: false },
   zoiv: { type: Boolean, default: false },
+  max: { type: Boolean, default: false },
+  sqoz: { type: Boolean, default: false },
+  kermit: { type: Boolean, default: false },
+  ssent: { type: Boolean, default: false },
+  key: { type: Boolean, default: false },
   cheating: { type: Boolean, default: false },
   boosting: { type: Boolean, default: false },
   dateAdded: String, // e.g. "2025-08-09" (YYYY-MM-DD)
@@ -240,6 +245,11 @@ app.post('/sweats', requireAdminKey, async (req, res) => {
       potat: !!body.potat,
       aballs: !!body.aballs,
       zoiv: !!body.zoiv,
+      max: !!body.max,
+      sqoz: !!body.sqoz,
+      kermit: !!body.kermit,
+      ssent: !!body.ssent,
+      key: !!body.key,
       cheating: !!body.cheating,
       boosting: !!body.boosting,
       dateAdded
@@ -270,7 +280,7 @@ app.patch('/sweats/:id', requireAdminKey, async (req, res) => {
   try {
     const id = req.params.id;
     const updates = req.body || {};
-    const allowed = ['milo','potat','aballs','zoiv'];
+    const allowed = ['milo','potat','aballs','zoiv','max','sqoz','kermit','ssent','key'];
     const set = {};
     allowed.forEach(k => { if (k in updates) set[k] = !!updates[k]; });
     const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
