@@ -104,13 +104,29 @@ function requirePatchKey(req, res, next) {
   next();
 }
 
-// Protects the Hypixel/Mojang/Urchin proxies (and the API key behind them) from being
-// hammered by anyone who finds the backend URL.
+// Protects the Hypixel/Mojang/Urchin/Seraph proxies (and the API keys behind
+// them) from being hammered by anyone who finds the backend URL. This is the
+// normal cap - anyone presenting a valid key (admin or the restricted add
+// key) only has to clear this one.
 const proxyLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 30,
   standardHeaders: true,
   legacyHeaders: false
+});
+
+// A tighter cap stacked in front of proxyLimiter for callers with no key at
+// all - these routes are intentionally public (the website's own anonymous
+// visitors use them), but that also means anyone who just finds the backend
+// URL can burn through our personal Urchin/Seraph/Hypixel quota. Skipped
+// entirely for a valid key, so keyed access keeps the normal 30/min above.
+const publicProxyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => !!keyKind(req),
+  message: { error: 'Rate limit exceeded. Try again shortly.' }
 });
 
 // The restricted 'add' key is meant for the /tracker plugin and could end up on
@@ -249,7 +265,7 @@ const Sweat = mongoose.model('Sweat', sweatSchema);
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 // --- Mojang proxy: get UUID and corrected name (via Bordic, falling back to Mojang) ---
-app.get('/mojang/:username', proxyLimiter, async (req, res) => {
+app.get('/mojang/:username', publicProxyLimiter, proxyLimiter, async (req, res) => {
   try {
     const data = await resolvePlayer(req.params.username);
     return res.json(data);
@@ -262,7 +278,7 @@ app.get('/mojang/:username', proxyLimiter, async (req, res) => {
 });
 
 // --- Hypixel proxy: get player data by UUID (via Bordic, falling back to Hypixel directly) ---
-app.get('/player/:uuid', proxyLimiter, async (req, res) => {
+app.get('/player/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
   try {
     const data = await getHypixelPlayer(req.params.uuid);
     return res.json(data);
@@ -276,7 +292,7 @@ app.get('/player/:uuid', proxyLimiter, async (req, res) => {
 // to an unrelated parking page - Urchin's tag/blacklist system now lives on
 // Coral. Normalizes Coral's `tag_type` field to `type` so the frontend's
 // existing contract (data.tags[].type) doesn't need to change.
-app.get('/urchin/:username', proxyLimiter, async (req, res) => {
+app.get('/urchin/:username', publicProxyLimiter, proxyLimiter, async (req, res) => {
   const username = req.params.username;
   try {
     const data = await coralGet('/player/tags', { player: username });
@@ -294,7 +310,7 @@ app.get('/urchin/:username', proxyLimiter, async (req, res) => {
 
 // Seraph tags a player as blacklist/bot/annoylist independently (a player can
 // be on more than one at once) - returns one entry per list that's tagged.
-app.get('/seraph/:uuid', proxyLimiter, async (req, res) => {
+app.get('/seraph/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
   const uuid = req.params.uuid;
   try {
     const data = await seraphGet(`/${uuid}/blacklist`);
@@ -390,7 +406,7 @@ app.patch('/sweats/:id', requirePatchKey, addKeyLimiter, async (req, res) => {
 });
 
 // --- UUID-based stats (for modal only) ---
-app.get('/stats/uuid/:uuid', proxyLimiter, async (req, res) => {
+app.get('/stats/uuid/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
   try {
     const uuid = req.params.uuid;
 
