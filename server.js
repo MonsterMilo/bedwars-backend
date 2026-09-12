@@ -14,6 +14,7 @@ app.set('trust proxy', 1); // Render sits behind a proxy; needed for correct cli
 const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
 const URCHIN_KEY = process.env.URCHIN_KEY; // legacy urchin.ws cheater-tag lookup only
+const SERAPH_KEY = process.env.SERAPH_KEY; // api.seraph.si personal API key
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const ADD_KEY = process.env.ADD_KEY; // restricted key: can add sweats and toggle flags, but not edit stats or delete
 const PORT = process.env.PORT || 3000;
@@ -134,6 +135,21 @@ async function coralGet(path, params) {
   const res = await axios.get(`${CORAL_BASE}${path}`, {
     params,
     headers: { 'X-API-Key': URCHIN_KEY },
+    timeout: 8_000
+  });
+  return res.data;
+}
+
+// --- Seraph API ---
+// A second, independent player-blacklist service - separate from Urchin/Coral,
+// keyed by UUID rather than username. Requires our own personal API key (like
+// Urchin originally did), sent as the seraph-api-key header.
+const SERAPH_BASE = 'https://api.seraph.si';
+
+async function seraphGet(path) {
+  if (!SERAPH_KEY) throw new Error('SERAPH_KEY not configured');
+  const res = await axios.get(`${SERAPH_BASE}${path}`, {
+    headers: { 'seraph-api-key': SERAPH_KEY },
     timeout: 8_000
   });
   return res.data;
@@ -273,6 +289,31 @@ app.get('/urchin/:username', proxyLimiter, async (req, res) => {
     }
     console.error("Urchin (Coral) tags fetch failed:", describeAxiosError(err));
     res.json({ error: "Urchin service unavailable", username });
+  }
+});
+
+// Seraph tags a player as blacklist/bot/annoylist independently (a player can
+// be on more than one at once) - returns one entry per list that's tagged.
+app.get('/seraph/:uuid', proxyLimiter, async (req, res) => {
+  const uuid = req.params.uuid;
+  try {
+    const data = await seraphGet(`/${uuid}/blacklist`);
+    const lists = data?.data || {};
+    const tags = ['blacklist', 'bot', 'annoylist']
+      .filter(list => lists[list]?.tagged === true)
+      .map(list => ({
+        type: lists[list].report_type || list,
+        verified: !!lists[list].verified,
+        reason: lists[list].tooltip || ''
+      }));
+    return res.json({ tags });
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      // No tags on record for this player - not an error, just nothing found.
+      return res.json({ tags: [] });
+    }
+    console.error("Seraph tags fetch failed:", describeAxiosError(err));
+    res.json({ error: "Seraph service unavailable", uuid });
   }
 });
 
