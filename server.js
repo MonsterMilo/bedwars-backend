@@ -44,6 +44,13 @@ if (!ADMIN_KEY) {
   console.warn('Warning: ADMIN_KEY not set. Write endpoints (add/delete/update sweat) will be disabled.');
 }
 
+// Single source of truth for the sweat roster/flag fields, reused by the
+// schema, the POST body mapping, and the PATCH whitelist below so the three
+// can't drift out of sync with each other.
+const ROSTER_FIELDS = ['milo', 'potat', 'aballs', 'zoiv', 'max', 'sqoz', 'kermit', 'ssent', 'key'];
+const BOOLEAN_FIELDS = [...ROSTER_FIELDS, 'cheating', 'boosting'];
+const NUMERIC_FIELDS = ['star', 'fkdr', 'wlr', 'bblr', 'kdr', 'finals', 'finalDeaths', 'beds', 'bedsLost', 'kills', 'deaths'];
+
 // Require a shared secret (sent as the x-admin-key header) for any request that
 // mutates the shared sweats list, so strangers who find the API URL can't spam or wipe it.
 // Full access only - used for delete, which the restricted ADD_KEY can never do.
@@ -63,28 +70,31 @@ function keyKind(req) {
   return null;
 }
 
-function requireWriteKey(req, res, next) {
+// Shared by requireWriteKey/requirePatchKey below: resolves which key was used,
+// or writes the appropriate 503/401 response itself and returns null.
+function resolveKeyKind(req, res) {
   const kind = keyKind(req);
-  if (!kind) {
-    if (!ADMIN_KEY && !ADD_KEY) return res.status(503).json({ error: 'Write access not configured on server' });
-    return res.status(401).json({ error: 'Invalid or missing admin key' });
-  }
+  if (kind) return kind;
+  if (!ADMIN_KEY && !ADD_KEY) res.status(503).json({ error: 'Write access not configured on server' });
+  else res.status(401).json({ error: 'Invalid or missing admin key' });
+  return null;
+}
+
+function requireWriteKey(req, res, next) {
+  const kind = resolveKeyKind(req, res);
+  if (!kind) return;
   req.keyKind = kind;
   next();
 }
 
 // Same as requireWriteKey, but the restricted 'add' key may only touch boolean
-// flags (roster/cheating/boosting) - never numeric stats - checked against the
-// request body once PATCH_BOOLEAN_FIELDS is defined below.
+// flags (roster/cheating/boosting) - never numeric stats.
 function requirePatchKey(req, res, next) {
-  const kind = keyKind(req);
-  if (!kind) {
-    if (!ADMIN_KEY && !ADD_KEY) return res.status(503).json({ error: 'Write access not configured on server' });
-    return res.status(401).json({ error: 'Invalid or missing admin key' });
-  }
+  const kind = resolveKeyKind(req, res);
+  if (!kind) return;
   if (kind === 'add') {
     const bodyKeys = Object.keys(req.body || {});
-    const hasNonBoolean = bodyKeys.some(k => !PATCH_BOOLEAN_FIELDS.includes(k));
+    const hasNonBoolean = bodyKeys.some(k => !BOOLEAN_FIELDS.includes(k));
     if (hasNonBoolean) {
       return res.status(403).json({ error: 'Restricted key can only toggle beaten-by/cheating/boosting flags' });
     }
@@ -206,34 +216,16 @@ mongoose
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.warn('MongoDB connection error:', err.message));
 
-const sweatSchema = new mongoose.Schema({
+const sweatSchemaFields = {
   username: { type: String, required: true },
   uuid: { type: String, index: true },
-  star: Number,
-  fkdr: Number,
-  wlr: Number,
-  bblr: Number,
-  kdr: Number,
-  finals: Number,
-  finalDeaths: Number,
-  beds: Number,
-  bedsLost: Number,
-  kills: Number,
-  deaths: Number,
-  milo: { type: Boolean, default: false },
-  potat: { type: Boolean, default: false },
-  aballs: { type: Boolean, default: false },
-  zoiv: { type: Boolean, default: false },
-  max: { type: Boolean, default: false },
-  sqoz: { type: Boolean, default: false },
-  kermit: { type: Boolean, default: false },
-  ssent: { type: Boolean, default: false },
-  key: { type: Boolean, default: false },
-  cheating: { type: Boolean, default: false },
-  boosting: { type: Boolean, default: false },
   dateAdded: String, // e.g. "2025-08-09" (YYYY-MM-DD)
   createdAt: { type: Date, default: Date.now, index: true }
-});
+};
+NUMERIC_FIELDS.forEach(f => { sweatSchemaFields[f] = Number; });
+BOOLEAN_FIELDS.forEach(f => { sweatSchemaFields[f] = { type: Boolean, default: false }; });
+
+const sweatSchema = new mongoose.Schema(sweatSchemaFields);
 
 const Sweat = mongoose.model('Sweat', sweatSchema);
 
@@ -304,34 +296,11 @@ app.post('/sweats', requireWriteKey, addKeyLimiter, async (req, res) => {
     if (!body.username) return res.status(400).json({ error: 'username required' });
 
     const dateAdded = body.dateAdded || (new Date().toISOString().slice(0, 10));
-    const doc = new Sweat({
-      username: body.username,
-      uuid: body.uuid || null,
-      star: body.star || 0,
-      fkdr: body.fkdr || 0,
-      wlr: body.wlr || 0,
-      bblr: body.bblr || 0,
-      kdr: body.kdr || 0,
-      finals: body.finals || 0,
-      finalDeaths: body.finalDeaths || 0,
-      beds: body.beds || 0,
-      bedsLost: body.bedsLost || 0,
-      kills: body.kills || 0,
-      deaths: body.deaths || 0,
-      milo: !!body.milo,
-      potat: !!body.potat,
-      aballs: !!body.aballs,
-      zoiv: !!body.zoiv,
-      max: !!body.max,
-      sqoz: !!body.sqoz,
-      kermit: !!body.kermit,
-      ssent: !!body.ssent,
-      key: !!body.key,
-      cheating: !!body.cheating,
-      boosting: !!body.boosting,
-      dateAdded
-    });
-    const saved = await doc.save();
+    const fields = { username: body.username, uuid: body.uuid || null, dateAdded };
+    NUMERIC_FIELDS.forEach(f => { fields[f] = Number(body[f]) || 0; });
+    BOOLEAN_FIELDS.forEach(f => { fields[f] = !!body[f]; });
+
+    const saved = await new Sweat(fields).save();
     return res.status(201).json(saved);
   } catch (err) {
     console.error('/sweats POST error', err);
@@ -354,17 +323,14 @@ app.delete('/sweats/:id', requireAdminKey, async (req, res) => {
 
 // Edit an existing sweat: beaten-by roster, cheating/boosting, and stats.
 // Username/uuid/dateAdded are intentionally not editable here.
-const PATCH_BOOLEAN_FIELDS = ['milo','potat','aballs','zoiv','max','sqoz','kermit','ssent','key','cheating','boosting'];
-const PATCH_NUMERIC_FIELDS = ['star','fkdr','wlr','bblr','kdr','finals','finalDeaths','beds','bedsLost','kills','deaths'];
-
 app.patch('/sweats/:id', requirePatchKey, addKeyLimiter, async (req, res) => {
   try {
     const id = req.params.id;
     const updates = req.body || {};
     const set = {};
 
-    PATCH_BOOLEAN_FIELDS.forEach(k => { if (k in updates) set[k] = !!updates[k]; });
-    PATCH_NUMERIC_FIELDS.forEach(k => {
+    BOOLEAN_FIELDS.forEach(k => { if (k in updates) set[k] = !!updates[k]; });
+    NUMERIC_FIELDS.forEach(k => {
       if (k in updates) {
         const num = Number(updates[k]);
         if (Number.isFinite(num)) set[k] = num;
