@@ -15,6 +15,7 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
 const URCHIN_KEY = process.env.URCHIN_KEY; // legacy urchin.ws cheater-tag lookup only
 const ADMIN_KEY = process.env.ADMIN_KEY;
+const ADD_KEY = process.env.ADD_KEY; // restricted key: can add sweats and toggle flags, but not edit stats or delete
 const PORT = process.env.PORT || 3000;
 
 // Comma-separated list of allowed origins, e.g. "https://monstermilo.github.io"
@@ -45,9 +46,50 @@ if (!ADMIN_KEY) {
 
 // Require a shared secret (sent as the x-admin-key header) for any request that
 // mutates the shared sweats list, so strangers who find the API URL can't spam or wipe it.
+// Full access only - used for delete, which the restricted ADD_KEY can never do.
 function requireAdminKey(req, res, next) {
   if (!ADMIN_KEY) return res.status(503).json({ error: 'Write access not configured on server' });
   if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ error: 'Invalid or missing admin key' });
+  next();
+}
+
+// Which key (if either) the request presented. 'admin' has full access; 'add' is the
+// restricted key handed out for the /tracker plugin, meant to add sweats and toggle
+// their beaten-by/cheating/boosting flags without being able to edit stats or delete.
+function keyKind(req) {
+  const key = req.get('x-admin-key');
+  if (ADMIN_KEY && key === ADMIN_KEY) return 'admin';
+  if (ADD_KEY && key === ADD_KEY) return 'add';
+  return null;
+}
+
+function requireWriteKey(req, res, next) {
+  const kind = keyKind(req);
+  if (!kind) {
+    if (!ADMIN_KEY && !ADD_KEY) return res.status(503).json({ error: 'Write access not configured on server' });
+    return res.status(401).json({ error: 'Invalid or missing admin key' });
+  }
+  req.keyKind = kind;
+  next();
+}
+
+// Same as requireWriteKey, but the restricted 'add' key may only touch boolean
+// flags (roster/cheating/boosting) - never numeric stats - checked against the
+// request body once PATCH_BOOLEAN_FIELDS is defined below.
+function requirePatchKey(req, res, next) {
+  const kind = keyKind(req);
+  if (!kind) {
+    if (!ADMIN_KEY && !ADD_KEY) return res.status(503).json({ error: 'Write access not configured on server' });
+    return res.status(401).json({ error: 'Invalid or missing admin key' });
+  }
+  if (kind === 'add') {
+    const bodyKeys = Object.keys(req.body || {});
+    const hasNonBoolean = bodyKeys.some(k => !PATCH_BOOLEAN_FIELDS.includes(k));
+    if (hasNonBoolean) {
+      return res.status(403).json({ error: 'Restricted key can only toggle beaten-by/cheating/boosting flags' });
+    }
+  }
+  req.keyKind = kind;
   next();
 }
 
@@ -58,6 +100,17 @@ const proxyLimiter = rateLimit({
   limit: 30,
   standardHeaders: true,
   legacyHeaders: false
+});
+
+// The restricted 'add' key is meant for the /tracker plugin and could end up on
+// multiple machines, so cap how fast it can write - the full admin key is unlimited.
+const addKeyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.keyKind !== 'add',
+  message: { error: 'Rate limit exceeded for the restricted add key. Try again shortly.' }
 });
 
 // --- Coral API (Urchin) ---
@@ -245,7 +298,7 @@ app.get('/sweats', async (req, res) => {
 });
 
 // POST add a sweat
-app.post('/sweats', requireAdminKey, async (req, res) => {
+app.post('/sweats', requireWriteKey, addKeyLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.username) return res.status(400).json({ error: 'username required' });
@@ -304,7 +357,7 @@ app.delete('/sweats/:id', requireAdminKey, async (req, res) => {
 const PATCH_BOOLEAN_FIELDS = ['milo','potat','aballs','zoiv','max','sqoz','kermit','ssent','key','cheating','boosting'];
 const PATCH_NUMERIC_FIELDS = ['star','fkdr','wlr','bblr','kdr','finals','finalDeaths','beds','bedsLost','kills','deaths'];
 
-app.patch('/sweats/:id', requireAdminKey, async (req, res) => {
+app.patch('/sweats/:id', requirePatchKey, addKeyLimiter, async (req, res) => {
   try {
     const id = req.params.id;
     const updates = req.body || {};
