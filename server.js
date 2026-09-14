@@ -356,8 +356,16 @@ app.get('/seraph/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
 });
 
 // --- Sweats API: shared DB ---
-// GET all sweats (sorted newest first)
-app.get('/sweats', async (req, res) => {
+// GET all sweats (sorted newest first). Public and unauthenticated like the
+// proxy routes above, so it needs a rate limit too - otherwise it's the one
+// endpoint anyone who finds the backend URL could hammer with zero limit at
+// all. Just proxyLimiter, not the tighter publicProxyLimiter stacked in
+// front of the Mojang/Hypixel/Urchin/Seraph routes: that tighter tier exists
+// specifically to protect our own metered third-party API quota, which this
+// route never touches (it only reads our own Mongo) - and the frontend
+// reloads this list after every add/edit/delete, so an admin doing several
+// of those in a row needs more headroom than an anonymous visitor.
+app.get('/sweats', proxyLimiter, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 1000, 1000);
     const docs = await Sweat.find({}).sort({ createdAt: -1 }).limit(limit).lean();
@@ -395,6 +403,7 @@ app.delete('/sweats/:id', requireWriteKey, async (req, res) => {
     }
 
     const id = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
     if (!(await requireRecentEnough(req, res, id))) return;
 
     const deleted = await Sweat.findByIdAndDelete(id).lean();
@@ -411,6 +420,8 @@ app.delete('/sweats/:id', requireWriteKey, async (req, res) => {
 app.patch('/sweats/:id', requirePatchKey, addKeyLimiter, async (req, res) => {
   try {
     const id = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+
     const updates = req.body || {};
     const set = {};
 
