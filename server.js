@@ -17,6 +17,7 @@ const URCHIN_KEY = process.env.URCHIN_KEY; // legacy urchin.ws cheater-tag looku
 const SERAPH_KEY = process.env.SERAPH_KEY; // api.seraph.si personal API key
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const ADD_KEY = process.env.ADD_KEY; // restricted key: can add sweats and toggle flags, but not edit stats or delete
+const TRUSTED_KEY = process.env.TRUSTED_KEY; // can add freely, and edit/delete - but only entries added in the last 7 days
 const PORT = process.env.PORT || 3000;
 
 // Comma-separated list of allowed origins, e.g. "https://monstermilo.github.io"
@@ -42,7 +43,10 @@ if (!HYPIXEL_API_KEY) {
   console.warn('Warning: HYPIXEL_API_KEY not set. Player data still works via Bordic, but the direct-Hypixel fallback will be unavailable if Bordic errors.');
 }
 if (!ADMIN_KEY) {
-  console.warn('Warning: ADMIN_KEY not set. Write endpoints (add/delete/update sweat) will be disabled.');
+  console.warn('Warning: ADMIN_KEY not set. Full-access write endpoints will be disabled (TRUSTED_KEY/ADD_KEY, if set, still work within their own limits).');
+}
+if (!ADMIN_KEY && !TRUSTED_KEY && !ADD_KEY) {
+  console.warn('Warning: no write key (ADMIN_KEY/TRUSTED_KEY/ADD_KEY) is set. All write endpoints (add/edit/delete sweat) will be disabled.');
 }
 
 // Single source of truth for the sweat roster/flag fields, reused by the
@@ -52,23 +56,41 @@ const ROSTER_FIELDS = ['milo', 'potat', 'aballs', 'zoiv', 'max', 'sqoz', 'kermit
 const BOOLEAN_FIELDS = [...ROSTER_FIELDS, 'cheating', 'boosting'];
 const NUMERIC_FIELDS = ['star', 'fkdr', 'wlr', 'bblr', 'kdr', 'finals', 'finalDeaths', 'beds', 'bedsLost', 'kills', 'deaths'];
 
-// Require a shared secret (sent as the x-admin-key header) for any request that
-// mutates the shared sweats list, so strangers who find the API URL can't spam or wipe it.
-// Full access only - used for delete, which the restricted ADD_KEY can never do.
-function requireAdminKey(req, res, next) {
-  if (!ADMIN_KEY) return res.status(503).json({ error: 'Write access not configured on server' });
-  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ error: 'Invalid or missing admin key' });
-  next();
-}
-
-// Which key (if either) the request presented. 'admin' has full access; 'add' is the
-// restricted key handed out for the /tracker plugin, meant to add sweats and toggle
-// their beaten-by/cheating/boosting flags without being able to edit stats or delete.
+// Which key (if any) the request presented:
+//   'admin'   full access - add, edit any field, delete, any age.
+//   'trusted' can add with no restrictions, and can edit any field or delete -
+//             but only on entries added in the last 7 days (see requireRecentEnough).
+//   'add'     the restricted key handed out for the /tracker plugin: add sweats
+//             and toggle their beaten-by/cheating/boosting flags, never edit
+//             stats or delete, no age limit on the flag toggles it is allowed.
 function keyKind(req) {
   const key = req.get('x-admin-key');
   if (ADMIN_KEY && key === ADMIN_KEY) return 'admin';
+  if (TRUSTED_KEY && key === TRUSTED_KEY) return 'trusted';
   if (ADD_KEY && key === ADD_KEY) return 'add';
   return null;
+}
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+// A 'trusted' key may only edit/delete a sweat that was added within the last
+// 7 days - 'admin' bypasses this entirely, and 'add' never reaches this check
+// since it can't delete and its PATCH restriction (boolean-only) is separate.
+// Looks the document up itself (rather than trusting a client-supplied date)
+// so the check can't be spoofed by editing the request body.
+async function requireRecentEnough(req, res, id) {
+  if (req.keyKind !== 'trusted') return true;
+  const existing = await Sweat.findById(id).lean();
+  if (!existing) {
+    res.status(404).json({ error: 'Not found' });
+    return false;
+  }
+  const created = existing.createdAt ? new Date(existing.createdAt).getTime() : 0;
+  if (Date.now() - created > SEVEN_DAYS_MS) {
+    res.status(403).json({ error: 'Trusted key can only edit or remove entries added in the last 7 days' });
+    return false;
+  }
+  return true;
 }
 
 // Shared by requireWriteKey/requirePatchKey below: resolves which key was used,
@@ -76,7 +98,7 @@ function keyKind(req) {
 function resolveKeyKind(req, res) {
   const kind = keyKind(req);
   if (kind) return kind;
-  if (!ADMIN_KEY && !ADD_KEY) res.status(503).json({ error: 'Write access not configured on server' });
+  if (!ADMIN_KEY && !TRUSTED_KEY && !ADD_KEY) res.status(503).json({ error: 'Write access not configured on server' });
   else res.status(401).json({ error: 'Invalid or missing admin key' });
   return null;
 }
@@ -365,10 +387,16 @@ app.post('/sweats', requireWriteKey, addKeyLimiter, async (req, res) => {
   }
 });
 
-// DELETE remove a sweat by id
-app.delete('/sweats/:id', requireAdminKey, async (req, res) => {
+// DELETE remove a sweat by id - admin (any age) or trusted (last 7 days only).
+app.delete('/sweats/:id', requireWriteKey, async (req, res) => {
   try {
+    if (req.keyKind === 'add') {
+      return res.status(403).json({ error: 'Restricted key cannot delete sweats' });
+    }
+
     const id = req.params.id;
+    if (!(await requireRecentEnough(req, res, id))) return;
+
     const deleted = await Sweat.findByIdAndDelete(id).lean();
     if (!deleted) return res.status(404).json({ error: 'Not found' });
     return res.json({ ok: true, deletedId: id });
@@ -395,6 +423,8 @@ app.patch('/sweats/:id', requirePatchKey, addKeyLimiter, async (req, res) => {
     });
 
     if (Object.keys(set).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
+
+    if (!(await requireRecentEnough(req, res, id))) return;
 
     const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
     if (!updated) return res.status(404).json({ error: 'Not found' });
