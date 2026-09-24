@@ -18,6 +18,7 @@ const SERAPH_KEY = process.env.SERAPH_KEY; // api.seraph.si personal API key
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const ADD_KEY = process.env.ADD_KEY; // restricted key: can add sweats and toggle flags, but not edit stats or delete
 const TRUSTED_KEY = process.env.TRUSTED_KEY; // can add freely, and edit/delete - but only entries added in the last 7 days
+const DENICKER_API_KEY = process.env.DENICKER_API_KEY; // proxies the Denicker nick-lookup DB (see /denicker routes below)
 const PORT = process.env.PORT || 3000;
 
 // Comma-separated list of allowed origins, e.g. "https://monstermilo.github.io"
@@ -47,6 +48,9 @@ if (!ADMIN_KEY) {
 }
 if (!ADMIN_KEY && !TRUSTED_KEY && !ADD_KEY) {
   console.warn('Warning: no write key (ADMIN_KEY/TRUSTED_KEY/ADD_KEY) is set. All write endpoints (add/edit/delete sweat) will be disabled.');
+}
+if (!DENICKER_API_KEY) {
+  console.warn('Warning: DENICKER_API_KEY not set. /denicker routes will report { noKey: true } until set - the frontend falls back to Diamond Dome-only results.');
 }
 
 // Single source of truth for the sweat roster/flag fields, reused by the
@@ -207,6 +211,30 @@ async function bordicGet(path, params) {
   return res.data;
 }
 
+// --- Denicker API ---
+// A private nick-lookup database (separate project, same author) - proxied
+// here for the same reason Hypixel/Urchin/Seraph are above: DENICKER_API_KEY
+// can't go in the public frontend, and the API itself is plain http:// on a
+// bare IP, which a browser on this https:// site couldn't call directly
+// even if the key weren't a problem (mixed-content blocked).
+const DENICKER_BASE = 'http://91.99.172.247:5025';
+
+async function denickerGet(params) {
+  if (!DENICKER_API_KEY) {
+    const err = new Error('DENICKER_API_KEY not configured');
+    err.noKey = true;
+    throw err;
+  }
+  const res = await axios.get(`${DENICKER_BASE}/nick`, {
+    // sources=MANUAL_STARFISH matches what the in-game /denicker command
+    // uses for a manually-typed lookup (as opposed to GAME_STARFISH, used
+    // only for live in-match auto-resolution).
+    params: { ...params, sources: 'MANUAL_STARFISH', key: DENICKER_API_KEY },
+    timeout: 8_000
+  });
+  return res.data;
+}
+
 function describeAxiosError(err) {
   return err.response
     ? `${err.response.status} ${JSON.stringify(err.response.data)}`
@@ -352,6 +380,32 @@ app.get('/seraph/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
     }
     console.error("Seraph tags fetch failed:", describeAxiosError(err));
     res.json({ error: "Seraph service unavailable", uuid });
+  }
+});
+
+// Who has used a given nick, most recent first (mirrors /denicker owners).
+app.get('/denicker/nick/:nick', publicProxyLimiter, proxyLimiter, async (req, res) => {
+  try {
+    const data = await denickerGet({ nick: req.params.nick });
+    return res.json(data);
+  } catch (err) {
+    if (err.noKey) return res.json({ success: false, noKey: true, nicks: [] });
+    console.error('/denicker/nick error', describeAxiosError(err));
+    return res.status(500).json({ error: 'Denicker proxy error', details: err.message });
+  }
+});
+
+// Nicks a player has used, most recent first (mirrors /denicker history).
+// Looked up by uuid (the API's key) plus the current username it wants
+// alongside it - the frontend resolves both via /mojang/:username first.
+app.get('/denicker/history/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
+  try {
+    const data = await denickerGet({ uuid: req.params.uuid, username: req.query.username || '' });
+    return res.json(data);
+  } catch (err) {
+    if (err.noKey) return res.json({ success: false, noKey: true, nicks: [] });
+    console.error('/denicker/history error', describeAxiosError(err));
+    return res.status(500).json({ error: 'Denicker proxy error', details: err.message });
   }
 });
 
