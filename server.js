@@ -15,9 +15,12 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
 const URCHIN_KEY = process.env.URCHIN_KEY; // legacy urchin.ws cheater-tag lookup only
 const SERAPH_KEY = process.env.SERAPH_KEY; // api.seraph.si personal API key
-const ADMIN_KEY = process.env.ADMIN_KEY;
-const ADD_KEY = process.env.ADD_KEY; // restricted key: can add sweats and toggle flags, but not edit stats or delete
-const TRUSTED_KEY = process.env.TRUSTED_KEY; // can add freely, and edit/delete - but only entries added in the last 7 days
+// Three escalating tiers (renamed 2026-09-24 from ADD_KEY/TRUSTED_KEY/ADMIN_KEY -
+// same three secrets, same escalation order, just generic names instead of
+// role-specific ones now that TIER_ONE also gates Denicker access below).
+const TIER_ONE = process.env.TIER_ONE; // add sweats, toggle flags (any age), Denicker at 5/min - no stat edits, no delete
+const TIER_TWO = process.env.TIER_TWO; // + edit any field/delete, but only entries added in the last 7 days; Denicker at 15/min
+const TIER_THREE = process.env.TIER_THREE; // + edit/delete any age, unlimited Denicker - full access
 const DENICKER_API_KEY = process.env.DENICKER_API_KEY; // proxies the Denicker nick-lookup DB (see /denicker routes below)
 const PORT = process.env.PORT || 3000;
 
@@ -43,11 +46,11 @@ if (!MONGODB_URI) {
 if (!HYPIXEL_API_KEY) {
   console.warn('Warning: HYPIXEL_API_KEY not set. Player data still works via Bordic, but the direct-Hypixel fallback will be unavailable if Bordic errors.');
 }
-if (!ADMIN_KEY) {
-  console.warn('Warning: ADMIN_KEY not set. Full-access write endpoints will be disabled (TRUSTED_KEY/ADD_KEY, if set, still work within their own limits).');
+if (!TIER_THREE) {
+  console.warn('Warning: TIER_THREE not set. Full-access write endpoints will be disabled (TIER_ONE/TIER_TWO, if set, still work within their own limits).');
 }
-if (!ADMIN_KEY && !TRUSTED_KEY && !ADD_KEY) {
-  console.warn('Warning: no write key (ADMIN_KEY/TRUSTED_KEY/ADD_KEY) is set. All write endpoints (add/edit/delete sweat) will be disabled.');
+if (!TIER_THREE && !TIER_TWO && !TIER_ONE) {
+  console.warn('Warning: no tier key (TIER_ONE/TIER_TWO/TIER_THREE) is set. All write endpoints (add/edit/delete sweat) and all Denicker lookups will be disabled.');
 }
 if (!DENICKER_API_KEY) {
   console.warn('Warning: DENICKER_API_KEY not set. /denicker routes will report { noKey: true } until set - the frontend falls back to Diamond Dome-only results.');
@@ -60,30 +63,32 @@ const ROSTER_FIELDS = ['milo', 'potat', 'aballs', 'zoiv', 'max', 'sqoz', 'kermit
 const BOOLEAN_FIELDS = [...ROSTER_FIELDS, 'cheating', 'boosting'];
 const NUMERIC_FIELDS = ['star', 'fkdr', 'wlr', 'bblr', 'kdr', 'finals', 'finalDeaths', 'beds', 'bedsLost', 'kills', 'deaths'];
 
-// Which key (if any) the request presented:
-//   'admin'   full access - add, edit any field, delete, any age.
-//   'trusted' can add with no restrictions, and can edit any field or delete -
-//             but only on entries added in the last 7 days (see requireRecentEnough).
-//   'add'     the restricted key handed out for the /tracker plugin: add sweats
-//             and toggle their beaten-by/cheating/boosting flags, never edit
-//             stats or delete, no age limit on the flag toggles it is allowed.
+// Which tier (if any) the request presented:
+//   'tier3' full access - add, edit any field, delete, any age, unlimited Denicker.
+//   'tier2' can add with no restrictions, and can edit any field or delete -
+//           but only on entries added in the last 7 days (see requireRecentEnough) -
+//           Denicker capped at 15/min.
+//   'tier1' the restricted tier handed out for the /tracker plugin: add sweats
+//           and toggle their beaten-by/cheating/boosting flags, never edit
+//           stats or delete, no age limit on the flag toggles it is allowed -
+//           Denicker capped at 5/min.
 function keyKind(req) {
   const key = req.get('x-admin-key');
-  if (ADMIN_KEY && key === ADMIN_KEY) return 'admin';
-  if (TRUSTED_KEY && key === TRUSTED_KEY) return 'trusted';
-  if (ADD_KEY && key === ADD_KEY) return 'add';
+  if (TIER_THREE && key === TIER_THREE) return 'tier3';
+  if (TIER_TWO && key === TIER_TWO) return 'tier2';
+  if (TIER_ONE && key === TIER_ONE) return 'tier1';
   return null;
 }
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
-// A 'trusted' key may only edit/delete a sweat that was added within the last
-// 7 days - 'admin' bypasses this entirely, and 'add' never reaches this check
-// since it can't delete and its PATCH restriction (boolean-only) is separate.
-// Looks the document up itself (rather than trusting a client-supplied date)
-// so the check can't be spoofed by editing the request body.
+// A 'tier2' key may only edit/delete a sweat that was added within the last
+// 7 days - 'tier3' bypasses this entirely, and 'tier1' never reaches this
+// check since it can't delete and its PATCH restriction (boolean-only) is
+// separate. Looks the document up itself (rather than trusting a
+// client-supplied date) so the check can't be spoofed by editing the request body.
 async function requireRecentEnough(req, res, id) {
-  if (req.keyKind !== 'trusted') return true;
+  if (req.keyKind !== 'tier2') return true;
   const existing = await Sweat.findById(id).lean();
   if (!existing) {
     res.status(404).json({ error: 'Not found' });
@@ -102,7 +107,7 @@ async function requireRecentEnough(req, res, id) {
 function resolveKeyKind(req, res) {
   const kind = keyKind(req);
   if (kind) return kind;
-  if (!ADMIN_KEY && !TRUSTED_KEY && !ADD_KEY) res.status(503).json({ error: 'Write access not configured on server' });
+  if (!TIER_THREE && !TIER_TWO && !TIER_ONE) res.status(503).json({ error: 'Write access not configured on server' });
   else res.status(401).json({ error: 'Invalid or missing admin key' });
   return null;
 }
@@ -114,12 +119,12 @@ function requireWriteKey(req, res, next) {
   next();
 }
 
-// Same as requireWriteKey, but the restricted 'add' key may only touch boolean
-// flags (roster/cheating/boosting) - never numeric stats.
+// Same as requireWriteKey, but the restricted 'tier1' key may only touch
+// boolean flags (roster/cheating/boosting) - never numeric stats.
 function requirePatchKey(req, res, next) {
   const kind = resolveKeyKind(req, res);
   if (!kind) return;
-  if (kind === 'add') {
+  if (kind === 'tier1') {
     const bodyKeys = Object.keys(req.body || {});
     const hasNonBoolean = bodyKeys.some(k => !BOOLEAN_FIELDS.includes(k));
     if (hasNonBoolean) {
@@ -131,9 +136,11 @@ function requirePatchKey(req, res, next) {
 }
 
 // Protects the Hypixel/Mojang/Urchin/Seraph proxies (and the API keys behind
-// them) from being hammered by anyone who finds the backend URL. This is the
-// normal cap - anyone presenting a valid key (admin or the restricted add
-// key) only has to clear this one.
+// them) from being hammered by anyone who finds the backend URL - this also
+// covers /stats/uuid, so clicking through sweat cards to fetch live stats is
+// rate-limited the same way. This is the normal cap - anyone presenting a
+// valid tier key (any of the three) only has to clear this one, not the
+// tighter publicProxyLimiter below.
 const proxyLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 30,
@@ -155,16 +162,44 @@ const publicProxyLimiter = rateLimit({
   message: { error: 'Rate limit exceeded. Try again shortly.' }
 });
 
-// The restricted 'add' key is meant for the /tracker plugin and could end up on
-// multiple machines, so cap how fast it can write - the full admin key is unlimited.
+// The restricted 'tier1' key is meant for the /tracker plugin and could end up
+// on multiple machines, so cap how fast it can write - tier2/tier3 are unlimited.
 const addKeyLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.keyKind !== 'add',
-  message: { error: 'Rate limit exceeded for the restricted add key. Try again shortly.' }
+  skip: (req) => req.keyKind !== 'tier1',
+  message: { error: 'Rate limit exceeded for the restricted tier1 key. Try again shortly.' }
 });
+
+// Denicker costs a real, metered API call per lookup (unlike the proxies
+// above, which are either free or backed by a keyless cache), so unlike
+// them it isn't public at all - requireTierForDenicker below turns away
+// anyone with no key before this ever runs. Budget then scales with tier
+// rather than sharing the general proxyLimiter/publicProxyLimiter pool, so
+// browsing player cards can't eat into it (or vice versa). tier3 skips this
+// limiter entirely (unlimited).
+const denickerLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: (req) => (req.keyKind === 'tier2' ? 15 : 5), // tier1 default (the only other kind that reaches this point)
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.keyKind === 'tier3',
+  message: { error: 'Denicker rate limit exceeded for your tier. Try again shortly.' }
+});
+
+// Turns away anyone with no tier key at all before denickerLimiter even runs.
+// Responds with the same { noKey: true } shape used when DENICKER_API_KEY
+// itself isn't configured server-side, so the frontend's existing
+// fall-back-to-Diamond-Dome path handles "you don't have access" and "no one
+// has access yet" identically - it doesn't need to tell them apart.
+function requireTierForDenicker(req, res, next) {
+  const kind = keyKind(req);
+  if (!kind) return res.json({ success: false, noKey: true, nicks: [] });
+  req.keyKind = kind;
+  next();
+}
 
 // --- Coral API (Urchin) ---
 // Our key is locked out of the Player Data/Hypixel-permission endpoints (see
@@ -384,7 +419,9 @@ app.get('/seraph/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
 });
 
 // Who has used a given nick, most recent first (mirrors /denicker owners).
-app.get('/denicker/nick/:nick', publicProxyLimiter, proxyLimiter, async (req, res) => {
+// Requires holding a tier key at all (see requireTierForDenicker) - unlike
+// the proxy routes above, this one isn't public.
+app.get('/denicker/nick/:nick', requireTierForDenicker, denickerLimiter, async (req, res) => {
   try {
     const data = await denickerGet({ nick: req.params.nick });
     return res.json(data);
@@ -398,7 +435,7 @@ app.get('/denicker/nick/:nick', publicProxyLimiter, proxyLimiter, async (req, re
 // Nicks a player has used, most recent first (mirrors /denicker history).
 // Looked up by uuid (the API's key) plus the current username it wants
 // alongside it - the frontend resolves both via /mojang/:username first.
-app.get('/denicker/history/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
+app.get('/denicker/history/:uuid', requireTierForDenicker, denickerLimiter, async (req, res) => {
   try {
     const data = await denickerGet({ uuid: req.params.uuid, username: req.query.username || '' });
     return res.json(data);
@@ -449,10 +486,10 @@ app.post('/sweats', requireWriteKey, addKeyLimiter, async (req, res) => {
   }
 });
 
-// DELETE remove a sweat by id - admin (any age) or trusted (last 7 days only).
+// DELETE remove a sweat by id - tier3 (any age) or tier2 (last 7 days only).
 app.delete('/sweats/:id', requireWriteKey, async (req, res) => {
   try {
-    if (req.keyKind === 'add') {
+    if (req.keyKind === 'tier1') {
       return res.status(403).json({ error: 'Restricted key cannot delete sweats' });
     }
 
