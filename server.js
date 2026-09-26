@@ -15,12 +15,30 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
 const URCHIN_KEY = process.env.URCHIN_KEY; // legacy urchin.ws cheater-tag lookup only
 const SERAPH_KEY = process.env.SERAPH_KEY; // api.seraph.si personal API key
-// Three escalating tiers (renamed 2026-09-24 from ADD_KEY/TRUSTED_KEY/ADMIN_KEY -
-// same three secrets, same escalation order, just generic names instead of
-// role-specific ones now that TIER_ONE also gates Denicker access below).
-const TIER_ONE = process.env.TIER_ONE; // add sweats, toggle flags (any age), Denicker at 5/min - no stat edits, no delete
-const TIER_TWO = process.env.TIER_TWO; // + edit any field/delete, but only entries added in the last 7 days; Denicker at 15/min
-const TIER_THREE = process.env.TIER_THREE; // + edit/delete any age, unlimited Denicker - full access
+// Write access (added 2026-09-26, replacing the old TIER_ONE/TWO/THREE keys):
+// one personal key per roster member, so the backend knows who is writing and
+// signs their notes automatically, plus one KEY_ADMIN.
+//   - personal keys: add, edit and delete anything, but edit/delete only on
+//     entries and notes from the last 10 days; normal rate limits.
+//   - KEY_ADMIN: no restrictions, just higher rate limits.
+// Map of env var -> roster id (the roster field name used in the schema).
+const PERSONAL_KEY_ENV = {
+  KEY_MILO: 'milo',
+  KEY_POTAT: 'potat',
+  KEY_ABOI: 'aballs',
+  KEY_ZOIV: 'zoiv',
+  KEY_MAX: 'max',
+  KEY_SQOZ: 'sqoz',
+  KEY_KERMIT: 'kermit',
+  KEY_SSENT: 'ssent',
+  KEY_KEY: 'key'
+};
+const PERSONAL_KEYS = new Map(); // key value -> roster id
+Object.entries(PERSONAL_KEY_ENV).forEach(([envName, who]) => {
+  const value = process.env[envName];
+  if (value) PERSONAL_KEYS.set(value, who);
+});
+const KEY_ADMIN = process.env.KEY_ADMIN;
 const DENICKER_API_KEY = process.env.DENICKER_API_KEY; // proxies the Denicker nick-lookup DB (see /denicker routes below)
 const PORT = process.env.PORT || 3000;
 
@@ -46,11 +64,15 @@ if (!MONGODB_URI) {
 if (!HYPIXEL_API_KEY) {
   console.warn('Warning: HYPIXEL_API_KEY not set. Player data still works via Bordic, but the direct-Hypixel fallback will be unavailable if Bordic errors.');
 }
-if (!TIER_THREE) {
-  console.warn('Warning: TIER_THREE not set. Full-access write endpoints will be disabled (TIER_ONE/TIER_TWO, if set, still work within their own limits).');
+const missingPersonalKeys = Object.keys(PERSONAL_KEY_ENV).filter(k => !process.env[k]);
+if (missingPersonalKeys.length) {
+  console.warn(`Warning: ${missingPersonalKeys.join(', ')} not set - those people can't write or use Denicker until their key is added.`);
 }
-if (!TIER_THREE && !TIER_TWO && !TIER_ONE) {
-  console.warn('Warning: no tier key (TIER_ONE/TIER_TWO/TIER_THREE) is set. All write endpoints (add/edit/delete sweat) and all Denicker lookups will be disabled.');
+if (!KEY_ADMIN) {
+  console.warn('Warning: KEY_ADMIN not set.');
+}
+if (!KEY_ADMIN && PERSONAL_KEYS.size === 0) {
+  console.warn('Warning: no write keys (KEY_ADMIN / KEY_<NAME>) are set. All write endpoints (add/edit/delete sweat) and all Denicker lookups will be disabled.');
 }
 if (!DENICKER_API_KEY) {
   console.warn('Warning: DENICKER_API_KEY not set. /denicker routes will report { noKey: true } until set - the frontend falls back to Diamond Dome-only results.');
@@ -62,82 +84,58 @@ if (!DENICKER_API_KEY) {
 const ROSTER_FIELDS = ['milo', 'potat', 'aballs', 'zoiv', 'max', 'sqoz', 'kermit', 'ssent', 'key'];
 const BOOLEAN_FIELDS = [...ROSTER_FIELDS, 'cheating', 'boosting'];
 // Notes: a running log per sweat, each with its own author (one of the
-// roster names above, or blank) and timestamp. Any tier can add one; editing
-// or deleting a note follows the same tier rules as editing a sweat, with
-// tier2's 7-day window measured from when that note was written.
+// roster names above, 'admin', or blank on older notes) and timestamp. The
+// author always comes from the key that wrote it, never from the request
+// body. Any key can add one; editing or deleting a note follows the same
+// 10-day rule as editing a sweat, measured from when that note was written.
 const NOTE_MAX_LENGTH = 280;
 const NOTES_PER_SWEAT_MAX = 50;
 const NUMERIC_FIELDS = ['star', 'fkdr', 'wlr', 'bblr', 'kdr', 'finals', 'finalDeaths', 'beds', 'bedsLost', 'kills', 'deaths'];
 
-// Which tier (if any) the request presented:
-//   'tier3' full access - add, edit any field, delete, any age, unlimited Denicker.
-//   'tier2' can add with no restrictions, and can edit any field or delete -
-//           but only on entries added in the last 7 days (see requireRecentEnough) -
-//           Denicker capped at 15/min.
-//   'tier1' the restricted tier handed out for the /tracker plugin: add sweats
-//           and toggle their beaten-by/cheating/boosting flags, never edit
-//           stats or delete, no age limit on the flag toggles it is allowed -
-//           Denicker capped at 5/min.
-function keyKind(req) {
+// Who (if anyone) the request's key belongs to: a roster id for a personal
+// key, 'admin' for KEY_ADMIN, or null for no/unknown key.
+function keyOwner(req) {
   const key = req.get('x-admin-key');
-  if (TIER_THREE && key === TIER_THREE) return 'tier3';
-  if (TIER_TWO && key === TIER_TWO) return 'tier2';
-  if (TIER_ONE && key === TIER_ONE) return 'tier1';
-  return null;
+  if (!key) return null;
+  if (KEY_ADMIN && key === KEY_ADMIN) return 'admin';
+  return PERSONAL_KEYS.get(key) || null;
 }
 
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const EDIT_WINDOW_DAYS = 10;
+const EDIT_WINDOW_MS = EDIT_WINDOW_DAYS * 24 * 60 * 60 * 1000;
 
-// A 'tier2' key may only edit/delete a sweat that was added within the last
-// 7 days - 'tier3' bypasses this entirely, and 'tier1' never reaches this
-// check since it can't delete and its PATCH restriction (boolean-only) is
-// separate. Looks the document up itself (rather than trusting a
-// client-supplied date) so the check can't be spoofed by editing the request body.
+// true when this key may still change something created at `createdAt`:
+// KEY_ADMIN always, personal keys only within the 10-day window.
+function withinEditWindow(req, createdAt) {
+  if (req.keyOwner === 'admin') return true;
+  const created = createdAt ? new Date(createdAt).getTime() : 0;
+  return Date.now() - created <= EDIT_WINDOW_MS;
+}
+
+// Personal keys may only edit/delete a sweat added within the last 10 days.
+// Looks the document up itself (rather than trusting a client-supplied date)
+// so the check can't be spoofed by editing the request body.
 async function requireRecentEnough(req, res, id) {
-  if (req.keyKind !== 'tier2') return true;
+  if (req.keyOwner === 'admin') return true;
   const existing = await Sweat.findById(id).lean();
   if (!existing) {
     res.status(404).json({ error: 'Not found' });
     return false;
   }
-  const created = existing.createdAt ? new Date(existing.createdAt).getTime() : 0;
-  if (Date.now() - created > SEVEN_DAYS_MS) {
-    res.status(403).json({ error: 'Trusted key can only edit or remove entries added in the last 7 days' });
+  if (!withinEditWindow(req, existing.createdAt)) {
+    res.status(403).json({ error: `Personal keys can only edit or remove entries added in the last ${EDIT_WINDOW_DAYS} days` });
     return false;
   }
   return true;
 }
 
-// Shared by requireWriteKey/requirePatchKey below: resolves which key was used,
-// or writes the appropriate 503/401 response itself and returns null.
-function resolveKeyKind(req, res) {
-  const kind = keyKind(req);
-  if (kind) return kind;
-  if (!TIER_THREE && !TIER_TWO && !TIER_ONE) res.status(503).json({ error: 'Write access not configured on server' });
-  else res.status(401).json({ error: 'Invalid or missing admin key' });
-  return null;
-}
-
 function requireWriteKey(req, res, next) {
-  const kind = resolveKeyKind(req, res);
-  if (!kind) return;
-  req.keyKind = kind;
-  next();
-}
-
-// Same as requireWriteKey, but the restricted 'tier1' key may only touch
-// boolean flags (roster/cheating/boosting) - never numeric stats.
-function requirePatchKey(req, res, next) {
-  const kind = resolveKeyKind(req, res);
-  if (!kind) return;
-  if (kind === 'tier1') {
-    const bodyKeys = Object.keys(req.body || {});
-    const hasNonBoolean = bodyKeys.some(k => !BOOLEAN_FIELDS.includes(k));
-    if (hasNonBoolean) {
-      return res.status(403).json({ error: 'Restricted key can only toggle beaten-by/cheating/boosting flags' });
-    }
+  const owner = keyOwner(req);
+  if (!owner) {
+    if (!KEY_ADMIN && PERSONAL_KEYS.size === 0) return res.status(503).json({ error: 'Write access not configured on server' });
+    return res.status(401).json({ error: 'Invalid or missing key' });
   }
-  req.keyKind = kind;
+  req.keyOwner = owner;
   next();
 }
 
@@ -145,11 +143,11 @@ function requirePatchKey(req, res, next) {
 // them) from being hammered by anyone who finds the backend URL - this also
 // covers /stats/uuid, so clicking through sweat cards to fetch live stats is
 // rate-limited the same way. This is the normal cap - anyone presenting a
-// valid tier key (any of the three) only has to clear this one, not the
-// tighter publicProxyLimiter below.
+// valid key only has to clear this one, not the tighter publicProxyLimiter
+// below. KEY_ADMIN gets a higher cap.
 const proxyLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 30,
+  limit: (req) => (keyOwner(req) === 'admin' ? 120 : 30),
   standardHeaders: true,
   legacyHeaders: false
 });
@@ -164,46 +162,46 @@ const publicProxyLimiter = rateLimit({
   limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => !!keyKind(req),
+  skip: (req) => !!keyOwner(req),
   message: { error: 'Rate limit exceeded. Try again shortly.' }
 });
 
-// The restricted 'tier1' key is meant for the /tracker plugin and could end up
-// on multiple machines, so cap how fast it can write - tier2/tier3 are unlimited.
-const addKeyLimiter = rateLimit({
+// Caps writes (add/edit/delete sweats and notes) per key rather than per IP,
+// so one person's plugin plus browser share a budget and nothing can be
+// spammed: 30/min for a personal key, 120/min for KEY_ADMIN.
+const writeLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 10,
+  limit: (req) => (req.keyOwner === 'admin' ? 120 : 30),
+  keyGenerator: (req) => `key:${req.keyOwner}`,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.keyKind !== 'tier1',
-  message: { error: 'Rate limit exceeded for the restricted tier1 key. Try again shortly.' }
+  message: { error: 'Too many changes in a short time. Try again shortly.' }
 });
 
 // Denicker costs a real, metered API call per lookup (unlike the proxies
 // above, which are either free or backed by a keyless cache), so unlike
-// them it isn't public at all - requireTierForDenicker below turns away
-// anyone with no key before this ever runs. Budget then scales with tier
-// rather than sharing the general proxyLimiter/publicProxyLimiter pool, so
-// browsing player cards can't eat into it (or vice versa). tier3 skips this
-// limiter entirely (unlimited).
+// them it isn't public at all - requireKeyForDenicker below turns away
+// anyone with no key before this ever runs. Counted per key rather than
+// sharing the general proxy pool, so browsing player cards can't eat into
+// it: 15/min for a personal key, 60/min for KEY_ADMIN.
 const denickerLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: (req) => (req.keyKind === 'tier2' ? 15 : 5), // tier1 default (the only other kind that reaches this point)
+  limit: (req) => (req.keyOwner === 'admin' ? 60 : 15),
+  keyGenerator: (req) => `key:${req.keyOwner}`,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.keyKind === 'tier3',
-  message: { error: 'Denicker rate limit exceeded for your tier. Try again shortly.' }
+  message: { error: 'Denicker rate limit exceeded. Try again shortly.' }
 });
 
-// Turns away anyone with no tier key at all before denickerLimiter even runs.
+// Turns away anyone with no key at all before denickerLimiter even runs.
 // Responds with the same { noKey: true } shape used when DENICKER_API_KEY
 // itself isn't configured server-side, so the frontend's existing
 // fall-back-to-Diamond-Dome path handles "you don't have access" and "no one
 // has access yet" identically - it doesn't need to tell them apart.
-function requireTierForDenicker(req, res, next) {
-  const kind = keyKind(req);
-  if (!kind) return res.json({ success: false, noKey: true, nicks: [] });
-  req.keyKind = kind;
+function requireKeyForDenicker(req, res, next) {
+  const owner = keyOwner(req);
+  if (!owner) return res.json({ success: false, noKey: true, nicks: [] });
+  req.keyOwner = owner;
   next();
 }
 
@@ -369,15 +367,16 @@ function cleanNoteText(raw) {
   return text.length > NOTE_MAX_LENGTH ? null : text;
 }
 
-// Only roster names are accepted as authors, so a note can't claim to be
-// from anyone outside the group; anything else is stored as blank.
-function cleanNoteAuthor(raw) {
-  const author = String(raw || '').trim().toLowerCase();
-  return ROSTER_FIELDS.includes(author) ? author : '';
-}
 
 // --- Health ---
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
+// Who the presented key belongs to, so the site can say "Writing as Milo"
+// and check a key when it's entered. { who: null } for no/unknown key.
+app.get('/whoami', proxyLimiter, (req, res) => {
+  const who = keyOwner(req);
+  return res.json({ who, admin: who === 'admin', editWindowDays: who === 'admin' ? null : EDIT_WINDOW_DAYS });
+});
 
 // --- Mojang proxy: get UUID and corrected name (via Bordic, falling back to Mojang) ---
 app.get('/mojang/:username', publicProxyLimiter, proxyLimiter, async (req, res) => {
@@ -449,9 +448,9 @@ app.get('/seraph/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
 });
 
 // Who has used a given nick, most recent first (mirrors /denicker owners).
-// Requires holding a tier key at all (see requireTierForDenicker) - unlike
+// Requires holding a key at all (see requireKeyForDenicker) - unlike
 // the proxy routes above, this one isn't public.
-app.get('/denicker/nick/:nick', requireTierForDenicker, denickerLimiter, async (req, res) => {
+app.get('/denicker/nick/:nick', requireKeyForDenicker, denickerLimiter, async (req, res) => {
   try {
     const data = await denickerGet({ nick: req.params.nick });
     return res.json(data);
@@ -465,7 +464,7 @@ app.get('/denicker/nick/:nick', requireTierForDenicker, denickerLimiter, async (
 // Nicks a player has used, most recent first (mirrors /denicker history).
 // Looked up by uuid (the API's key) plus the current username it wants
 // alongside it - the frontend resolves both via /mojang/:username first.
-app.get('/denicker/history/:uuid', requireTierForDenicker, denickerLimiter, async (req, res) => {
+app.get('/denicker/history/:uuid', requireKeyForDenicker, denickerLimiter, async (req, res) => {
   try {
     const data = await denickerGet({ uuid: req.params.uuid, username: req.query.username || '' });
     return res.json(data);
@@ -553,7 +552,7 @@ app.get('/sweats', proxyLimiter, async (req, res) => {
 });
 
 // POST add a sweat
-app.post('/sweats', requireWriteKey, addKeyLimiter, async (req, res) => {
+app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.username) return res.status(400).json({ error: 'username required' });
@@ -566,7 +565,7 @@ app.post('/sweats', requireWriteKey, addKeyLimiter, async (req, res) => {
     // Optional first note, written alongside the sweat itself.
     const noteText = cleanNoteText(body.note);
     if (noteText === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
-    fields.notes = noteText ? [{ text: noteText, author: cleanNoteAuthor(body.noteAuthor) }] : [];
+    fields.notes = noteText ? [{ text: noteText, author: req.keyOwner }] : [];
 
     const saved = await new Sweat(fields).save();
     return res.status(201).json(saved);
@@ -576,13 +575,9 @@ app.post('/sweats', requireWriteKey, addKeyLimiter, async (req, res) => {
   }
 });
 
-// DELETE remove a sweat by id - tier3 (any age) or tier2 (last 7 days only).
-app.delete('/sweats/:id', requireWriteKey, async (req, res) => {
+// DELETE remove a sweat by id - KEY_ADMIN (any age) or a personal key (last 10 days only).
+app.delete('/sweats/:id', requireWriteKey, writeLimiter, async (req, res) => {
   try {
-    if (req.keyKind === 'tier1') {
-      return res.status(403).json({ error: 'Restricted key cannot delete sweats' });
-    }
-
     const id = req.params.id;
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
     if (!(await requireRecentEnough(req, res, id))) return;
@@ -598,7 +593,7 @@ app.delete('/sweats/:id', requireWriteKey, async (req, res) => {
 
 // Edit an existing sweat: beaten-by roster, cheating/boosting, and stats.
 // Username/uuid/dateAdded are intentionally not editable here.
-app.patch('/sweats/:id', requirePatchKey, addKeyLimiter, async (req, res) => {
+app.patch('/sweats/:id', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const id = req.params.id;
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -628,9 +623,8 @@ app.patch('/sweats/:id', requirePatchKey, addKeyLimiter, async (req, res) => {
 });
 
 // --- Notes on a sweat ---
-// POST add a note - any tier, including the restricted tier1 plugin key (so
-// it shares tier1's addKeyLimiter), on a sweat of any age.
-app.post('/sweats/:id/notes', requireWriteKey, addKeyLimiter, async (req, res) => {
+// POST add a note - any key, on a sweat of any age. Signed with the key's owner.
+app.post('/sweats/:id/notes', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const id = req.params.id;
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -638,7 +632,7 @@ app.post('/sweats/:id/notes', requireWriteKey, addKeyLimiter, async (req, res) =
     if (text === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
     if (!text) return res.status(400).json({ error: 'Note text required' });
 
-    const note = { text, author: cleanNoteAuthor((req.body || {}).author), createdAt: new Date() };
+    const note = { text, author: req.keyOwner, createdAt: new Date() };
     // The size check lives in the filter so two notes added at once can't
     // push a sweat past the cap.
     const updated = await Sweat.findOneAndUpdate(
@@ -658,16 +652,12 @@ app.post('/sweats/:id/notes', requireWriteKey, addKeyLimiter, async (req, res) =
   }
 });
 
-// Shared by the note edit/delete routes: tier1 can never change an existing
-// note, and tier2 only one written in the last 7 days (the note's own
-// createdAt, looked up server-side). Returns the sweat, or null once it has
+// Shared by the note edit/delete routes: a personal key may only change a
+// note written in the last 10 days (the note's own createdAt, looked up
+// server-side); KEY_ADMIN any note. Returns the sweat, or null once it has
 // written the error response itself.
 async function loadNoteForChange(req, res) {
   const { id, noteId } = req.params;
-  if (req.keyKind === 'tier1') {
-    res.status(403).json({ error: 'Restricted key can add notes but not edit or delete them' });
-    return null;
-  }
   if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(noteId)) {
     res.status(400).json({ error: 'Invalid id' });
     return null;
@@ -678,18 +668,15 @@ async function loadNoteForChange(req, res) {
     res.status(404).json({ error: 'Not found' });
     return null;
   }
-  if (req.keyKind === 'tier2') {
-    const created = note.createdAt ? new Date(note.createdAt).getTime() : 0;
-    if (Date.now() - created > SEVEN_DAYS_MS) {
-      res.status(403).json({ error: 'Trusted key can only edit or remove notes written in the last 7 days' });
-      return null;
-    }
+  if (!withinEditWindow(req, note.createdAt)) {
+    res.status(403).json({ error: `Personal keys can only edit or remove notes written in the last ${EDIT_WINDOW_DAYS} days` });
+    return null;
   }
   return sweat;
 }
 
-// PATCH edit a note's text - tier3 (any age) or tier2 (last 7 days only).
-app.patch('/sweats/:id/notes/:noteId', requireWriteKey, async (req, res) => {
+// PATCH edit a note's text - KEY_ADMIN (any age) or a personal key (last 10 days only).
+app.patch('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const text = cleanNoteText((req.body || {}).text);
     if (text === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
@@ -710,8 +697,8 @@ app.patch('/sweats/:id/notes/:noteId', requireWriteKey, async (req, res) => {
   }
 });
 
-// DELETE remove a note - tier3 (any age) or tier2 (last 7 days only).
-app.delete('/sweats/:id/notes/:noteId', requireWriteKey, async (req, res) => {
+// DELETE remove a note - KEY_ADMIN (any age) or a personal key (last 10 days only).
+app.delete('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     if (!(await loadNoteForChange(req, res))) return;
     const { id, noteId } = req.params;
