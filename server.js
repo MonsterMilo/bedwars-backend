@@ -7,6 +7,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 
 const app = express();
 app.set('trust proxy', 1); // Render sits behind a proxy; needed for correct client IPs in rate limiting
@@ -58,7 +59,7 @@ app.use(cors({
     return callback(new Error('Not allowed by CORS'));
   }
 }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '100kb' }));
 
 if (!MONGODB_URI) {
   console.warn('Warning: MONGODB_URI not set. DB features will fail until set.');
@@ -96,11 +97,23 @@ const NUMERIC_FIELDS = ['star', 'fkdr', 'wlr', 'bblr', 'kdr', 'finals', 'finalDe
 
 // Who (if anyone) the request's key belongs to: a roster id for a personal
 // key, 'admin' for KEY_ADMIN, or null for no/unknown key.
+// Keys are compared as SHA-256 digests with timingSafeEqual, and every key
+// is checked on every request, so response timing can't be used to guess a
+// key one character at a time.
+const sha256 = (v) => crypto.createHash('sha256').update(String(v)).digest();
+const KEY_DIGESTS = [
+  ...(KEY_ADMIN ? [[sha256(KEY_ADMIN), 'admin']] : []),
+  ...[...PERSONAL_KEYS].map(([value, who]) => [sha256(value), who])
+];
 function keyOwner(req) {
   const key = req.get('x-admin-key');
-  if (!key) return null;
-  if (KEY_ADMIN && key === KEY_ADMIN) return 'admin';
-  return PERSONAL_KEYS.get(key) || null;
+  if (!key || key.length > 256) return null;
+  const digest = sha256(key);
+  let owner = null;
+  for (const [known, who] of KEY_DIGESTS) {
+    if (crypto.timingSafeEqual(digest, known) && owner === null) owner = who;
+  }
+  return owner;
 }
 
 // Full access: KEY_ADMIN, and KEY_MILO (still signed as Milo).
@@ -425,6 +438,29 @@ function requireAdminKey(req, res, next) {
   next();
 }
 
+// --- Input checks ---
+// Minecraft names (and nicks) are 1-16 letters, digits or underscores;
+// UUIDs are 32 hex digits, with or without dashes. Path params that end up
+// in a third-party URL are checked first, so a crafted value like
+// "../something" can't reach a different endpoint on that service with our
+// API key attached.
+const NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
+const UUID_RE = /^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const STAT_MAX = 1e9;
+function checkParam(name, re, label) {
+  return (req, res, next) => (re.test(String(req.params[name] || ''))
+    ? next()
+    : res.status(400).json({ error: `Invalid ${label}` }));
+}
+const validName = (param) => checkParam(param, NAME_RE, 'username');
+const validUuid = (param) => checkParam(param, UUID_RE, 'uuid');
+// A finite, non-negative stat, or null when the value isn't usable.
+function cleanStat(raw) {
+  const num = Number(raw);
+  return Number.isFinite(num) ? Math.min(Math.max(num, 0), STAT_MAX) : null;
+}
+
 // Returns the trimmed note text, '' for an empty/missing note, or null when
 // it is too long (the caller answers 400).
 function cleanNoteText(raw) {
@@ -451,26 +487,26 @@ app.get('/whoami', proxyLimiter, (req, res) => {
 });
 
 // --- Mojang proxy: get UUID and corrected name (via Bordic, falling back to Mojang) ---
-app.get('/mojang/:username', publicProxyLimiter, proxyLimiter, async (req, res) => {
+app.get('/mojang/:username', validName('username'), publicProxyLimiter, proxyLimiter, async (req, res) => {
   try {
     const data = await resolvePlayer(req.params.username);
     return res.json(data);
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ error: 'Not found' });
     if (err.response && (err.response.status === 204 || err.response.status === 404)) return res.status(404).json({ error: 'Not found' });
-    console.error('/mojang error', err.message);
-    return res.status(500).json({ error: 'Mojang proxy error', details: err.message, bordicDetail: err.bordicDetail });
+    console.error('/mojang error', err.message, err.bordicDetail || '');
+    return res.status(500).json({ error: 'Mojang proxy error' });
   }
 });
 
 // --- Hypixel proxy: get player data by UUID (via Bordic, falling back to Hypixel directly) ---
-app.get('/player/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
+app.get('/player/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter, async (req, res) => {
   try {
     const data = await getHypixelPlayer(req.params.uuid);
     return res.json(data);
   } catch (err) {
-    console.error('/player error', err.message);
-    return res.status(500).json({ error: 'Hypixel proxy error', details: err.message, bordicDetail: err.bordicDetail });
+    console.error('/player error', err.message, err.bordicDetail || '');
+    return res.status(500).json({ error: 'Hypixel proxy error' });
   }
 });
 
@@ -478,7 +514,7 @@ app.get('/player/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
 // to an unrelated parking page - Urchin's tag/blacklist system now lives on
 // Coral. Normalizes Coral's `tag_type` field to `type` so the frontend's
 // existing contract (data.tags[].type) doesn't need to change.
-app.get('/urchin/:username', publicProxyLimiter, proxyLimiter, async (req, res) => {
+app.get('/urchin/:username', validName('username'), publicProxyLimiter, proxyLimiter, async (req, res) => {
   const username = req.params.username;
   try {
     const data = await coralGet('/player/tags', { player: username });
@@ -496,7 +532,7 @@ app.get('/urchin/:username', publicProxyLimiter, proxyLimiter, async (req, res) 
 
 // Seraph tags a player as blacklist/bot/annoylist independently (a player can
 // be on more than one at once) - returns one entry per list that's tagged.
-app.get('/seraph/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
+app.get('/seraph/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter, async (req, res) => {
   const uuid = req.params.uuid;
   try {
     const data = await seraphGet(`/${uuid}/blacklist`);
@@ -522,28 +558,29 @@ app.get('/seraph/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
 // Who has used a given nick, most recent first (mirrors /denicker owners).
 // Requires holding a key at all (see requireKeyForDenicker) - unlike
 // the proxy routes above, this one isn't public.
-app.get('/denicker/nick/:nick', requireKeyForDenicker, denickerLimiter, async (req, res) => {
+app.get('/denicker/nick/:nick', validName('nick'), requireKeyForDenicker, denickerLimiter, async (req, res) => {
   try {
     const data = await denickerGet({ nick: req.params.nick });
     return res.json(data);
   } catch (err) {
     if (err.noKey) return res.json({ success: false, noKey: true, nicks: [] });
     console.error('/denicker/nick error', describeAxiosError(err));
-    return res.status(500).json({ error: 'Denicker proxy error', details: err.message });
+    return res.status(500).json({ error: 'Denicker proxy error' });
   }
 });
 
 // Nicks a player has used, most recent first (mirrors /denicker history).
 // Looked up by uuid (the API's key) plus the current username it wants
 // alongside it - the frontend resolves both via /mojang/:username first.
-app.get('/denicker/history/:uuid', requireKeyForDenicker, denickerLimiter, async (req, res) => {
+app.get('/denicker/history/:uuid', validUuid('uuid'), requireKeyForDenicker, denickerLimiter, async (req, res) => {
   try {
-    const data = await denickerGet({ uuid: req.params.uuid, username: req.query.username || '' });
+    const username = NAME_RE.test(String(req.query.username || '')) ? String(req.query.username) : '';
+    const data = await denickerGet({ uuid: req.params.uuid, username });
     return res.json(data);
   } catch (err) {
     if (err.noKey) return res.json({ success: false, noKey: true, nicks: [] });
     console.error('/denicker/history error', describeAxiosError(err));
-    return res.status(500).json({ error: 'Denicker proxy error', details: err.message });
+    return res.status(500).json({ error: 'Denicker proxy error' });
   }
 });
 
@@ -628,11 +665,16 @@ app.get('/sweats', proxyLimiter, async (req, res) => {
 app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const body = req.body || {};
-    if (!body.username) return res.status(400).json({ error: 'username required' });
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    if (!username) return res.status(400).json({ error: 'username required' });
+    if (!NAME_RE.test(username)) return res.status(400).json({ error: 'Username must be 1-16 letters, numbers or underscores' });
+    const uuid = typeof body.uuid === 'string' && UUID_RE.test(body.uuid) ? body.uuid : null;
 
-    const dateAdded = body.dateAdded || (new Date().toISOString().slice(0, 10));
-    const fields = { username: body.username, uuid: body.uuid || null, dateAdded };
-    NUMERIC_FIELDS.forEach(f => { fields[f] = Number(body[f]) || 0; });
+    const dateAdded = typeof body.dateAdded === 'string' && DATE_RE.test(body.dateAdded)
+      ? body.dateAdded
+      : new Date().toISOString().slice(0, 10);
+    const fields = { username, uuid, dateAdded };
+    NUMERIC_FIELDS.forEach(f => { fields[f] = cleanStat(body[f]) ?? 0; });
     BOOLEAN_FIELDS.forEach(f => { fields[f] = !!body[f]; });
 
     // Optional first note, written alongside the sweat itself.
@@ -685,8 +727,8 @@ app.patch('/sweats/:id', requireWriteKey, writeLimiter, async (req, res) => {
     BOOLEAN_FIELDS.forEach(k => { if (k in updates) set[k] = !!updates[k]; });
     NUMERIC_FIELDS.forEach(k => {
       if (k in updates) {
-        const num = Number(updates[k]);
-        if (Number.isFinite(num)) set[k] = num;
+        const num = cleanStat(updates[k]);
+        if (num !== null) set[k] = num;
       }
     });
 
@@ -866,7 +908,7 @@ app.post('/sweats/:id/restore', requireAdminKey, writeLimiter, async (req, res) 
 });
 
 // --- UUID-based stats (for modal only) ---
-app.get('/stats/uuid/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) => {
+app.get('/stats/uuid/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter, async (req, res) => {
   try {
     const uuid = req.params.uuid;
 
@@ -901,8 +943,8 @@ app.get('/stats/uuid/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) 
     });
 
   } catch (err) {
-    console.error('/stats/uuid error', err.message);
-    res.status(500).json({ error: 'Failed to fetch stats by UUID', bordicDetail: err.bordicDetail });
+    console.error('/stats/uuid error', err.message, err.bordicDetail || '');
+    res.status(500).json({ error: 'Failed to fetch stats by UUID' });
   }
 });
 
