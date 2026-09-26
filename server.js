@@ -811,7 +811,7 @@ app.delete('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (re
 
 // --- Activity log + restore (admin key only) ---
 // GET newest-first page of activity. Optional filters: who (roster id or
-// 'admin'), action (e.g. sweat.delete), sweatId. Page with ?before=<entry id>
+// 'admin'), action (e.g. sweat.delete, or a comma list), sweatId. Page with ?before=<entry id>
 // from the previous response's nextBefore. Delete entries whose sweat is
 // still deleted come back with restorable: true.
 app.get('/activity', requireAdminKey, proxyLimiter, async (req, res) => {
@@ -819,7 +819,10 @@ app.get('/activity', requireAdminKey, proxyLimiter, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const filter = {};
     if (req.query.who) filter.who = String(req.query.who);
-    if (req.query.action) filter.action = String(req.query.action);
+    if (req.query.action) {
+      const actions = String(req.query.action).split(',').filter(Boolean).slice(0, 10);
+      filter.action = actions.length > 1 ? { $in: actions } : actions[0];
+    }
     if (req.query.sweatId && mongoose.Types.ObjectId.isValid(req.query.sweatId)) filter.sweatId = req.query.sweatId;
     if (req.query.before) {
       if (!mongoose.Types.ObjectId.isValid(req.query.before)) return res.status(400).json({ error: 'Invalid cursor' });
