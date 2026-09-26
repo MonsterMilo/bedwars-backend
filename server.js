@@ -18,9 +18,11 @@ const SERAPH_KEY = process.env.SERAPH_KEY; // api.seraph.si personal API key
 // Write access (added 2026-09-26, replacing the old TIER_ONE/TWO/THREE keys):
 // one personal key per roster member, so the backend knows who is writing and
 // signs their notes automatically, plus one KEY_ADMIN.
-//   - personal keys: add, edit and delete anything, but edit/delete only on
-//     entries and notes from the last 10 days; normal rate limits.
-//   - KEY_ADMIN: no restrictions, just higher rate limits.
+//   - personal keys: add anything; edit entries and notes from the last 30
+//     days, delete ones from the last 10 days; normal rate limits.
+//   - KEY_ADMIN and KEY_MILO: no restrictions, just higher rate limits
+//     (Milo runs the site, so his key is an admin key that still signs
+//     notes as Milo).
 // Map of env var -> roster id (the roster field name used in the schema).
 const PERSONAL_KEY_ENV = {
   KEY_MILO: 'milo',
@@ -101,29 +103,41 @@ function keyOwner(req) {
   return PERSONAL_KEYS.get(key) || null;
 }
 
-const EDIT_WINDOW_DAYS = 10;
-const EDIT_WINDOW_MS = EDIT_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-
-// true when this key may still change something created at `createdAt`:
-// KEY_ADMIN always, personal keys only within the 10-day window.
-function withinEditWindow(req, createdAt) {
-  if (req.keyOwner === 'admin') return true;
-  const created = createdAt ? new Date(createdAt).getTime() : 0;
-  return Date.now() - created <= EDIT_WINDOW_MS;
+// Full access: KEY_ADMIN, and KEY_MILO (still signed as Milo).
+const FULL_ACCESS_OWNERS = new Set(['admin', 'milo']);
+function hasFullAccess(owner) {
+  return FULL_ACCESS_OWNERS.has(owner);
 }
 
-// Personal keys may only edit/delete a sweat added within the last 10 days.
-// Looks the document up itself (rather than trusting a client-supplied date)
-// so the check can't be spoofed by editing the request body.
-async function requireRecentEnough(req, res, id) {
-  if (req.keyOwner === 'admin') return true;
+// How far back a personal key can reach, per action.
+const CHANGE_WINDOW_DAYS = { edit: 30, delete: 10 };
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// true when this key may still `action` ('edit' or 'delete') something
+// created at `createdAt`: full-access keys always, personal keys only inside
+// that action's window.
+function withinChangeWindow(req, createdAt, action) {
+  if (hasFullAccess(req.keyOwner)) return true;
+  const created = createdAt ? new Date(createdAt).getTime() : 0;
+  return Date.now() - created <= CHANGE_WINDOW_DAYS[action] * DAY_MS;
+}
+function changeWindowError(action, what) {
+  const verb = action === 'edit' ? 'edit' : 'remove';
+  return `Personal keys can only ${verb} ${what} from the last ${CHANGE_WINDOW_DAYS[action]} days`;
+}
+
+// Personal keys may only edit a sweat added in the last 30 days, or delete
+// one from the last 10. Looks the document up itself (rather than trusting a
+// client-supplied date) so the check can't be spoofed by editing the request body.
+async function requireRecentEnough(req, res, id, action) {
+  if (hasFullAccess(req.keyOwner)) return true;
   const existing = await Sweat.findById(id).lean();
   if (!existing) {
     res.status(404).json({ error: 'Not found' });
     return false;
   }
-  if (!withinEditWindow(req, existing.createdAt)) {
-    res.status(403).json({ error: `Personal keys can only edit or remove entries added in the last ${EDIT_WINDOW_DAYS} days` });
+  if (!withinChangeWindow(req, existing.createdAt, action)) {
+    res.status(403).json({ error: changeWindowError(action, 'entries') });
     return false;
   }
   return true;
@@ -144,10 +158,10 @@ function requireWriteKey(req, res, next) {
 // covers /stats/uuid, so clicking through sweat cards to fetch live stats is
 // rate-limited the same way. This is the normal cap - anyone presenting a
 // valid key only has to clear this one, not the tighter publicProxyLimiter
-// below. KEY_ADMIN gets a higher cap.
+// below. Full-access keys get a higher cap.
 const proxyLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: (req) => (keyOwner(req) === 'admin' ? 120 : 30),
+  limit: (req) => (hasFullAccess(keyOwner(req)) ? 120 : 30),
   standardHeaders: true,
   legacyHeaders: false
 });
@@ -168,10 +182,10 @@ const publicProxyLimiter = rateLimit({
 
 // Caps writes (add/edit/delete sweats and notes) per key rather than per IP,
 // so one person's plugin plus browser share a budget and nothing can be
-// spammed: 30/min for a personal key, 120/min for KEY_ADMIN.
+// spammed: 30/min for a personal key, 120/min for full-access keys.
 const writeLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: (req) => (req.keyOwner === 'admin' ? 120 : 30),
+  limit: (req) => (hasFullAccess(req.keyOwner) ? 120 : 30),
   keyGenerator: (req) => `key:${req.keyOwner}`,
   standardHeaders: true,
   legacyHeaders: false,
@@ -183,10 +197,10 @@ const writeLimiter = rateLimit({
 // them it isn't public at all - requireKeyForDenicker below turns away
 // anyone with no key before this ever runs. Counted per key rather than
 // sharing the general proxy pool, so browsing player cards can't eat into
-// it: 15/min for a personal key, 60/min for KEY_ADMIN.
+// it: 15/min for a personal key, 60/min for full-access keys.
 const denickerLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: (req) => (req.keyOwner === 'admin' ? 60 : 15),
+  limit: (req) => (hasFullAccess(req.keyOwner) ? 60 : 15),
   keyGenerator: (req) => `key:${req.keyOwner}`,
   standardHeaders: true,
   legacyHeaders: false,
@@ -375,7 +389,13 @@ app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString()
 // and check a key when it's entered. { who: null } for no/unknown key.
 app.get('/whoami', proxyLimiter, (req, res) => {
   const who = keyOwner(req);
-  return res.json({ who, admin: who === 'admin', editWindowDays: who === 'admin' ? null : EDIT_WINDOW_DAYS });
+  const full = hasFullAccess(who);
+  return res.json({
+    who,
+    admin: full,
+    editWindowDays: full ? null : CHANGE_WINDOW_DAYS.edit,
+    deleteWindowDays: full ? null : CHANGE_WINDOW_DAYS.delete
+  });
 });
 
 // --- Mojang proxy: get UUID and corrected name (via Bordic, falling back to Mojang) ---
@@ -575,12 +595,12 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
   }
 });
 
-// DELETE remove a sweat by id - KEY_ADMIN (any age) or a personal key (last 10 days only).
+// DELETE remove a sweat by id - full-access keys (any age) or a personal key (last 10 days only).
 app.delete('/sweats/:id', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const id = req.params.id;
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
-    if (!(await requireRecentEnough(req, res, id))) return;
+    if (!(await requireRecentEnough(req, res, id, 'delete'))) return;
 
     const deleted = await Sweat.findByIdAndDelete(id).lean();
     if (!deleted) return res.status(404).json({ error: 'Not found' });
@@ -611,7 +631,7 @@ app.patch('/sweats/:id', requireWriteKey, writeLimiter, async (req, res) => {
 
     if (Object.keys(set).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
 
-    if (!(await requireRecentEnough(req, res, id))) return;
+    if (!(await requireRecentEnough(req, res, id, 'edit'))) return;
 
     const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
     if (!updated) return res.status(404).json({ error: 'Not found' });
@@ -652,11 +672,11 @@ app.post('/sweats/:id/notes', requireWriteKey, writeLimiter, async (req, res) =>
   }
 });
 
-// Shared by the note edit/delete routes: a personal key may only change a
-// note written in the last 10 days (the note's own createdAt, looked up
-// server-side); KEY_ADMIN any note. Returns the sweat, or null once it has
+// Shared by the note edit/delete routes: a personal key may only edit a
+// note written in the last 30 days or delete one from the last 10 (the
+// note's own createdAt, looked up server-side); full-access keys any note. Returns the sweat, or null once it has
 // written the error response itself.
-async function loadNoteForChange(req, res) {
+async function loadNoteForChange(req, res, action) {
   const { id, noteId } = req.params;
   if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(noteId)) {
     res.status(400).json({ error: 'Invalid id' });
@@ -668,20 +688,20 @@ async function loadNoteForChange(req, res) {
     res.status(404).json({ error: 'Not found' });
     return null;
   }
-  if (!withinEditWindow(req, note.createdAt)) {
-    res.status(403).json({ error: `Personal keys can only edit or remove notes written in the last ${EDIT_WINDOW_DAYS} days` });
+  if (!withinChangeWindow(req, note.createdAt, action)) {
+    res.status(403).json({ error: changeWindowError(action, 'notes') });
     return null;
   }
   return sweat;
 }
 
-// PATCH edit a note's text - KEY_ADMIN (any age) or a personal key (last 10 days only).
+// PATCH edit a note's text - full-access keys (any age) or a personal key (last 30 days only).
 app.patch('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const text = cleanNoteText((req.body || {}).text);
     if (text === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
     if (!text) return res.status(400).json({ error: 'Note text required' });
-    if (!(await loadNoteForChange(req, res))) return;
+    if (!(await loadNoteForChange(req, res, 'edit'))) return;
 
     const { id, noteId } = req.params;
     const updated = await Sweat.findOneAndUpdate(
@@ -697,10 +717,10 @@ app.patch('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req
   }
 });
 
-// DELETE remove a note - KEY_ADMIN (any age) or a personal key (last 10 days only).
+// DELETE remove a note - full-access keys (any age) or a personal key (last 10 days only).
 app.delete('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req, res) => {
   try {
-    if (!(await loadNoteForChange(req, res))) return;
+    if (!(await loadNoteForChange(req, res, 'delete'))) return;
     const { id, noteId } = req.params;
     const updated = await Sweat.findByIdAndUpdate(
       id,
