@@ -456,11 +456,66 @@ app.get('/denicker/history/:uuid', requireTierForDenicker, denickerLimiter, asyn
 // route never touches (it only reads our own Mongo) - and the frontend
 // reloads this list after every add/edit/delete, so an admin doing several
 // of those in a row needs more headroom than an anonymous visitor.
+//
+// Two response shapes:
+// - no `paged` param: a bare array of up to `limit` (max 1000) newest sweats,
+//   kept as-is so older frontends keep working.
+// - `paged=1`: { sweats, nextCursor, total }, one page of up to `limit`
+//   (max 1000). Pass nextCursor back as `cursor` to get the next page; it is
+//   null on the last page. Keyset paging on (createdAt, _id) rather than
+//   skip, so a sweat added or deleted between page loads can't shift the
+//   pages and make an entry show up twice or go missing.
+const SWEATS_PAGE_MAX = 1000;
+
+// Cursor is "<createdAt ms or empty>_<_id>". Empty createdAt covers legacy
+// docs saved before the field existed, which sort after everything else.
+function encodeSweatCursor(doc) {
+  const ts = doc.createdAt ? new Date(doc.createdAt).getTime() : '';
+  return `${ts}_${doc._id}`;
+}
+
+function sweatCursorFilter(cursor) {
+  const m = /^(\d*)_([a-f0-9]{24})$/i.exec(String(cursor));
+  if (!m) return null;
+  const id = new mongoose.Types.ObjectId(m[2]);
+  if (m[1] === '') return { createdAt: null, _id: { $lt: id } };
+  const ts = new Date(Number(m[1]));
+  return {
+    $or: [
+      { createdAt: { $lt: ts } },
+      { createdAt: ts, _id: { $lt: id } },
+      { createdAt: null }
+    ]
+  };
+}
+
 app.get('/sweats', proxyLimiter, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 1000, 1000);
-    const docs = await Sweat.find({}).sort({ createdAt: -1 }).limit(limit).lean();
-    return res.json(docs);
+    const limit = Math.min(parseInt(req.query.limit, 10) || SWEATS_PAGE_MAX, SWEATS_PAGE_MAX);
+    const sort = { createdAt: -1, _id: -1 };
+
+    if (!req.query.paged) {
+      const docs = await Sweat.find({}).sort(sort).limit(limit).lean();
+      return res.json(docs);
+    }
+
+    let filter = {};
+    if (req.query.cursor) {
+      filter = sweatCursorFilter(req.query.cursor);
+      if (!filter) return res.status(400).json({ error: 'Invalid cursor' });
+    }
+    // Fetch one extra to know whether another page exists without a second query.
+    const [docs, total] = await Promise.all([
+      Sweat.find(filter).sort(sort).limit(limit + 1).lean(),
+      Sweat.estimatedDocumentCount()
+    ]);
+    const hasMore = docs.length > limit;
+    if (hasMore) docs.pop();
+    return res.json({
+      sweats: docs,
+      nextCursor: hasMore ? encodeSweatCursor(docs[docs.length - 1]) : null,
+      total
+    });
   } catch (err) {
     console.error('/sweats GET error', err);
     return res.status(500).json({ error: 'DB read error' });
