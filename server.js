@@ -126,21 +126,23 @@ function changeWindowError(action, what) {
   return `Personal keys can only ${verb} ${what} from the last ${CHANGE_WINDOW_DAYS[action]} days`;
 }
 
-// Personal keys may only edit a sweat added in the last 30 days, or delete
-// one from the last 10. Looks the document up itself (rather than trusting a
-// client-supplied date) so the check can't be spoofed by editing the request body.
-async function requireRecentEnough(req, res, id, action) {
-  if (hasFullAccess(req.keyOwner)) return true;
-  const existing = await Sweat.findById(id).lean();
+// Loads a live (not deleted) sweat for an edit/delete and checks the key may
+// touch it: personal keys may only edit a sweat added in the last 30 days, or
+// delete one from the last 10. Looks the document up itself (rather than
+// trusting a client-supplied date) so the check can't be spoofed by editing
+// the request body. Returns the sweat as it was before the change (the
+// activity log diffs against it), or null once it has written the error.
+async function loadSweatForChange(req, res, id, action) {
+  const existing = await Sweat.findOne({ _id: id, ...LIVE }).lean();
   if (!existing) {
     res.status(404).json({ error: 'Not found' });
-    return false;
+    return null;
   }
   if (!withinChangeWindow(req, existing.createdAt, action)) {
     res.status(403).json({ error: changeWindowError(action, 'entries') });
-    return false;
+    return null;
   }
-  return true;
+  return existing;
 }
 
 function requireWriteKey(req, res, next) {
@@ -356,6 +358,10 @@ const sweatSchemaFields = {
   uuid: { type: String, index: true },
   dateAdded: String, // e.g. "2025-08-09" (YYYY-MM-DD)
   createdAt: { type: Date, default: Date.now, index: true },
+  // Soft delete: removing a sweat hides it (and records who did it) instead
+  // of erasing it, so the admin key can restore it with everything intact.
+  deletedAt: { type: Date, default: null, index: true },
+  deletedBy: String,
   notes: {
     type: [{
       text: { type: String, required: true, maxlength: NOTE_MAX_LENGTH },
@@ -372,6 +378,52 @@ BOOLEAN_FIELDS.forEach(f => { sweatSchemaFields[f] = { type: Boolean, default: f
 const sweatSchema = new mongoose.Schema(sweatSchemaFields);
 
 const Sweat = mongoose.model('Sweat', sweatSchema);
+
+// Matches sweats that haven't been (soft) deleted - includes older documents
+// saved before deletedAt existed.
+const LIVE = { deletedAt: null };
+
+// --- Activity log ---
+// One entry per change made with a key: who (roster id or 'admin'), what,
+// and on which sweat. Edits keep a before/after of each changed field; note
+// actions keep the note text. Only the admin key can read it (GET /activity).
+const activitySchema = new mongoose.Schema({
+  at: { type: Date, default: Date.now, index: true },
+  who: { type: String, index: true },
+  action: { type: String, index: true }, // sweat.add|sweat.edit|sweat.delete|sweat.restore|note.add|note.edit|note.delete
+  sweatId: { type: mongoose.Schema.Types.ObjectId, index: true },
+  username: String,
+  uuid: String,
+  changes: mongoose.Schema.Types.Mixed, // { field: [before, after] } for sweat.edit
+  noteId: mongoose.Schema.Types.ObjectId,
+  noteText: String,
+  noteBefore: String, // note.edit: the text before the edit
+  noteAuthor: String  // note.delete: who had written the removed note
+});
+const Activity = mongoose.model('Activity', activitySchema);
+
+// Fire-and-forget: a failed log write is reported but never fails the change
+// the person actually made.
+function logActivity(req, action, sweat, extra = {}) {
+  if (!sweat) return;
+  Activity.create({
+    who: req.keyOwner,
+    action,
+    sweatId: sweat._id,
+    username: sweat.username,
+    uuid: sweat.uuid,
+    ...extra
+  }).catch(err => console.error('activity log write failed', err.message));
+}
+
+// Only KEY_ADMIN itself - not KEY_MILO, despite its full access - can read
+// the activity log or restore deleted sweats.
+function requireAdminKey(req, res, next) {
+  const owner = keyOwner(req);
+  if (owner !== 'admin') return res.status(403).json({ error: 'Admin key required' });
+  req.keyOwner = owner;
+  next();
+}
 
 // Returns the trimmed note text, '' for an empty/missing note, or null when
 // it is too long (the caller answers 400).
@@ -544,19 +596,20 @@ app.get('/sweats', proxyLimiter, async (req, res) => {
     const sort = { createdAt: -1, _id: -1 };
 
     if (!req.query.paged) {
-      const docs = await Sweat.find({}).sort(sort).limit(limit).lean();
+      const docs = await Sweat.find(LIVE).sort(sort).limit(limit).lean();
       return res.json(docs);
     }
 
-    let filter = {};
+    let filter = LIVE;
     if (req.query.cursor) {
-      filter = sweatCursorFilter(req.query.cursor);
-      if (!filter) return res.status(400).json({ error: 'Invalid cursor' });
+      const cursorFilter = sweatCursorFilter(req.query.cursor);
+      if (!cursorFilter) return res.status(400).json({ error: 'Invalid cursor' });
+      filter = { $and: [LIVE, cursorFilter] };
     }
     // Fetch one extra to know whether another page exists without a second query.
     const [docs, total] = await Promise.all([
       Sweat.find(filter).sort(sort).limit(limit + 1).lean(),
-      Sweat.estimatedDocumentCount()
+      Sweat.countDocuments(LIVE)
     ]);
     const hasMore = docs.length > limit;
     if (hasMore) docs.pop();
@@ -588,6 +641,7 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
     fields.notes = noteText ? [{ text: noteText, author: req.keyOwner }] : [];
 
     const saved = await new Sweat(fields).save();
+    logActivity(req, 'sweat.add', saved, noteText ? { noteId: saved.notes[0]._id, noteText } : {});
     return res.status(201).json(saved);
   } catch (err) {
     console.error('/sweats POST error', err);
@@ -595,15 +649,22 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
   }
 });
 
-// DELETE remove a sweat by id - full-access keys (any age) or a personal key (last 10 days only).
+// DELETE remove a sweat by id - full-access keys (any age) or a personal key
+// (last 10 days only). A soft delete: the sweat is hidden, not erased, so the
+// admin key can restore it from the activity log.
 app.delete('/sweats/:id', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const id = req.params.id;
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
-    if (!(await requireRecentEnough(req, res, id, 'delete'))) return;
+    if (!(await loadSweatForChange(req, res, id, 'delete'))) return;
 
-    const deleted = await Sweat.findByIdAndDelete(id).lean();
+    const deleted = await Sweat.findOneAndUpdate(
+      { _id: id, ...LIVE },
+      { $set: { deletedAt: new Date(), deletedBy: req.keyOwner } },
+      { new: true }
+    ).lean();
     if (!deleted) return res.status(404).json({ error: 'Not found' });
+    logActivity(req, 'sweat.delete', deleted);
     return res.json({ ok: true, deletedId: id });
   } catch (err) {
     console.error('/sweats DELETE error', err);
@@ -631,10 +692,17 @@ app.patch('/sweats/:id', requireWriteKey, writeLimiter, async (req, res) => {
 
     if (Object.keys(set).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
 
-    if (!(await requireRecentEnough(req, res, id, 'edit'))) return;
+    const before = await loadSweatForChange(req, res, id, 'edit');
+    if (!before) return;
 
-    const updated = await Sweat.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
+    const updated = await Sweat.findOneAndUpdate({ _id: id, ...LIVE }, { $set: set }, { new: true }).lean();
     if (!updated) return res.status(404).json({ error: 'Not found' });
+    const changes = {};
+    Object.keys(set).forEach(k => {
+      const was = before[k] === undefined ? null : before[k];
+      if (was !== set[k]) changes[k] = [was, set[k]];
+    });
+    if (Object.keys(changes).length) logActivity(req, 'sweat.edit', updated, { changes });
     return res.json(updated);
   } catch (err) {
     console.error('/sweats PATCH error', err);
@@ -656,15 +724,17 @@ app.post('/sweats/:id/notes', requireWriteKey, writeLimiter, async (req, res) =>
     // The size check lives in the filter so two notes added at once can't
     // push a sweat past the cap.
     const updated = await Sweat.findOneAndUpdate(
-      { _id: id, [`notes.${NOTES_PER_SWEAT_MAX - 1}`]: { $exists: false } },
+      { _id: id, ...LIVE, [`notes.${NOTES_PER_SWEAT_MAX - 1}`]: { $exists: false } },
       { $push: { notes: note } },
       { new: true }
     ).lean();
     if (!updated) {
-      const exists = await Sweat.exists({ _id: id });
+      const exists = await Sweat.exists({ _id: id, ...LIVE });
       if (!exists) return res.status(404).json({ error: 'Not found' });
       return res.status(400).json({ error: `A sweat can have at most ${NOTES_PER_SWEAT_MAX} notes` });
     }
+    const saved = updated.notes[updated.notes.length - 1];
+    logActivity(req, 'note.add', updated, { noteId: saved._id, noteText: text });
     return res.status(201).json(updated);
   } catch (err) {
     console.error('/sweats/:id/notes POST error', err);
@@ -682,7 +752,7 @@ async function loadNoteForChange(req, res, action) {
     res.status(400).json({ error: 'Invalid id' });
     return null;
   }
-  const sweat = await Sweat.findById(id).lean();
+  const sweat = await Sweat.findOne({ _id: id, ...LIVE }).lean();
   const note = sweat && (sweat.notes || []).find(n => String(n._id) === noteId);
   if (!note) {
     res.status(404).json({ error: 'Not found' });
@@ -692,7 +762,7 @@ async function loadNoteForChange(req, res, action) {
     res.status(403).json({ error: changeWindowError(action, 'notes') });
     return null;
   }
-  return sweat;
+  return { sweat, note };
 }
 
 // PATCH edit a note's text - full-access keys (any age) or a personal key (last 30 days only).
@@ -701,7 +771,8 @@ app.patch('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req
     const text = cleanNoteText((req.body || {}).text);
     if (text === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
     if (!text) return res.status(400).json({ error: 'Note text required' });
-    if (!(await loadNoteForChange(req, res, 'edit'))) return;
+    const found = await loadNoteForChange(req, res, 'edit');
+    if (!found) return;
 
     const { id, noteId } = req.params;
     const updated = await Sweat.findOneAndUpdate(
@@ -710,6 +781,7 @@ app.patch('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req
       { new: true }
     ).lean();
     if (!updated) return res.status(404).json({ error: 'Not found' });
+    logActivity(req, 'note.edit', updated, { noteId, noteText: text, noteBefore: found.note.text });
     return res.json(updated);
   } catch (err) {
     console.error('/sweats/:id/notes PATCH error', err);
@@ -720,7 +792,8 @@ app.patch('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req
 // DELETE remove a note - full-access keys (any age) or a personal key (last 10 days only).
 app.delete('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (req, res) => {
   try {
-    if (!(await loadNoteForChange(req, res, 'delete'))) return;
+    const found = await loadNoteForChange(req, res, 'delete');
+    if (!found) return;
     const { id, noteId } = req.params;
     const updated = await Sweat.findByIdAndUpdate(
       id,
@@ -728,10 +801,67 @@ app.delete('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (re
       { new: true }
     ).lean();
     if (!updated) return res.status(404).json({ error: 'Not found' });
+    logActivity(req, 'note.delete', updated, { noteId, noteText: found.note.text, noteAuthor: found.note.author || '' });
     return res.json(updated);
   } catch (err) {
     console.error('/sweats/:id/notes DELETE error', err);
     return res.status(500).json({ error: 'DB delete error' });
+  }
+});
+
+// --- Activity log + restore (admin key only) ---
+// GET newest-first page of activity. Optional filters: who (roster id or
+// 'admin'), action (e.g. sweat.delete, or a comma list), sweatId. Page with ?before=<entry id>
+// from the previous response's nextBefore. Delete entries whose sweat is
+// still deleted come back with restorable: true.
+app.get('/activity', requireAdminKey, proxyLimiter, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const filter = {};
+    if (req.query.who) filter.who = String(req.query.who);
+    if (req.query.action) {
+      const actions = String(req.query.action).split(',').filter(Boolean).slice(0, 10);
+      filter.action = actions.length > 1 ? { $in: actions } : actions[0];
+    }
+    if (req.query.sweatId && mongoose.Types.ObjectId.isValid(req.query.sweatId)) filter.sweatId = req.query.sweatId;
+    if (req.query.before) {
+      if (!mongoose.Types.ObjectId.isValid(req.query.before)) return res.status(400).json({ error: 'Invalid cursor' });
+      filter._id = { $lt: new mongoose.Types.ObjectId(req.query.before) };
+    }
+    const entries = await Activity.find(filter).sort({ _id: -1 }).limit(limit + 1).lean();
+    const hasMore = entries.length > limit;
+    if (hasMore) entries.pop();
+
+    const deleteIds = entries.filter(e => e.action === 'sweat.delete').map(e => e.sweatId);
+    const stillDeleted = new Set(
+      (await Sweat.find({ _id: { $in: deleteIds }, deletedAt: { $ne: null } }, { _id: 1 }).lean()).map(d => String(d._id))
+    );
+    entries.forEach(e => {
+      if (e.action === 'sweat.delete') e.restorable = stillDeleted.has(String(e.sweatId));
+    });
+    return res.json({ entries, nextBefore: hasMore ? String(entries[entries.length - 1]._id) : null });
+  } catch (err) {
+    console.error('/activity GET error', err);
+    return res.status(500).json({ error: 'DB read error' });
+  }
+});
+
+// POST restore a deleted sweat exactly as it was (stats, flags, notes).
+app.post('/sweats/:id/restore', requireAdminKey, writeLimiter, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+    const restored = await Sweat.findOneAndUpdate(
+      { _id: id, deletedAt: { $ne: null } },
+      { $set: { deletedAt: null }, $unset: { deletedBy: '' } },
+      { new: true }
+    ).lean();
+    if (!restored) return res.status(404).json({ error: 'Not found or not deleted' });
+    logActivity(req, 'sweat.restore', restored);
+    return res.json(restored);
+  } catch (err) {
+    console.error('/sweats/:id/restore error', err);
+    return res.status(500).json({ error: 'DB update error' });
   }
 });
 
@@ -755,7 +885,7 @@ app.get('/stats/uuid/:uuid', publicProxyLimiter, proxyLimiter, async (req, res) 
 
     const star = player.achievements?.bedwars_level || 0;
 
-    const sweatDoc = await Sweat.findOne({ uuid }).lean();
+    const sweatDoc = await Sweat.findOne({ uuid, ...LIVE }).lean();
 
     res.json({
       currentName: player.displayname,
