@@ -61,6 +61,12 @@ if (!DENICKER_API_KEY) {
 // can't drift out of sync with each other.
 const ROSTER_FIELDS = ['milo', 'potat', 'aballs', 'zoiv', 'max', 'sqoz', 'kermit', 'ssent', 'key'];
 const BOOLEAN_FIELDS = [...ROSTER_FIELDS, 'cheating', 'boosting'];
+// Notes: a running log per sweat, each with its own author (one of the
+// roster names above, or blank) and timestamp. Any tier can add one; editing
+// or deleting a note follows the same tier rules as editing a sweat, with
+// tier2's 7-day window measured from when that note was written.
+const NOTE_MAX_LENGTH = 280;
+const NOTES_PER_SWEAT_MAX = 50;
 const NUMERIC_FIELDS = ['star', 'fkdr', 'wlr', 'bblr', 'kdr', 'finals', 'finalDeaths', 'beds', 'bedsLost', 'kills', 'deaths'];
 
 // Which tier (if any) the request presented:
@@ -337,7 +343,16 @@ const sweatSchemaFields = {
   username: { type: String, required: true },
   uuid: { type: String, index: true },
   dateAdded: String, // e.g. "2025-08-09" (YYYY-MM-DD)
-  createdAt: { type: Date, default: Date.now, index: true }
+  createdAt: { type: Date, default: Date.now, index: true },
+  notes: {
+    type: [{
+      text: { type: String, required: true, maxlength: NOTE_MAX_LENGTH },
+      author: { type: String, default: '' },
+      createdAt: { type: Date, default: Date.now },
+      editedAt: Date
+    }],
+    default: []
+  }
 };
 NUMERIC_FIELDS.forEach(f => { sweatSchemaFields[f] = Number; });
 BOOLEAN_FIELDS.forEach(f => { sweatSchemaFields[f] = { type: Boolean, default: false }; });
@@ -345,6 +360,21 @@ BOOLEAN_FIELDS.forEach(f => { sweatSchemaFields[f] = { type: Boolean, default: f
 const sweatSchema = new mongoose.Schema(sweatSchemaFields);
 
 const Sweat = mongoose.model('Sweat', sweatSchema);
+
+// Returns the trimmed note text, '' for an empty/missing note, or null when
+// it is too long (the caller answers 400).
+function cleanNoteText(raw) {
+  if (raw == null) return '';
+  const text = String(raw).replace(/\r\n?/g, '\n').trim();
+  return text.length > NOTE_MAX_LENGTH ? null : text;
+}
+
+// Only roster names are accepted as authors, so a note can't claim to be
+// from anyone outside the group; anything else is stored as blank.
+function cleanNoteAuthor(raw) {
+  const author = String(raw || '').trim().toLowerCase();
+  return ROSTER_FIELDS.includes(author) ? author : '';
+}
 
 // --- Health ---
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
@@ -533,6 +563,11 @@ app.post('/sweats', requireWriteKey, addKeyLimiter, async (req, res) => {
     NUMERIC_FIELDS.forEach(f => { fields[f] = Number(body[f]) || 0; });
     BOOLEAN_FIELDS.forEach(f => { fields[f] = !!body[f]; });
 
+    // Optional first note, written alongside the sweat itself.
+    const noteText = cleanNoteText(body.note);
+    if (noteText === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
+    fields.notes = noteText ? [{ text: noteText, author: cleanNoteAuthor(body.noteAuthor) }] : [];
+
     const saved = await new Sweat(fields).save();
     return res.status(201).json(saved);
   } catch (err) {
@@ -589,6 +624,107 @@ app.patch('/sweats/:id', requirePatchKey, addKeyLimiter, async (req, res) => {
   } catch (err) {
     console.error('/sweats PATCH error', err);
     return res.status(500).json({ error: 'DB update error' });
+  }
+});
+
+// --- Notes on a sweat ---
+// POST add a note - any tier, including the restricted tier1 plugin key (so
+// it shares tier1's addKeyLimiter), on a sweat of any age.
+app.post('/sweats/:id/notes', requireWriteKey, addKeyLimiter, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+    const text = cleanNoteText((req.body || {}).text);
+    if (text === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
+    if (!text) return res.status(400).json({ error: 'Note text required' });
+
+    const note = { text, author: cleanNoteAuthor((req.body || {}).author), createdAt: new Date() };
+    // The size check lives in the filter so two notes added at once can't
+    // push a sweat past the cap.
+    const updated = await Sweat.findOneAndUpdate(
+      { _id: id, [`notes.${NOTES_PER_SWEAT_MAX - 1}`]: { $exists: false } },
+      { $push: { notes: note } },
+      { new: true }
+    ).lean();
+    if (!updated) {
+      const exists = await Sweat.exists({ _id: id });
+      if (!exists) return res.status(404).json({ error: 'Not found' });
+      return res.status(400).json({ error: `A sweat can have at most ${NOTES_PER_SWEAT_MAX} notes` });
+    }
+    return res.status(201).json(updated);
+  } catch (err) {
+    console.error('/sweats/:id/notes POST error', err);
+    return res.status(500).json({ error: 'DB write error' });
+  }
+});
+
+// Shared by the note edit/delete routes: tier1 can never change an existing
+// note, and tier2 only one written in the last 7 days (the note's own
+// createdAt, looked up server-side). Returns the sweat, or null once it has
+// written the error response itself.
+async function loadNoteForChange(req, res) {
+  const { id, noteId } = req.params;
+  if (req.keyKind === 'tier1') {
+    res.status(403).json({ error: 'Restricted key can add notes but not edit or delete them' });
+    return null;
+  }
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(noteId)) {
+    res.status(400).json({ error: 'Invalid id' });
+    return null;
+  }
+  const sweat = await Sweat.findById(id).lean();
+  const note = sweat && (sweat.notes || []).find(n => String(n._id) === noteId);
+  if (!note) {
+    res.status(404).json({ error: 'Not found' });
+    return null;
+  }
+  if (req.keyKind === 'tier2') {
+    const created = note.createdAt ? new Date(note.createdAt).getTime() : 0;
+    if (Date.now() - created > SEVEN_DAYS_MS) {
+      res.status(403).json({ error: 'Trusted key can only edit or remove notes written in the last 7 days' });
+      return null;
+    }
+  }
+  return sweat;
+}
+
+// PATCH edit a note's text - tier3 (any age) or tier2 (last 7 days only).
+app.patch('/sweats/:id/notes/:noteId', requireWriteKey, async (req, res) => {
+  try {
+    const text = cleanNoteText((req.body || {}).text);
+    if (text === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
+    if (!text) return res.status(400).json({ error: 'Note text required' });
+    if (!(await loadNoteForChange(req, res))) return;
+
+    const { id, noteId } = req.params;
+    const updated = await Sweat.findOneAndUpdate(
+      { _id: id, 'notes._id': noteId },
+      { $set: { 'notes.$.text': text, 'notes.$.editedAt': new Date() } },
+      { new: true }
+    ).lean();
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    return res.json(updated);
+  } catch (err) {
+    console.error('/sweats/:id/notes PATCH error', err);
+    return res.status(500).json({ error: 'DB update error' });
+  }
+});
+
+// DELETE remove a note - tier3 (any age) or tier2 (last 7 days only).
+app.delete('/sweats/:id/notes/:noteId', requireWriteKey, async (req, res) => {
+  try {
+    if (!(await loadNoteForChange(req, res))) return;
+    const { id, noteId } = req.params;
+    const updated = await Sweat.findByIdAndUpdate(
+      id,
+      { $pull: { notes: { _id: noteId } } },
+      { new: true }
+    ).lean();
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    return res.json(updated);
+  } catch (err) {
+    console.error('/sweats/:id/notes DELETE error', err);
+    return res.status(500).json({ error: 'DB delete error' });
   }
 });
 
