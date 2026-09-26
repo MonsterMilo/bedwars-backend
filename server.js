@@ -4,6 +4,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const mongoose = require('mongoose');
@@ -52,6 +53,10 @@ const ALLOWED_ORIGINS = (process.env.FRONTEND_ORIGIN || 'https://monstermilo.git
   .filter(Boolean);
 
 app.use(helmet());
+// Gzip responses over 1kb. The full sweat list (up to 1000 entries with
+// notes) is repetitive JSON that gzips to a small fraction of its size, so
+// the site's first load and every refresh download much less.
+app.use(compression());
 app.use(cors({
   origin(origin, callback) {
     // allow same-origin/non-browser requests (no Origin header, e.g. curl, health checks)
