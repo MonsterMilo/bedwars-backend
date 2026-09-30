@@ -279,8 +279,8 @@ async function seraphGet(path) {
 // see above.)
 const BORDIC_BASE = 'https://api.bordic.xyz';
 
-async function bordicGet(path, params) {
-  const res = await axios.get(`${BORDIC_BASE}${path}`, { params, timeout: 8_000 });
+async function bordicGet(path, params, timeout = 8_000) {
+  const res = await axios.get(`${BORDIC_BASE}${path}`, { params, timeout });
   return res.data;
 }
 
@@ -337,11 +337,34 @@ async function resolvePlayer(identifier) {
   }
 }
 
+// Worth one more try: a timeout, a dropped connection, a rate limit or a
+// 5xx. A 4xx (other than 429) would just fail the same way again.
+function isRetryable(err) {
+  const status = err.response && err.response.status;
+  return !status || status === 429 || status >= 500;
+}
+
 // Get Hypixel's raw player payload (wrapped as { player }), trying Bordic first.
+// Bordic answers straight from its cache for players it has seen lately, but
+// has to go to Hypixel for one it hasn't, which can be slow or briefly fail.
+// That's why a player that loaded fine when added (cache warm) could later
+// fail: so Bordic gets a longer timeout and one retry before we fall back to
+// our own Hypixel key, which is a temporary one and often expired.
 async function getHypixelPlayer(identifier) {
-  try {
-    const data = await bordicGet('/v3/cache/hypixel', { uuid: identifier });
+  const uuid = String(identifier).replace(/-/g, '');
+  const fromBordic = async () => {
+    const data = await bordicGet('/v3/cache/hypixel', { uuid }, 15_000);
     return { player: data.player };
+  };
+  try {
+    try {
+      return await fromBordic();
+    } catch (firstErr) {
+      if (!isRetryable(firstErr)) throw firstErr;
+      console.warn('Bordic hypixel/player failed, retrying once:', describeAxiosError(firstErr));
+      await new Promise(r => setTimeout(r, 1_500));
+      return await fromBordic();
+    }
   } catch (bordicErr) {
     const bordicDetail = describeAxiosError(bordicErr);
     console.warn('Bordic hypixel/player failed, falling back to direct Hypixel:', bordicDetail);
@@ -351,7 +374,7 @@ async function getHypixelPlayer(identifier) {
     }
     try {
       const hypRes = await axios.get('https://api.hypixel.net/player', {
-        params: { key: HYPIXEL_API_KEY, uuid: identifier },
+        params: { key: HYPIXEL_API_KEY, uuid },
         timeout: 15_000
       });
       return hypRes.data;
@@ -932,7 +955,10 @@ app.get('/stats/uuid/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter
 
     const star = player.achievements?.bedwars_level || 0;
 
-    const sweatDoc = await Sweat.findOne({ uuid, ...LIVE }).lean();
+    // Stored uuids come from Mojang without dashes, but match either form.
+    const bare = uuid.replace(/-/g, '');
+    const dashed = bare.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+    const sweatDoc = await Sweat.findOne({ uuid: { $in: [uuid, bare, dashed] }, ...LIVE }).lean();
 
     res.json({
       currentName: player.displayname,
@@ -949,7 +975,10 @@ app.get('/stats/uuid/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter
 
   } catch (err) {
     console.error('/stats/uuid error', err.message, err.bordicDetail || '');
-    res.status(500).json({ error: 'Failed to fetch stats by UUID' });
+    // Almost always means neither stats source could answer right now, not
+    // that anything is wrong with the saved entry - say so, so the site can
+    // fall back to the saved stats instead of a dead end.
+    res.status(502).json({ error: "Couldn't reach the stats service for this player right now.", sourcesDown: true });
   }
 });
 
