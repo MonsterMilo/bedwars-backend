@@ -16,7 +16,6 @@ app.set('trust proxy', 1); // Render sits behind a proxy; needed for correct cli
 const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
 const URCHIN_KEY = process.env.URCHIN_KEY; // legacy urchin.ws cheater-tag lookup only
-const SERAPH_KEY = process.env.SERAPH_KEY; // api.seraph.si personal API key
 // Write access (added 2026-09-26, replacing the old TIER_ONE/TWO/THREE keys):
 // one personal key per roster member, so the backend knows who is writing and
 // signs their notes automatically, plus one KEY_ADMIN.
@@ -173,7 +172,7 @@ function requireWriteKey(req, res, next) {
   next();
 }
 
-// Protects the Hypixel/Mojang/Urchin/Seraph proxies (and the API keys behind
+// Protects the Hypixel/Mojang/Urchin proxies (and the API keys behind
 // them) from being hammered by anyone who finds the backend URL - this also
 // covers /stats/uuid, so clicking through sweat cards to fetch live stats is
 // rate-limited the same way. This is the normal cap - anyone presenting a
@@ -189,7 +188,7 @@ const proxyLimiter = rateLimit({
 // A tighter cap stacked in front of proxyLimiter for callers with no key at
 // all - these routes are intentionally public (the website's own anonymous
 // visitors use them), but that also means anyone who just finds the backend
-// URL can burn through our personal Urchin/Seraph/Hypixel quota. Skipped
+// URL can burn through our personal Urchin/Hypixel quota. Skipped
 // entirely for a valid key, so keyed access keeps the normal 30/min above.
 const publicProxyLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -255,21 +254,6 @@ async function coralGet(path, params) {
   return res.data;
 }
 
-// --- Seraph API ---
-// A second, independent player-blacklist service - separate from Urchin/Coral,
-// keyed by UUID rather than username. Requires our own personal API key (like
-// Urchin originally did), sent as the seraph-api-key header.
-const SERAPH_BASE = 'https://api.seraph.si';
-
-async function seraphGet(path) {
-  if (!SERAPH_KEY) throw new Error('SERAPH_KEY not configured');
-  const res = await axios.get(`${SERAPH_BASE}${path}`, {
-    headers: { 'seraph-api-key': SERAPH_KEY },
-    timeout: 8_000
-  });
-  return res.data;
-}
-
 // --- Bordic API ---
 // Preferred source for player lookups: a genuinely keyless public proxy that
 // caches Hypixel responses, so it doesn't burn our own (temporary) Hypixel
@@ -286,7 +270,7 @@ async function bordicGet(path, params, timeout = 8_000) {
 
 // --- Denicker API ---
 // A private nick-lookup database (separate project, same author) - proxied
-// here for the same reason Hypixel/Urchin/Seraph are above: DENICKER_API_KEY
+// here for the same reason Hypixel/Urchin are above: DENICKER_API_KEY
 // can't go in the public frontend, and the API itself is plain http:// on a
 // bare IP, which a browser on this https:// site couldn't call directly
 // even if the key weren't a problem (mixed-content blocked).
@@ -558,31 +542,6 @@ app.get('/urchin/:username', validName('username'), publicProxyLimiter, proxyLim
   }
 });
 
-// Seraph tags a player as blacklist/bot/annoylist independently (a player can
-// be on more than one at once) - returns one entry per list that's tagged.
-app.get('/seraph/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter, async (req, res) => {
-  const uuid = req.params.uuid;
-  try {
-    const data = await seraphGet(`/${uuid}/blacklist`);
-    const lists = data?.data || {};
-    const tags = ['blacklist', 'bot', 'annoylist']
-      .filter(list => lists[list]?.tagged === true)
-      .map(list => ({
-        type: lists[list].report_type || list,
-        verified: !!lists[list].verified,
-        reason: lists[list].tooltip || ''
-      }));
-    return res.json({ tags });
-  } catch (err) {
-    if (err.response && err.response.status === 404) {
-      // No tags on record for this player - not an error, just nothing found.
-      return res.json({ tags: [] });
-    }
-    console.error("Seraph tags fetch failed:", describeAxiosError(err));
-    res.json({ error: "Seraph service unavailable", uuid });
-  }
-});
-
 // Who has used a given nick, most recent first (mirrors /denicker owners).
 // Requires holding a key at all (see requireKeyForDenicker) - unlike
 // the proxy routes above, this one isn't public.
@@ -617,7 +576,7 @@ app.get('/denicker/history/:uuid', validUuid('uuid'), requireKeyForDenicker, den
 // proxy routes above, so it needs a rate limit too - otherwise it's the one
 // endpoint anyone who finds the backend URL could hammer with zero limit at
 // all. Just proxyLimiter, not the tighter publicProxyLimiter stacked in
-// front of the Mojang/Hypixel/Urchin/Seraph routes: that tighter tier exists
+// front of the Mojang/Hypixel/Urchin routes: that tighter tier exists
 // specifically to protect our own metered third-party API quota, which this
 // route never touches (it only reads our own Mongo) - and the frontend
 // reloads this list after every add/edit/delete, so an admin doing several
