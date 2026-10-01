@@ -15,10 +15,14 @@
 // Missing any of the first four just turns the bot off.
 
 const crypto = require('crypto');
+const zlib = require('zlib');
 const axios = require('axios');
 
 const API = 'https://discord.com/api/v10';
 const SITE_URL = process.env.SITE_URL || 'https://monstermilo.github.io/bedwars-frontend/';
+// This backend's public address, for the spacer image below. Render sets
+// RENDER_EXTERNAL_URL itself.
+const BACKEND_URL = (process.env.RENDER_EXTERNAL_URL || 'https://bedwars-backend.onrender.com').replace(/\/$/, '');
 
 // Display names for the roster ids, matching the website's.
 const ROSTER_LABELS = {
@@ -38,6 +42,32 @@ const BUTTON = { blurple: 1, grey: 2, red: 4 };
 const fmtStat = (n, digits = 0) => (Number.isFinite(n) && n !== 0
   ? n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })
   : '—');
+
+// Discord sizes a card to its widest line of text, so a short note makes a
+// narrow card. An image always spans the card's full width, so every card
+// gets this invisible 1000x1 PNG to keep them all full width.
+const SPACER_PNG = (() => {
+  const W = 1000;
+  const crc = (buf) => {
+    let c = ~0;
+    for (const b of buf) { c ^= b; for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1)); }
+    return (~c) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const sum = Buffer.alloc(4); sum.writeUInt32BE(crc(body));
+    return Buffer.concat([len, body, sum]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(1, 4);
+  ihdr[8] = 8; ihdr[9] = 6; // 8-bit RGBA
+  const row = Buffer.alloc(1 + W * 4); // filter byte, then fully transparent pixels
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(row)), chunk('IEND', Buffer.alloc(0))
+  ]);
+})();
 
 // Ed25519 public key from the 64 hex characters the portal shows.
 function loadPublicKey(hex) {
@@ -114,6 +144,7 @@ module.exports = function setupDiscord({ app, Sweat, LIVE, ROSTER_FIELDS, NAME_R
     if (header.author) embed.author = { name: header.author };
     if (tags.length) embed.description = tags.join('   ');
     if (uuid) embed.thumbnail = { url: `https://mc-heads.net/head/${uuid}/128` };
+    embed.image = { url: `${BACKEND_URL}/discord/spacer.png` };
 
     // The flag buttons are coloured while that flag is on.
     const id = String(sweat._id);
@@ -199,6 +230,11 @@ module.exports = function setupDiscord({ app, Sweat, LIVE, ROSTER_FIELDS, NAME_R
     const old = (interaction.message && interaction.message.embeds && interaction.message.embeds[0]) || {};
     return res.json({ type: UPDATE, data: sweatCard(updated, { author: old.author && old.author.name, footer: old.footer && old.footer.text }) });
   }
+
+  app.get('/discord/spacer.png', (req, res) => {
+    res.set({ 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=31536000, immutable' });
+    res.send(SPACER_PNG);
+  });
 
   // --- The endpoint Discord calls ---
   app.post('/discord/interactions', async (req, res) => {
