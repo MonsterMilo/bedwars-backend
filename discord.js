@@ -271,7 +271,30 @@ module.exports = function setupDiscord({
       .then(n => { header.footer = `Sweat #${n.toLocaleString('en-US')}`; })
       .catch(err => console.error('Discord sweat count failed', err.message))
       .then(() => bot.post(`/channels/${CHANNEL_ID}/messages`, sweatCard(sweat, header)))
+      .then(r => rememberPost(sweat._id, { channelId: CHANNEL_ID, messageId: r.data.id, ...header }))
       .catch(err => console.error('Discord post failed', describeAxiosError(err)));
+  }
+
+  // --- Keeping the card up to date ---
+  // Each sweat remembers its Sweat Log message, so a change made on the
+  // website (or from a /sweat lookup) edits that message to match.
+  function rememberPost(id, post) {
+    return Sweat.updateOne({ _id: id }, { $set: { discordPost: post } })
+      .catch(err => console.error('Discord: saving the message id failed', err.message));
+  }
+
+  // Fire-and-forget. skipMessageId: the card a click came from, which that
+  // click's own reply already redraws.
+  function refreshCard(sweat, skipMessageId) {
+    const post = enabled && sweat && sweat.discordPost;
+    if (!post || !post.messageId || post.messageId === skipMessageId) return;
+    const mode = sweat.deletedAt ? 'removed' : 'normal';
+    bot.patch(`/channels/${post.channelId}/messages/${post.messageId}`, sweatCard(sweat, post, mode))
+      .catch(err => {
+        // Someone deleted the message in Discord: stop trying to edit it.
+        if (err.response && err.response.status === 404) rememberPost(sweat._id, null);
+        else console.error('Discord card update failed', describeAxiosError(err));
+      });
   }
 
   // --- Slash commands ---
@@ -319,7 +342,8 @@ module.exports = function setupDiscord({
     const userId = (interaction.member && interaction.member.user && interaction.member.user.id) || (interaction.user && interaction.user.id);
     const who = roster.get(userId);
     if (!who) return reply(res, NOT_LINKED);
-    const req = { keyOwner: who };
+    const msg = interaction.message || {};
+    const req = { keyOwner: who, discordMessageId: msg.id };
 
     // Redraws the card the click came from, keeping its top line and footer.
     const old = (interaction.message && interaction.message.embeds && interaction.message.embeds[0]) || {};
@@ -328,6 +352,12 @@ module.exports = function setupDiscord({
 
     const sweat = await Sweat.findOne({ _id: id, ...LIVE }).lean();
     if (!sweat) return reply(res, GONE);
+    // Cards posted before the bot remembered its messages: the first click on
+    // one (in the Sweat Log channel, not a /sweat reply) records it.
+    if (!sweat.discordPost && msg.id && msg.channel_id === CHANNEL_ID && !msg.interaction_metadata && !msg.interaction) {
+      sweat.discordPost = { channelId: CHANNEL_ID, messageId: msg.id, ...header };
+      rememberPost(id, sweat.discordPost);
+    }
     const canEdit = withinChangeWindow(req, sweat.createdAt, 'edit');
 
     // Saves `set` on the sweat, logs what changed and redraws the card.
@@ -475,5 +505,5 @@ module.exports = function setupDiscord({
     }
   });
 
-  return { postNewSweat };
+  return { postNewSweat, refreshCard };
 };

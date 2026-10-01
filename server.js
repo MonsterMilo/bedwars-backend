@@ -402,6 +402,9 @@ const sweatSchemaFields = {
   // Who added it (roster id or 'admin'): only they can remove it, apart from
   // full-access keys. Older sweats get it from the activity log at startup.
   addedBy: { type: String, default: null },
+  // The Sweat Log message for this sweat ({ channelId, messageId, author,
+  // footer }), so the bot can edit it when the sweat changes on the site.
+  discordPost: { type: mongoose.Schema.Types.Mixed, default: null },
   createdAt: { type: Date, default: Date.now, index: true },
   // Soft delete: removing a sweat hides it (and records who did it) instead
   // of erasing it, so the admin key can restore it with everything intact.
@@ -474,6 +477,9 @@ mongoose.connection.once('open', async () => {
 // the person actually made.
 function logActivity(req, action, sweat, extra = {}) {
   if (!sweat) return;
+  // Keep its Sweat Log card in Discord matching. req.discordMessageId is
+  // the card a bot click came from, which the click redraws itself.
+  if (action !== 'sweat.add') discord.refreshCard(sweat, req.discordMessageId);
   Activity.create({
     who: req.keyOwner,
     action,
