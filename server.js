@@ -43,6 +43,11 @@ Object.entries(PERSONAL_KEY_ENV).forEach(([envName, who]) => {
 });
 const KEY_ADMIN = process.env.KEY_ADMIN;
 const DENICKER_API_KEY = process.env.DENICKER_API_KEY; // proxies the Denicker nick-lookup DB (see /denicker routes below)
+// Optional. A Discord webhook URL; when set, every newly added sweat is posted
+// to that channel. Kept server-side only - anyone holding it can post there.
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+// Where the Discord message's title links to (opens that player's card).
+const SITE_URL = process.env.SITE_URL || 'https://monstermilo.github.io/bedwars-frontend/';
 const PORT = process.env.PORT || 3000;
 
 // Comma-separated list of allowed origins, e.g. "https://monstermilo.github.io"
@@ -441,6 +446,52 @@ function logActivity(req, action, sweat, extra = {}) {
   }).catch(err => console.error('activity log write failed', err.message));
 }
 
+// --- Discord: post newly added sweats ---
+// Display names for the roster ids, matching the website's.
+const ROSTER_LABELS = {
+  milo: 'Milo', potat: 'Potat', aballs: 'ABoi', zoiv: 'Zoiv', max: 'Max',
+  sqoz: 'Sqoz', kermit: 'Kermit', ssent: 'Ssent', key: 'Key', admin: 'Admin'
+};
+const fmtStat = (n, digits = 0) => (Number.isFinite(n)
+  ? n.toLocaleString('en-US', { maximumFractionDigits: digits })
+  : '?');
+
+// Fire-and-forget like logActivity: Discord being down or slow never delays
+// or fails the add itself.
+function postSweatToDiscord(sweat, who) {
+  if (!DISCORD_WEBHOOK_URL || !sweat) return;
+  const beatenBy = ROSTER_FIELDS.filter(f => sweat[f]).map(f => ROSTER_LABELS[f]);
+  const tags = [sweat.cheating && 'Cheating', sweat.boosting && 'Boosting'].filter(Boolean);
+  const fields = [
+    { name: 'Star', value: `${fmtStat(sweat.star)}✫`, inline: true },
+    { name: 'FKDR', value: fmtStat(sweat.fkdr, 2), inline: true },
+    { name: 'WLR', value: fmtStat(sweat.wlr, 2), inline: true },
+    { name: 'Finals', value: fmtStat(sweat.finals), inline: true },
+    { name: 'Beds', value: fmtStat(sweat.beds), inline: true },
+    { name: 'BBLR', value: fmtStat(sweat.bblr, 2), inline: true }
+  ];
+  if (beatenBy.length) fields.push({ name: 'Beaten by', value: beatenBy.join(', ') });
+  if (tags.length) fields.push({ name: 'Tags', value: tags.join(', ') });
+  if (sweat.notes && sweat.notes[0]) fields.push({ name: 'Note', value: sweat.notes[0].text });
+
+  const embed = {
+    title: sweat.username,
+    url: `${SITE_URL}?player=${encodeURIComponent(sweat.username)}`,
+    color: tags.length ? 0xe74c3c : 0xf1c40f,
+    fields,
+    footer: { text: `Logged by ${ROSTER_LABELS[who] || who || 'unknown'}` },
+    timestamp: new Date(sweat.createdAt || Date.now()).toISOString()
+  };
+  if (sweat.uuid) embed.thumbnail = { url: `https://mc-heads.net/avatar/${sweat.uuid.replace(/-/g, '')}/64` };
+
+  axios.post(DISCORD_WEBHOOK_URL, {
+    username: 'Sweats',
+    embeds: [embed],
+    allowed_mentions: { parse: [] }
+  }, { timeout: 5000 })
+    .catch(err => console.error('Discord webhook failed', describeAxiosError(err)));
+}
+
 // Only KEY_ADMIN itself - not KEY_MILO, despite its full access - can read
 // the activity log or restore deleted sweats.
 function requireAdminKey(req, res, next) {
@@ -671,6 +722,7 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
 
     const saved = await new Sweat(fields).save();
     logActivity(req, 'sweat.add', saved, noteText ? { noteId: saved.notes[0]._id, noteText } : {});
+    postSweatToDiscord(saved, req.keyOwner);
     return res.status(201).json(saved);
   } catch (err) {
     console.error('/sweats POST error', err);
