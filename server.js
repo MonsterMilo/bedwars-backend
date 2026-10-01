@@ -150,6 +150,16 @@ function changeWindowError(action, what) {
   return `Personal keys can only ${verb} ${what} from the last ${CHANGE_WINDOW_DAYS[action]} days`;
 }
 
+// Removing a sweat: full-access keys can remove any; everyone else only ones
+// they added themselves, from the last 10 days. Returns why not, or null.
+// Shared by the website's DELETE route and the Discord bot.
+function canRemoveSweat(owner, sweat) {
+  if (hasFullAccess(owner)) return null;
+  if (!sweat.addedBy || sweat.addedBy !== owner) return 'You can only remove sweats you added yourself';
+  if (!withinChangeWindow({ keyOwner: owner }, sweat.createdAt, 'delete')) return changeWindowError('delete', 'sweats');
+  return null;
+}
+
 // Loads a live (not deleted) sweat for an edit/delete and checks the key may
 // touch it: personal keys may only edit a sweat added in the last 30 days, or
 // delete one from the last 10. Looks the document up itself (rather than
@@ -389,6 +399,9 @@ const sweatSchemaFields = {
   username: { type: String, required: true },
   uuid: { type: String, index: true },
   dateAdded: String, // e.g. "2025-08-09" (YYYY-MM-DD)
+  // Who added it (roster id or 'admin'): only they can remove it, apart from
+  // full-access keys. Older sweats get it from the activity log at startup.
+  addedBy: { type: String, default: null },
   createdAt: { type: Date, default: Date.now, index: true },
   // Soft delete: removing a sweat hides it (and records who did it) instead
   // of erasing it, so the admin key can restore it with everything intact.
@@ -433,6 +446,29 @@ const activitySchema = new mongoose.Schema({
   noteAuthor: String  // note.delete: who had written the removed note
 });
 const Activity = mongoose.model('Activity', activitySchema);
+
+// One-off fill-in for sweats saved before addedBy existed: take it from the
+// activity log's "sweat.add" entry. Runs at every start but only touches
+// sweats still missing it, so after the first run it's a single empty query.
+// Sweats older than the activity log stay unowned: only full-access keys can
+// remove those.
+mongoose.connection.once('open', async () => {
+  try {
+    const missing = await Sweat.find({ addedBy: null }, { _id: 1 }).lean();
+    if (!missing.length) return;
+    const adds = await Activity.find(
+      { action: 'sweat.add', sweatId: { $in: missing.map(d => d._id) }, who: { $ne: null } },
+      { sweatId: 1, who: 1 }
+    ).lean();
+    if (!adds.length) return;
+    await Sweat.bulkWrite(adds.map(a => ({
+      updateOne: { filter: { _id: a.sweatId, addedBy: null }, update: { $set: { addedBy: a.who } } }
+    })));
+    console.log(`Filled in who added ${adds.length} older sweat(s) from the activity log`);
+  } catch (err) {
+    console.error('addedBy fill-in failed', err.message);
+  }
+});
 
 // Fire-and-forget: a failed log write is reported but never fails the change
 // the person actually made.
@@ -580,7 +616,8 @@ app.get('/denicker/history/:uuid', validUuid('uuid'), requireKeyForDenicker, den
 
 // --- Discord bot (see discord.js) ---
 const discord = require('./discord')({
-  app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, logActivity, withinChangeWindow, describeAxiosError
+  app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
+  cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError
 });
 
 // --- Sweats API: shared DB ---
@@ -672,7 +709,7 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
     const dateAdded = typeof body.dateAdded === 'string' && DATE_RE.test(body.dateAdded)
       ? body.dateAdded
       : new Date().toISOString().slice(0, 10);
-    const fields = { username, uuid, dateAdded };
+    const fields = { username, uuid, dateAdded, addedBy: req.keyOwner };
     NUMERIC_FIELDS.forEach(f => { fields[f] = cleanStat(body[f]) ?? 0; });
     BOOLEAN_FIELDS.forEach(f => { fields[f] = !!body[f]; });
 
@@ -698,7 +735,10 @@ app.delete('/sweats/:id', requireWriteKey, writeLimiter, async (req, res) => {
   try {
     const id = req.params.id;
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
-    if (!(await loadSweatForChange(req, res, id, 'delete'))) return;
+    const existing = await Sweat.findOne({ _id: id, ...LIVE }).lean();
+    if (!existing) return res.status(404).json({ error: 'Not found' });
+    const notAllowed = canRemoveSweat(req.keyOwner, existing);
+    if (notAllowed) return res.status(403).json({ error: notAllowed });
 
     const deleted = await Sweat.findOneAndUpdate(
       { _id: id, ...LIVE },
