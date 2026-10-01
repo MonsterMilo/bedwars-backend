@@ -510,7 +510,7 @@ function postSweatToDiscord(sweat, who) {
     .then(n => { embed.footer.text = `Sweat #${n.toLocaleString('en-US')}`; })
     .catch(err => console.error('Discord sweat count failed', err.message))
     .then(() => axios.post(DISCORD_WEBHOOK_URL, {
-      username: 'Sweats',
+      username: 'Sweat Log',
       embeds: [embed],
       allowed_mentions: { parse: [] }
     }, { timeout: 5000 }))
