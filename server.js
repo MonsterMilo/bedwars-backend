@@ -43,11 +43,6 @@ Object.entries(PERSONAL_KEY_ENV).forEach(([envName, who]) => {
 });
 const KEY_ADMIN = process.env.KEY_ADMIN;
 const DENICKER_API_KEY = process.env.DENICKER_API_KEY; // proxies the Denicker nick-lookup DB (see /denicker routes below)
-// Optional. A Discord webhook URL; when set, every newly added sweat is posted
-// to that channel. Kept server-side only - anyone holding it can post there.
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-// Where the Discord message's title links to (opens that player's card).
-const SITE_URL = process.env.SITE_URL || 'https://monstermilo.github.io/bedwars-frontend/';
 const PORT = process.env.PORT || 3000;
 
 // Comma-separated list of allowed origins, e.g. "https://monstermilo.github.io"
@@ -68,7 +63,14 @@ app.use(cors({
     return callback(new Error('Not allowed by CORS'));
   }
 }));
-app.use(express.json({ limit: '100kb' }));
+// The Discord endpoint checks a signature over the exact bytes Discord sent,
+// so keep them for that route.
+app.use(express.json({
+  limit: '100kb',
+  verify(req, res, buf) {
+    if (req.originalUrl === '/discord/interactions') req.rawBody = buf;
+  }
+}));
 
 if (!MONGODB_URI) {
   console.warn('Warning: MONGODB_URI not set. DB features will fail until set.');
@@ -446,77 +448,6 @@ function logActivity(req, action, sweat, extra = {}) {
   }).catch(err => console.error('activity log write failed', err.message));
 }
 
-// --- Discord: post newly added sweats ---
-// Display names for the roster ids, matching the website's.
-const ROSTER_LABELS = {
-  milo: 'Milo', potat: 'Potat', aballs: 'ABoi', zoiv: 'Zoiv', max: 'Max',
-  sqoz: 'Sqoz', kermit: 'Kermit', ssent: 'Ssent', key: 'Key', admin: 'Admin'
-};
-// Stats missing from the request are saved as 0, so 0 is shown as a dash
-// rather than as a real zero.
-const fmtStat = (n, digits = 0) => (Number.isFinite(n) && n !== 0
-  ? n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })
-  : '—');
-// Sidebar colour: red for cheating, yellow for boosting only, otherwise the
-// website's cyan accent.
-const DISCORD_COLORS = { cheating: 0xed4245, boosting: 0xf0b232, normal: 0x00d9ff };
-
-// Fire-and-forget like logActivity: Discord being down or slow never delays
-// or fails the add itself.
-function postSweatToDiscord(sweat, who) {
-  if (!DISCORD_WEBHOOK_URL || !sweat) return;
-  const uuid = sweat.uuid ? sweat.uuid.replace(/-/g, '') : null;
-  const beatenBy = ROSTER_FIELDS.filter(f => sweat[f]).map(f => ROSTER_LABELS[f]);
-  const logger = ROSTER_LABELS[who] || who || 'Someone';
-
-  const tags = [];
-  if (sweat.cheating) tags.push('🚩 **Cheating**');
-  if (sweat.boosting) tags.push('⚠️ **Boosting**');
-  const color = sweat.cheating ? DISCORD_COLORS.cheating
-    : sweat.boosting ? DISCORD_COLORS.boosting
-      : DISCORD_COLORS.normal;
-
-  // Two rows of three: ratios on top, totals underneath. Left out entirely
-  // when the sweat was added with no stats at all.
-  const hasStats = ['fkdr', 'wlr', 'bblr', 'finals', 'beds', 'kills'].some(f => sweat[f]);
-  const fields = !hasStats ? [] : [
-    { name: 'FKDR', value: `**${fmtStat(sweat.fkdr, 2)}**`, inline: true },
-    { name: 'WLR', value: `**${fmtStat(sweat.wlr, 2)}**`, inline: true },
-    { name: 'BBLR', value: `**${fmtStat(sweat.bblr, 2)}**`, inline: true },
-    { name: 'Finals', value: fmtStat(sweat.finals), inline: true },
-    { name: 'Beds', value: fmtStat(sweat.beds), inline: true },
-    { name: 'Kills', value: fmtStat(sweat.kills), inline: true }
-  ];
-  if (beatenBy.length) fields.push({ name: 'Beaten by', value: beatenBy.join(' · ') });
-  const note = sweat.notes && sweat.notes[0] && sweat.notes[0].text;
-  if (note) fields.push({ name: 'Note', value: `> ${note.replace(/\n/g, '\n> ')}` });
-
-  const star = Number.isFinite(sweat.star) && sweat.star > 0 ? `[${fmtStat(sweat.star)}✫] ` : '';
-  const embed = {
-    author: { name: `${logger} logged a new sweat` },
-    title: `${star}${sweat.username}`,
-    url: `${SITE_URL}?player=${encodeURIComponent(sweat.username)}`,
-    color,
-    fields,
-    footer: { text: 'Bed Wars Sweats' },
-    timestamp: new Date(sweat.createdAt || Date.now()).toISOString()
-  };
-  if (tags.length) embed.description = tags.join('   ');
-  if (uuid) embed.thumbnail = { url: `https://mc-heads.net/head/${uuid}/128` };
-
-  // Footer number = how many sweats are on the list now, this one included.
-  // If the count fails the message still goes, just without the number.
-  Sweat.countDocuments(LIVE)
-    .then(n => { embed.footer.text = `Sweat #${n.toLocaleString('en-US')}`; })
-    .catch(err => console.error('Discord sweat count failed', err.message))
-    .then(() => axios.post(DISCORD_WEBHOOK_URL, {
-      username: 'Sweat Log',
-      embeds: [embed],
-      allowed_mentions: { parse: [] }
-    }, { timeout: 5000 }))
-    .catch(err => console.error('Discord webhook failed', describeAxiosError(err)));
-}
-
 // Only KEY_ADMIN itself - not KEY_MILO, despite its full access - can read
 // the activity log or restore deleted sweats.
 function requireAdminKey(req, res, next) {
@@ -647,6 +578,11 @@ app.get('/denicker/history/:uuid', validUuid('uuid'), requireKeyForDenicker, den
   }
 });
 
+// --- Discord bot (see discord.js) ---
+const discord = require('./discord')({
+  app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, logActivity, withinChangeWindow, describeAxiosError
+});
+
 // --- Sweats API: shared DB ---
 // GET all sweats (sorted newest first). Public and unauthenticated like the
 // proxy routes above, so it needs a rate limit too - otherwise it's the one
@@ -747,7 +683,7 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
 
     const saved = await new Sweat(fields).save();
     logActivity(req, 'sweat.add', saved, noteText ? { noteId: saved.notes[0]._id, noteText } : {});
-    postSweatToDiscord(saved, req.keyOwner);
+    discord.postNewSweat(saved, req.keyOwner);
     return res.status(201).json(saved);
   } catch (err) {
     console.error('/sweats POST error', err);
