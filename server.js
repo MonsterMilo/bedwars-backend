@@ -504,11 +504,16 @@ function postSweatToDiscord(sweat, who) {
   if (tags.length) embed.description = tags.join('   ');
   if (uuid) embed.thumbnail = { url: `https://mc-heads.net/head/${uuid}/128` };
 
-  axios.post(DISCORD_WEBHOOK_URL, {
-    username: 'Sweats',
-    embeds: [embed],
-    allowed_mentions: { parse: [] }
-  }, { timeout: 5000 })
+  // Footer number = how many sweats are on the list now, this one included.
+  // If the count fails the message still goes, just without the number.
+  Sweat.countDocuments(LIVE)
+    .then(n => { embed.footer.text = `Sweat #${n.toLocaleString('en-US')}`; })
+    .catch(err => console.error('Discord sweat count failed', err.message))
+    .then(() => axios.post(DISCORD_WEBHOOK_URL, {
+      username: 'Sweats',
+      embeds: [embed],
+      allowed_mentions: { parse: [] }
+    }, { timeout: 5000 }))
     .catch(err => console.error('Discord webhook failed', describeAxiosError(err)));
 }
 
