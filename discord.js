@@ -77,8 +77,6 @@ const FLAG_FILTERS = [
   { id: 'clean', name: 'Not flagged', label: 'not flagged', test: s => !s.cheating && !s.boosting }
 ];
 const PAGE_SIZE = 10;
-// The /beaten card's min star dropdown.
-const MIN_STARS = ['500', '1000', '1500', '2000', '3000'];
 // The stats the website's edit form changes - five, which is also the most
 // boxes a Discord pop-up can hold.
 const STAT_INPUTS = [
@@ -171,7 +169,7 @@ const DiscordPref = mongoose.models.DiscordPref || mongoose.model('DiscordPref',
 module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -231,6 +229,32 @@ module.exports = function setupDiscord({
     skinsLoading.set(id, loading);
     return loading;
   }
+
+  // A player's stats now, for the "since logged" changes on looked-up cards.
+  // Kept for 10 minutes and shared like skins. A card waits at most
+  // LIVE_WAIT_MS for them, and is drawn without the changes if they're
+  // slower (they're still saved for the next card).
+  const LIVE_WAIT_MS = 3000;
+  const lives = new Map(); // uuid -> { stats, at }
+  const livesLoading = new Map(); // uuid -> promise
+  function liveStatsFor(uuid) {
+    const id = uuidForms(uuid)[0];
+    if (!id || !currentStats) return Promise.resolve(null);
+    const hit = lives.get(id);
+    if (hit && Date.now() - hit.at < 10 * 60 * 1000) return Promise.resolve(hit.stats);
+    if (livesLoading.has(id)) return livesLoading.get(id);
+    const loading = currentStats(id).then(stats => {
+      if (lives.size > 300) lives.delete(lives.keys().next().value);
+      lives.set(id, { stats, at: Date.now() });
+      return stats;
+    }).catch(err => {
+      console.warn('Live stats failed', id, describeAxiosError(err));
+      return null;
+    }).finally(() => livesLoading.delete(id));
+    livesLoading.set(id, loading);
+    return loading;
+  }
+  const liveStatsWithin = uuid => Promise.race([liveStatsFor(uuid), new Promise(r => setTimeout(() => r(null), LIVE_WAIT_MS))]);
 
   // --- Sending cards ---
   // A message is { content, components, png, kind, theme }: the card goes up
@@ -294,11 +318,11 @@ module.exports = function setupDiscord({
     const last = notes[notes.length - 1];
     const timing = {};
     const t0 = Date.now();
-    const skin = await skinFor(sweat.uuid);
+    const [skin, live] = await Promise.all([skinFor(sweat.uuid), header.live && mode !== 'removed' ? liveStatsWithin(sweat.uuid) : null]);
     timing.skinMs = Date.now() - t0;
     const png = await cards.render(cards.sweatCard(sweat, themeId, {
-      skin,
-      footer: header.footer,
+      skin, live,
+      footer: live && header.footer ? [header.footer[0], '▲▼ since logged'] : header.footer,
       line: header.line,
       note: last && last.text ? { text: last.text, by: ROSTER_LABELS[last.author] || last.author, count: notes.length } : null,
       removedBy: mode === 'removed' ? (ROSTER_LABELS[sweat.deletedBy] || sweat.deletedBy || 'someone') : null
@@ -390,8 +414,10 @@ module.exports = function setupDiscord({
 
   // Footers: a channel post says who logged it and its number; a lookup
   // says when it was added and by whom.
+  // Looked-up cards also show how the player's stats changed since then.
   const lookupHeader = (sweat, extra = {}) => ({
     footer: [`Added ${addedOn(sweat)}${sweat.addedBy ? ` by ${ROSTER_LABELS[sweat.addedBy] || sweat.addedBy}` : ''}`, 'Sweat Log'],
+    live: true,
     ...extra
   });
   const postCaption = (sweat, who) => `**${ROSTER_LABELS[who] || who || 'Someone'}** logged **${sweat.username}**`;
@@ -500,7 +526,7 @@ module.exports = function setupDiscord({
       { type: 3, name: 'flag', description: 'Only flagged / not flagged', required: false, choices: FLAG_FILTERS.map(f => ({ name: f.name, value: f.id })) },
       { type: 4, name: 'min_star', description: 'Only this star or higher', required: false, min_value: 0, max_value: 10000 },
       { type: 10, name: 'min_fkdr', description: 'Only this FKDR or higher', required: false, min_value: 0, max_value: 1000 },
-      { type: 3, name: 'name', description: 'Names containing this', required: false, max_length: 16 }
+      { type: 3, name: 'name', description: 'Names containing this', required: false, max_length: 16, autocomplete: true }
     ]
   }, {
     name: 'stats',
@@ -594,17 +620,23 @@ module.exports = function setupDiscord({
         const now = player.name || name;
         if (now.toLowerCase() !== sweat.username.toLowerCase()) line = `Now known as ${now}`;
       }
+      liveStatsFor(sweat.uuid);
       const [nav] = await Promise.all([entriesOf(sweat), skinFor(sweat.uuid)]);
       return sweatMessage(sweat, theme, lookupHeader(sweat, { line }), 'normal', nav);
     });
   }
 
-  // --- /sweat autocomplete ---
+  // --- Name autocomplete (/sweat, /beaten) ---
   // Names on the list starting with what's typed so far, newest first.
   async function onAutocomplete(interaction, res) {
     const focused = (interaction.data.options || []).find(o => o.focused);
     const typed = String((focused && focused.value) || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16);
-    const filter = typed ? { ...LIVE, username: new RegExp(`^${typed}`, 'i') } : LIVE;
+    const filter = typed ? { ...LIVE, username: new RegExp(`^${typed}`, 'i') } : { ...LIVE };
+    // /beaten only suggests names on that person's list.
+    if (interaction.data.name === 'beaten') {
+      const person = optionOf(interaction, 'person') || roster.get(userOf(interaction));
+      if (ROSTER_FIELDS.includes(person)) filter[person] = true;
+    }
     const docs = await Sweat.find(filter, { username: 1 }).sort({ createdAt: -1 }).limit(50).lean();
     const seen = new Set();
     const choices = [];
@@ -752,8 +784,8 @@ module.exports = function setupDiscord({
     const m = BEATEN_STATE.exec(interaction.data.custom_id || '');
     if (!m || !ROSTER_FIELDS.includes(m[3])) return reply(res, 'That doesn\'t do anything any more.');
     const state = { page: Number(m[2]), person: m[3], sort: m[4], flag: m[5], minStar: m[6], minFkdr: m[7], name: m[8] };
-    // The dropdowns (S = sort, F = flags, M = min star) change one setting
-    // and go back to the first page.
+    // The dropdowns (S = sort; F = flags and M = min star on older cards)
+    // change one setting and go back to the first page.
     const picked = ((interaction.data.values || [])[0] || '').replace(/[^\w]/g, '');
     if (m[1] === 'S' && SORTS.some(x => x.id === picked)) state.sort = picked;
     if (m[1] === 'F') state.flag = FLAG_FILTERS.some(x => x.id === picked) ? picked : '';
@@ -767,7 +799,7 @@ module.exports = function setupDiscord({
     const sort = SORTS.find(s => s.id === state.sort) || SORTS[0];
     const flag = FLAG_FILTERS.find(f => f.id === state.flag);
     const all = await Sweat.find({ ...LIVE, [state.person]: true },
-      { username: 1, star: 1, fkdr: 1, wlr: 1, cheating: 1, boosting: 1, createdAt: 1 }).lean();
+      ROSTER_FIELDS.reduce((o, f) => { o[f] = 1; return o; }, { username: 1, star: 1, fkdr: 1, wlr: 1, cheating: 1, boosting: 1, createdAt: 1 })).lean();
     const filters = [];
     let list = all;
     if (flag) { list = list.filter(flag.test); filters.push(flag.label); }
@@ -781,7 +813,9 @@ module.exports = function setupDiscord({
     const page = Math.min(Math.max(0, state.page), pages - 1);
     const rows = list.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((s, i) => ({
       n: page * PAGE_SIZE + i + 1, star: s.star, username: s.username, fkdr: s.fkdr, wlr: s.wlr,
-      cheating: s.cheating, boosting: s.boosting, ago: s.createdAt ? agoShort(s.createdAt) : ''
+      cheating: s.cheating, boosting: s.boosting, ago: s.createdAt ? agoShort(s.createdAt) : '',
+      // Who else beat them (the list's own person is a given).
+      beaten: ROSTER_FIELDS.filter(f => f !== state.person && s[f])
     }));
     // One short line: the filters, how many match, and the order.
     const lines = [[filters.length ? `${filters.join(', ')}: ${plural(list.length, 'sweat')}` : plural(list.length, 'sweat'), sort.label].join(' · ')];
@@ -797,15 +831,9 @@ module.exports = function setupDiscord({
       type: SELECT, custom_id: id(k, 0), placeholder, min_values: 1, max_values: 1, options
     }] });
     const components = [
-      select('S', 'Sort', SORTS.map(x => ({ label: `Sort: ${x.name}`, value: x.id, default: x.id === sort.id }))),
-      select('F', 'Flags', [{ id: 'any', label: 'any' }, ...FLAG_FILTERS].map(x => ({
-        label: `Flags: ${x.label}`, value: x.id, default: (state.flag || 'any') === x.id
-      }))),
-      select('M', 'Min star', ['any', ...MIN_STARS].map(v => ({
-        label: v === 'any' ? 'Stars: any' : `Stars: ${v}✫ or more`, value: v, default: (state.minStar || 'any') === v
-      })))
+      select('S', 'Sort', SORTS.map(x => ({ label: `Sort: ${x.name}`, value: x.id, default: x.id === sort.id })))
     ];
-    // Page buttons on top, the dropdowns under them.
+    // Page buttons on top, the sort dropdown under them.
     if (pages > 1) components.unshift({ type: ROW, components: [
       { type: BUTTON, style: STYLE.grey, label: '⏮', custom_id: id('f', 0), disabled: page === 0 },
       { type: BUTTON, style: STYLE.blurple, label: '◀ Prev', custom_id: id('p', page - 1), disabled: page === 0 },
@@ -816,113 +844,168 @@ module.exports = function setupDiscord({
   }
 
   // --- /stats ---
+  // A Person dropdown on the card switches between the whole list and each
+  // person (custom_id "st:W", the value is "all" or a roster field).
   async function onStats(interaction, res) {
     const person = optionOf(interaction, 'person');
     const theme = themeOf(userOf(interaction));
-    return withCard(interaction, res, async () => {
-      const keep = ['username', 'uuid', 'star', 'fkdr', 'wlr', 'cheating', 'boosting', 'createdAt', 'addedBy', 'notes', ...ROSTER_FIELDS]
-        .reduce((o, f) => { o[f] = 1; return o; }, {});
-      const everything = await Sweat.find(LIVE, keep).lean();
-      const list = person ? everything.filter(sw => sw[person]) : everything;
-      const n = list.length;
+    return withCard(interaction, res, () => statsPage(ROSTER_FIELDS.includes(person) ? person : null, theme));
+  }
 
-      const vals = k => list.map(sw => sw[k]).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
-      const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
-      const median = a => (a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2) : 0);
-      const top = k => list.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])[0];
-      const since = days => list.filter(sw => sw.createdAt && Date.now() - new Date(sw.createdAt).getTime() < days * DAY_MS).length;
-      const dates = list.map(sw => sw.createdAt && new Date(sw.createdAt).getTime()).filter(Boolean).sort((a, b) => a - b);
-      const weeks = dates.length ? Math.max(1, (Date.now() - dates[0]) / (7 * DAY_MS)) : 1;
-      const players = new Set(list.map(sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase())).size;
-      const starV = vals('star'), fkdrV = vals('fkdr'), wlrV = vals('wlr');
-      const cheating = list.filter(sw => sw.cheating).length;
-      const boosting = list.filter(sw => sw.boosting).length;
-      const notes = list.reduce((t, sw) => t + ((sw.notes || []).length), 0);
-      const fk = v => cards.ratioColor(theme, v, 'fkdr');
-      const wl = v => cards.ratioColor(theme, v, 'wlr');
-      const ranked = counts => Object.entries(counts).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]).slice(0, 3);
+  async function onStatsPick(interaction, res) {
+    const picked = (interaction.data.values || [])[0];
+    res.json({ type: DEFER_UPDATE });
+    return editOriginal(interaction, await statsPage(ROSTER_FIELDS.includes(picked) ? picked : null,
+      themeOfMessage(interaction.message) || themeOf(userOf(interaction))));
+  }
 
-      let people;
-      let third;
-      if (person) {
-        const counts = Object.fromEntries(ROSTER_FIELDS.map(f => [f, everything.filter(sw => sw[f]).length]));
-        const place = 1 + Object.values(counts).filter(c => c > n).length;
-        people = { title: 'Most often beaten with', rows: ranked(Object.fromEntries(ROSTER_FIELDS.filter(f => f !== person).map(f => [f, list.filter(sw => sw[f]).length]))) };
-        third = { title: ROSTER_LABELS[person], rows: [['Leaderboard', `#${place}`], ['Share of list', pct(n, everything.length)], ['Flagged', num(cheating + boosting)]] };
-      } else {
-        people = { title: 'Beaten the most', rows: ranked(Object.fromEntries(ROSTER_FIELDS.map(f => [f, list.filter(sw => sw[f]).length]))) };
-        third = { title: 'Flags', rows: [['Cheating', `${num(cheating)} · ${pct(cheating, n)}`], ['Boosting', `${num(boosting)} · ${pct(boosting, n)}`], ['Notes', num(notes)]] };
-      }
-      const topStar = top('star'), topFkdr = top('fkdr'), topWlr = top('wlr');
-      const timing = {};
-      const png = await cards.render(cards.statsCard(theme, {
-        title: person ? 'Sweats beaten by' : 'Sweat stats', who: person || null, right: person ? null : 'Whole list',
-        summary: [[num(n), 'Sweats'], [num(players), 'Players'], [(n / weeks).toFixed(1), 'A week'], [`+${num(since(30))}`, '30 days']],
-        blocks: [
-          { title: 'Average', rows: [['Star', stars(mean(starV))], ['FKDR', mean(fkdrV).toFixed(2), fk(mean(fkdrV))], ['WLR', mean(wlrV).toFixed(2), wl(mean(wlrV))]] },
-          { title: 'Median', rows: [['Star', stars(median(starV))], ['FKDR', median(fkdrV).toFixed(2), fk(median(fkdrV))], ['WLR', median(wlrV).toFixed(2), wl(median(wlrV))]] },
-          third
-        ],
-        people,
-        top: [
-          topStar && { star: topStar.star, username: topStar.username, value: stars(topStar.star) },
-          topFkdr && { star: topFkdr.star, username: topFkdr.username, value: `${topFkdr.fkdr.toFixed(2)} FKDR`, color: fk(topFkdr.fkdr) },
-          topWlr && { star: topWlr.star, username: topWlr.username, value: `${topWlr.wlr.toFixed(2)} WLR`, color: wl(topWlr.wlr) }
-        ].filter(Boolean),
-        footer: [dates.length ? `First sweat ${day(new Date(dates[0]))} · latest ${ago(dates[dates.length - 1])}` : 'No sweats yet', 'Sweat Log']
-      }), timing);
-      return { png, kind: 'stats', theme, timing };
-    });
+  async function statsPage(person, theme) {
+    const keep = ['username', 'uuid', 'star', 'fkdr', 'wlr', 'cheating', 'boosting', 'createdAt', 'addedBy', 'notes', ...ROSTER_FIELDS]
+      .reduce((o, f) => { o[f] = 1; return o; }, {});
+    const everything = await Sweat.find(LIVE, keep).lean();
+    const list = person ? everything.filter(sw => sw[person]) : everything;
+    const n = list.length;
+
+    const vals = k => list.map(sw => sw[k]).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+    const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+    const median = a => (a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2) : 0);
+    const top = k => list.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])[0];
+    const since = days => list.filter(sw => sw.createdAt && Date.now() - new Date(sw.createdAt).getTime() < days * DAY_MS).length;
+    const dates = list.map(sw => sw.createdAt && new Date(sw.createdAt).getTime()).filter(Boolean).sort((a, b) => a - b);
+    const weeks = dates.length ? Math.max(1, (Date.now() - dates[0]) / (7 * DAY_MS)) : 1;
+    const players = new Set(list.map(sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase())).size;
+    const starV = vals('star'), fkdrV = vals('fkdr'), wlrV = vals('wlr');
+    const cheating = list.filter(sw => sw.cheating).length;
+    const boosting = list.filter(sw => sw.boosting).length;
+    const notes = list.reduce((t, sw) => t + ((sw.notes || []).length), 0);
+    const fk = v => cards.ratioColor(theme, v, 'fkdr');
+    const wl = v => cards.ratioColor(theme, v, 'wlr');
+    const ranked = counts => Object.entries(counts).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+    let people;
+    let third;
+    if (person) {
+      const counts = Object.fromEntries(ROSTER_FIELDS.map(f => [f, everything.filter(sw => sw[f]).length]));
+      const place = 1 + Object.values(counts).filter(c => c > n).length;
+      people = { title: 'Most often beaten with', rows: ranked(Object.fromEntries(ROSTER_FIELDS.filter(f => f !== person).map(f => [f, list.filter(sw => sw[f]).length]))) };
+      third = { title: ROSTER_LABELS[person], rows: [['Leaderboard', `#${place}`], ['Share of list', pct(n, everything.length)], ['Flagged', num(cheating + boosting)]] };
+    } else {
+      people = { title: 'Beaten the most', rows: ranked(Object.fromEntries(ROSTER_FIELDS.map(f => [f, list.filter(sw => sw[f]).length]))) };
+      third = { title: 'Flags', rows: [['Cheating', `${num(cheating)} · ${pct(cheating, n)}`], ['Boosting', `${num(boosting)} · ${pct(boosting, n)}`], ['Notes', num(notes)]] };
+    }
+    const topStar = top('star'), topFkdr = top('fkdr'), topWlr = top('wlr');
+    const timing = {};
+    const png = await cards.render(cards.statsCard(theme, {
+      title: person ? 'Sweats beaten by' : 'Sweat stats', who: person || null, right: person ? null : 'Whole list',
+      summary: [[num(n), 'Sweats'], [num(players), 'Players'], [(n / weeks).toFixed(1), 'A week'], [`+${num(since(30))}`, '30 days']],
+      blocks: [
+        { title: 'Average', rows: [['Star', stars(mean(starV))], ['FKDR', mean(fkdrV).toFixed(2), fk(mean(fkdrV))], ['WLR', mean(wlrV).toFixed(2), wl(mean(wlrV))]] },
+        { title: 'Median', rows: [['Star', stars(median(starV))], ['FKDR', median(fkdrV).toFixed(2), fk(median(fkdrV))], ['WLR', median(wlrV).toFixed(2), wl(median(wlrV))]] },
+        third
+      ],
+      people,
+      top: [
+        topStar && { star: topStar.star, username: topStar.username, value: stars(topStar.star) },
+        topFkdr && { star: topFkdr.star, username: topFkdr.username, value: `${topFkdr.fkdr.toFixed(2)} FKDR`, color: fk(topFkdr.fkdr) },
+        topWlr && { star: topWlr.star, username: topWlr.username, value: `${topWlr.wlr.toFixed(2)} WLR`, color: wl(topWlr.wlr) }
+      ].filter(Boolean),
+      footer: [dates.length ? `First sweat ${day(new Date(dates[0]))} · latest ${ago(dates[dates.length - 1])}` : 'No sweats yet', 'Sweat Log']
+    }), timing);
+    const components = [{ type: ROW, components: [{
+      type: SELECT, custom_id: 'st:W', min_values: 1, max_values: 1,
+      options: [{ label: 'Whole list', value: 'all', default: !person },
+        ...ROSTER_FIELDS.map(f => ({ label: `Beaten by ${ROSTER_LABELS[f]}`, value: f, default: f === person }))]
+    }] }];
+    return { png, kind: 'stats', theme, components, timing };
   }
 
   // --- /leaderboard ---
+  // The card has Type and Period dropdowns, and page arrows on the sweat
+  // boards (10 a page). State lives in the custom_id:
+  // lb:<what>:<page>:<board>:<period>.
+  const LB_STATE = /^lb:([TPfpnl]):(-?\d+):(\w+):(\w+)$/;
+
   async function onLeaderboard(interaction, res) {
-    const board = LEADERBOARDS.find(b => b.id === optionOf(interaction, 'type')) || LEADERBOARDS[0];
-    const period = PERIODS.find(p => p.id === optionOf(interaction, 'period')) || PERIODS[0];
+    const state = { board: optionOf(interaction, 'type') || 'beaten', period: optionOf(interaction, 'period') || 'all', page: 0 };
     const theme = themeOf(userOf(interaction));
-    return withCard(interaction, res, async () => {
-      const filter = period.days ? { ...LIVE, createdAt: { $gte: new Date(Date.now() - period.days * DAY_MS) } } : LIVE;
-      const keep = ['username', 'uuid', 'addedBy', 'createdAt', 'star', 'fkdr', 'wlr', ...ROSTER_FIELDS]
-        .reduce((o, f) => { o[f] = 1; return o; }, {});
-      const sweats = await Sweat.find(filter, keep).lean();
-      const data = { title: board.title, right: period.name, footer: [`${plural(sweats.length, 'sweat')} counted`, 'Sweat Log'] };
-      if (board.kind === 'people') {
-        // Sweats added with the admin key count as "Admin" for who logged most.
-        const people = board.id === 'logged' ? [...ROSTER_FIELDS, 'admin'] : ROSTER_FIELDS;
-        const counts = Object.fromEntries(people.map(f => [f, 0]));
-        sweats.forEach(sw => {
-          if (board.id === 'logged') { if (counts[sw.addedBy] !== undefined) counts[sw.addedBy]++; }
-          else ROSTER_FIELDS.forEach(f => { if (sw[f]) counts[f]++; });
+    return withCard(interaction, res, () => leaderboardPage(state, theme));
+  }
+
+  async function onLeaderboardPage(interaction, res) {
+    const m = LB_STATE.exec(interaction.data.custom_id || '');
+    if (!m) return reply(res, 'That doesn\'t do anything any more.');
+    const state = { page: Number(m[2]), board: m[3], period: m[4] };
+    const picked = ((interaction.data.values || [])[0] || '').replace(/[^\w]/g, '');
+    if (m[1] === 'T') { state.board = picked; state.page = 0; }
+    if (m[1] === 'P') { state.period = picked; state.page = 0; }
+    res.json({ type: DEFER_UPDATE });
+    return editOriginal(interaction, await leaderboardPage(state, themeOfMessage(interaction.message) || themeOf(userOf(interaction))));
+  }
+
+  async function leaderboardPage(state, theme) {
+    const board = LEADERBOARDS.find(b => b.id === state.board) || LEADERBOARDS[0];
+    const period = PERIODS.find(p => p.id === state.period) || PERIODS[0];
+    const filter = period.days ? { ...LIVE, createdAt: { $gte: new Date(Date.now() - period.days * DAY_MS) } } : LIVE;
+    const keep = ['username', 'uuid', 'addedBy', 'createdAt', 'star', 'fkdr', 'wlr', ...ROSTER_FIELDS]
+      .reduce((o, f) => { o[f] = 1; return o; }, {});
+    const sweats = await Sweat.find(filter, keep).lean();
+    let pages = 1, page = 0;
+    const data = { title: board.title, right: period.name, footer: [`${plural(sweats.length, 'sweat')} counted`, 'Sweat Log'] };
+    if (board.kind === 'people') {
+      // Sweats added with the admin key count as "Admin" for who logged most.
+      const people = board.id === 'logged' ? [...ROSTER_FIELDS, 'admin'] : ROSTER_FIELDS;
+      const counts = Object.fromEntries(people.map(f => [f, 0]));
+      sweats.forEach(sw => {
+        if (board.id === 'logged') { if (counts[sw.addedBy] !== undefined) counts[sw.addedBy]++; }
+        else ROSTER_FIELDS.forEach(f => { if (sw[f]) counts[f]++; });
+      });
+      data.people = people.filter(f => counts[f] > 0).sort((a, b) => counts[b] - counts[a]).map(f => [f, counts[f]]);
+    } else {
+      const k = board.stat;
+      // Each player once, by their best entry - but showing everyone who
+      // has beaten them across all their entries.
+      const key = sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
+      const beatenBy = new Map();
+      sweats.forEach(sw => {
+        const set = beatenBy.get(key(sw)) || new Set();
+        ROSTER_FIELDS.forEach(f => { if (sw[f]) set.add(f); });
+        beatenBy.set(key(sw), set);
+      });
+      const seen = new Set();
+      const ranked = sweats.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])
+        .filter(sw => {
+          const who = key(sw);
+          if (seen.has(who)) return false;
+          seen.add(who);
+          return true;
         });
-        data.people = people.filter(f => counts[f] > 0).sort((a, b) => counts[b] - counts[a]).map(f => [f, counts[f]]);
-      } else {
-        const k = board.stat;
-        // Each player once, by their best entry - but showing everyone who
-        // has beaten them across all their entries.
-        const key = sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
-        const beatenBy = new Map();
-        sweats.forEach(sw => {
-          const set = beatenBy.get(key(sw)) || new Set();
-          ROSTER_FIELDS.forEach(f => { if (sw[f]) set.add(f); });
-          beatenBy.set(key(sw), set);
-        });
-        const seen = new Set();
-        data.sweats = sweats.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])
-          .filter(sw => {
-            const who = key(sw);
-            if (seen.has(who)) return false;
-            seen.add(who);
-            return true;
-          }).slice(0, 10)
-          .map(sw => ({
-            star: sw.star, username: sw.username, beaten: ROSTER_FIELDS.filter(f => beatenBy.get(key(sw)).has(f)),
-            value: k === 'star' ? stars(sw.star) : sw[k].toFixed(2),
-            color: k === 'star' ? null : cards.ratioColor(theme, sw[k], k)
-          }));
-      }
-      const timing = {};
-      return { png: await cards.render(cards.leaderboardCard(theme, data), timing), kind: 'leaderboard', theme, timing };
-    });
+      pages = Math.max(1, Math.ceil(ranked.length / PAGE_SIZE));
+      page = Math.min(Math.max(0, state.page), pages - 1);
+      data.offset = page * PAGE_SIZE;
+      if (pages > 1) data.footer[0] += ` · page ${page + 1} of ${pages}`;
+      data.sweats = ranked.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+        .map(sw => ({
+          star: sw.star, username: sw.username, beaten: ROSTER_FIELDS.filter(f => beatenBy.get(key(sw)).has(f)),
+          value: k === 'star' ? stars(sw.star) : sw[k].toFixed(2),
+          color: k === 'star' ? null : cards.ratioColor(theme, sw[k], k)
+        }));
+    }
+    const timing = {};
+    const png = await cards.render(cards.leaderboardCard(theme, data), timing);
+
+    const id = (k, p) => `lb:${k}:${p}:${board.id}:${period.id}`;
+    const select = (k, options) => ({ type: ROW, components: [{ type: SELECT, custom_id: id(k, 0), min_values: 1, max_values: 1, options }] });
+    const components = [
+      select('T', LEADERBOARDS.map(b => ({ label: b.name, value: b.id, default: b.id === board.id }))),
+      select('P', PERIODS.map(x => ({ label: x.name, value: x.id, default: x.id === period.id })))
+    ];
+    if (pages > 1) components.unshift({ type: ROW, components: [
+      { type: BUTTON, style: STYLE.grey, label: '⏮', custom_id: id('f', 0), disabled: page === 0 },
+      { type: BUTTON, style: STYLE.blurple, label: '◀ Prev', custom_id: id('p', page - 1), disabled: page === 0 },
+      { type: BUTTON, style: STYLE.blurple, label: 'Next ▶', custom_id: id('n', page + 1), disabled: page >= pages - 1 },
+      { type: BUTTON, style: STYLE.grey, label: '⏭', custom_id: id('l', pages - 1), disabled: page >= pages - 1 }
+    ] });
+    return { png, kind: 'leaderboard', theme, components, timing };
   }
 
   // --- /random ---
@@ -978,6 +1061,8 @@ module.exports = function setupDiscord({
   async function onInteraction(interaction, res) {
     const customId = (interaction.data && interaction.data.custom_id) || '';
     if (customId.startsWith('bt:')) return onBeatenPage(interaction, res);
+    if (customId.startsWith('lb:')) return onLeaderboardPage(interaction, res);
+    if (customId === 'st:W') return onStatsPick(interaction, res);
     const addMatch = /^add:(beaten|flags|confirm|cancel):([0-9a-f]{12})$/.exec(customId);
     if (addMatch) return onAddInteraction(interaction, res, addMatch[1], addMatch[2]);
 
@@ -998,6 +1083,7 @@ module.exports = function setupDiscord({
       const target = await Sweat.findOne({ _id: id, ...LIVE }).lean();
       if (!target) return reply(res, GONE);
       res.json({ type: DEFER_UPDATE });
+      liveStatsFor(target.uuid);
       const [nav] = await Promise.all([entriesOf(target), skinFor(target.uuid)]);
       return editOriginal(interaction, await sweatMessage(target, theme, lookupHeader(target), 'normal', nav));
     }

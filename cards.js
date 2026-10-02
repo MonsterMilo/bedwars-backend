@@ -204,14 +204,14 @@ function chip(t, who, px = 22) {
 }
 
 // A row of small roster icons (coloured initials), at most `max` and then "+N".
-function rosterIcons(t, people, px = 30, max = 5) {
+function rosterIcons(t, people, px = 30, max = 5, gap = 4) {
   const shown = people.slice(0, people.length > max ? max - 1 : max);
   const more = people.length - shown.length;
   const dot = (bg, label, color) => h('div', {
     width: px, height: px, alignItems: 'center', justifyContent: 'center', flexShrink: 0,
     background: bg, borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none'
   }, text(label, { fontFamily: t.font, fontSize: size(t, Math.round(px * (label.length > 1 ? 0.46 : 0.55))), fontWeight: 800, color, lineHeight: 1 }));
-  return h('div', { alignItems: 'center', gap: 4 },
+  return h('div', { alignItems: 'center', gap, flexShrink: 0 },
     shown.map(who => dot(t.roster[who] || t.dim, INITIALS[who] || who[0].toUpperCase(), t.chipText)),
     more > 0 ? dot(t.track, `+${more}`, t.slotLabel || t.dim) : null);
 }
@@ -243,7 +243,18 @@ function statBox(t, heading, value, color, opts = {}) {
     text(value, {
       fontFamily: t.font, fontSize: size(t, opts.px || 44), fontWeight: 800, color, lineHeight: 1, marginTop: 6,
       textShadow: t.id === 'skyisles' ? '3px 3px 0 rgba(0,0,0,0.45)' : t.glow(color)
-    }));
+    }),
+    opts.delta ? change(t, opts.delta, 19, { marginTop: 7 }) : null);
+}
+
+// A change since the sweat was logged: ▲ 0.42 (up) or ▼ 1.10 (down).
+// delta: { up, text }. Up is the theme's green, down its red.
+function change(t, delta, px, style = {}) {
+  const c = delta.up ? t.mc.a : t.mc.c;
+  return h('div', { alignItems: 'center', gap: 5, ...style },
+    text(delta.up ? '▲' : '▼', { fontFamily: 'Symbols', fontSize: Math.round(px * 0.7), color: c }),
+    text(delta.text, { fontFamily: t.font, fontSize: size(t, px), fontWeight: 800, color: c, lineHeight: 1, textShadow: t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.55)' : 'none' }),
+    delta.star ? text('✫', { fontFamily: 'Symbols', fontSize: Math.round(px * 0.8), color: c }) : null);
 }
 
 // The whole card: page background, the theme's panel, and a footer line.
@@ -276,7 +287,7 @@ function nameBar(t, star, name, flagColor, right) {
     h('div', { alignItems: 'center' },
       star !== null && star !== undefined ? starTag(t, star, size(t, 46), true) : null,
       text(name, { fontFamily: t.font, fontSize: size(t, 48), fontWeight: 800, color: t.barText || t.name, marginLeft: star !== null && star !== undefined ? 16 : 0, lineHeight: 1, textShadow: t.nameShadow })),
-    right ? label(t, right, { color: t.barDim || t.dim }) : null);
+    typeof right === 'string' ? label(t, right, { color: t.barDim || t.dim }) : right || null);
 }
 
 const fmt = (n, d = 0) => (Number.isFinite(n) && n !== 0 ? n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—');
@@ -297,15 +308,25 @@ function sweatCard(sweat, themeId, opts = {}) {
     opts.skin ? img(opts.skin, 150, 314, { objectFit: 'contain' })
       : text('?', { fontFamily: t.font, fontSize: 120, color: t.dim }));
 
+  // opts.live: their stats now. Each box then shows the change since the
+  // sweat was logged (nothing when it hasn't moved, or wasn't recorded).
+  const live = opts.live || null;
+  const delta = (k, d) => {
+    if (!live || !Number.isFinite(live[k]) || !Number.isFinite(sweat[k]) || !(sweat[k] > 0)) return null;
+    const diff = live[k] - sweat[k];
+    if (Math.abs(diff) < (d ? 0.005 : 0.5)) return null;
+    return { up: diff > 0, text: Math.abs(diff).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }) };
+  };
+  const box = (heading, k, d, color) => statBox(t, heading, fmt(sweat[k], d), color, live ? { delta: delta(k, d), height: 128 } : {});
   const stats = h('div', { flexDirection: 'column', flexGrow: 1 },
     h('div', { gap: 14 },
-      statBox(t, 'FKDR', fmt(sweat.fkdr, 2), ratioColor(t, sweat.fkdr, FKDR_STEPS)),
-      statBox(t, 'WLR', fmt(sweat.wlr, 2), ratioColor(t, sweat.wlr, WLR_STEPS)),
-      statBox(t, 'BBLR', fmt(sweat.bblr, 2), ratioColor(t, sweat.bblr, WLR_STEPS))),
+      box('FKDR', 'fkdr', 2, ratioColor(t, sweat.fkdr, FKDR_STEPS)),
+      box('WLR', 'wlr', 2, ratioColor(t, sweat.wlr, WLR_STEPS)),
+      box('BBLR', 'bblr', 2, ratioColor(t, sweat.bblr, WLR_STEPS))),
     h('div', { gap: 14, marginTop: 14 },
-      statBox(t, 'Finals', fmt(sweat.finals), plain),
-      statBox(t, 'Beds', fmt(sweat.beds), plain),
-      statBox(t, 'Kills', fmt(sweat.kills), plain)),
+      box('Finals', 'finals', 0, plain),
+      box('Beds', 'beds', 0, plain),
+      box('Kills', 'kills', 0, plain)),
     h('div', { flexDirection: 'column', marginTop: 18 },
       label(t, 'Beaten by'),
       h('div', { flexWrap: 'wrap', gap: 10, marginTop: 10 },
@@ -321,7 +342,8 @@ function sweatCard(sweat, themeId, opts = {}) {
     opts.note.by ? text(`— ${opts.note.by}`, { fontFamily: t.body, fontSize: size(t, 18), color: t.dim, marginTop: 4 }) : null) : null;
 
   const body = h('div', { flexDirection: 'column', opacity: opts.removedBy ? 0.45 : 1 },
-    nameBar(t, sweat.star > 0 ? sweat.star : null, sweat.username, flagColor, opts.preview ? 'Preview' : null),
+    nameBar(t, sweat.star > 0 ? sweat.star : null, sweat.username, flagColor,
+      opts.preview ? 'Preview' : (delta('star', 0) ? change(t, { ...delta('star', 0), text: String(Math.round(Math.abs(live.star - sweat.star))), star: true }, 28) : null)),
     opts.line ? text(opts.line, { fontFamily: t.body, fontSize: size(t, 22), fontWeight: 700, color: t.dim, marginTop: 12 }) : null,
     h('div', { marginTop: 18, gap: 22 }, skin, stats),
     note);
@@ -335,7 +357,7 @@ function sweatCard(sweat, themeId, opts = {}) {
 }
 
 // --- /beaten: one page of a person's list ---
-// rows: [{ n, star, username, fkdr, wlr, cheating, boosting, ago }]
+// rows: [{ n, star, username, fkdr, wlr, cheating, boosting, ago, beaten: [who else beat them] }]
 // Two columns of five, so the card is wide and short: Discord caps how
 // tall an image shows, and a tall card gets shrunk to fit.
 function listCard(themeId, { title, who, lines, rows, footer, empty }) {
@@ -355,10 +377,11 @@ function listCard(themeId, { title, who, lines, rows, footer, empty }) {
       text(r.username, { fontFamily: t.font, fontSize: size(t, 28), fontWeight: 800, color: t.slotText || t.text, lineHeight: 1.25, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1 }),
       r.cheating ? text('⚑', { fontFamily: 'Symbols', fontSize: 22, color: t.cheating }) : null,
       r.boosting ? text('⚠', { fontFamily: 'Symbols', fontSize: 22, color: t.boosting }) : null),
-    h('div', { alignItems: 'center', gap: 22, paddingLeft: 40 },
+    h('div', { alignItems: 'center', gap: 16, paddingLeft: 40 },
       ratio(r.fkdr, FKDR_STEPS, 'FKDR'), ratio(r.wlr, WLR_STEPS, 'WLR'),
-      h('div', { flexGrow: 1, justifyContent: 'flex-end' },
-        text(r.ago || '', { fontFamily: t.body, fontSize: size(t, 20), fontWeight: 700, color: t.slotLabel || t.dim }))));
+      h('div', { flexGrow: 1, justifyContent: 'flex-end', alignItems: 'center', gap: 10 },
+        r.beaten && r.beaten.length ? rosterIcons(t, r.beaten, 22, 3, 3) : null,
+        text(r.ago || '', { fontFamily: t.body, fontSize: size(t, 20), fontWeight: 700, color: t.slotLabel || t.dim, flexShrink: 0 }))));
   const column = list => h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0 }, list.map(row));
   const body = rows.length
     ? h('div', { gap: 16, marginTop: 6 }, column(rows.slice(0, 5)), rows.length > 5 ? column(rows.slice(5)) : null)
@@ -410,10 +433,11 @@ function leaderboardCard(themeId, data) {
     text(data.title, { fontFamily: t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }),
     label(t, data.right || '', { color: t.barDim || t.dim }));
   const MEDAL = ['#f5c542', '#c9d1d9', '#d4884a'];
+  const offset = data.offset || 0; // later pages carry on numbering from 11
   const place = (i) => h('div', {
     width: 50, height: 50, alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-    background: MEDAL[i] || t.track, borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none'
-  }, text(String(i + 1), { fontFamily: t.font, fontSize: size(t, 28), fontWeight: 800, color: i < 3 ? '#1e1e1e' : (t.slotText || t.text) }));
+    background: MEDAL[offset + i] || t.track, borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none'
+  }, text(String(offset + i + 1), { fontFamily: t.font, fontSize: size(t, offset + i >= 99 ? 22 : 28), fontWeight: 800, color: offset + i < 3 ? '#1e1e1e' : (t.slotText || t.text) }));
 
   // Two columns of five (1-5 left, 6-10 right), like /beaten: a short,
   // wide card shows bigger in Discord.

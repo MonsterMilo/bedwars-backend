@@ -634,14 +634,8 @@ async function createSweat(fields, who, noteText) {
 // A player's current Bed Wars stats by name, worked out the same way the
 // website's add form does, plus whether Urchin tags them as a cheater (the
 // site ticks Cheating for that). Used by the bot's /add.
-async function lookupPlayerStats(name) {
-  const { id, name: ign } = await resolvePlayer(name);
-  const { player } = await getHypixelPlayer(id);
-  if (!player) {
-    const err = new Error('No Hypixel data');
-    err.status = 404;
-    throw err;
-  }
+// A player's Bedwars numbers, worked out the same way as the website.
+function bedwarsStats(player) {
   const bw = player.stats?.Bedwars || {};
   const n = k => bw[k] || 0;
   const ratio = (a, b) => a / (b === 0 ? 1 : b);
@@ -658,6 +652,18 @@ async function lookupPlayerStats(name) {
     kills: n('kills_bedwars'),
     deaths: n('deaths_bedwars')
   };
+  return stats;
+}
+
+async function lookupPlayerStats(name) {
+  const { id, name: ign } = await resolvePlayer(name);
+  const { player } = await getHypixelPlayer(id);
+  if (!player) {
+    const err = new Error('No Hypixel data');
+    err.status = 404;
+    throw err;
+  }
+  const stats = bedwarsStats(player);
   let cheaterTagged = false;
   try {
     const data = await coralGet('/player/tags', { player: ign });
@@ -668,11 +674,18 @@ async function lookupPlayerStats(name) {
   return { username: ign || player.displayname || name, uuid: id, stats, cheaterTagged };
 }
 
+// Current stats by uuid (no name lookup, no tags): for the "since logged"
+// changes on /sweat cards. null when Hypixel has nothing.
+async function currentStats(uuid) {
+  const { player } = await getHypixelPlayer(uuid);
+  return player ? bedwarsStats(player) : null;
+}
+
 // --- Discord bot (see discord.js) ---
 const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats
 });
 
 // --- Sweats API: shared DB ---
