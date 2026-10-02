@@ -540,7 +540,12 @@ module.exports = function setupDiscord({
     }, 3000);
   }
   if (enabled) {
-    bot.put(`/applications/${APP_ID}/commands`, COMMANDS)
+    // Usable in servers, in the bot's own DMs, and (once someone adds the
+    // app to their account) in any DM or group chat. integration_types:
+    // 0 = added to a server, 1 = added to a user. contexts: 0 = server,
+    // 1 = DM with the bot, 2 = other DMs and group chats.
+    const everywhere = COMMANDS.map(c => ({ ...c, integration_types: [0, 1], contexts: [0, 1, 2] }));
+    bot.put(`/applications/${APP_ID}/commands`, everywhere)
       .then(() => console.log('Discord commands registered'))
       .catch(err => console.error('Discord command registration failed', describeAxiosError(err)));
   }
