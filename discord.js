@@ -3,7 +3,7 @@
 // with buttons and menus underneath:
 //   new sweats           posted to the Sweat Log channel, with an "Edit this
 //                        sweat" menu (stats, beaten by, flags, add note,
-//                        remove) and an "I beat them" button
+//                        remove)
 //   /sweat <name>        a player's card (renamed players found by uuid; arrows
 //                        between their entries when they're on the list twice)
 //   /add <name> [note]   log a sweat: a private preview to pick who beat them
@@ -251,7 +251,7 @@ module.exports = function setupDiscord({
   // between a channel post and a /sweat lookup and are kept when a click
   // redraws the card.
   // mode picks the controls under it:
-  //   normal    the "Edit this sweat" menu and the "I beat them" button
+  //   normal    the "Edit this sweat" menu
   //   beaten    a pick-list of the roster, ticked for who has beaten them
   //   flags     a pick-list of Cheating / Boosting
   //   remove    "Yes, remove" / "Cancel"
@@ -305,8 +305,7 @@ module.exports = function setupDiscord({
           { label: 'Add note', value: 'note', emoji: { name: '📝' } },
           { label: 'Remove from the list', value: 'remove', description: 'Only sweats you added', emoji: { name: '🗑️' } }
         ]
-      }] },
-      { type: ROW, components: [button('I beat them', 'beat', STYLE.grey, '⚔️')] }
+      }] }
     ];
   }
 
@@ -969,7 +968,9 @@ module.exports = function setupDiscord({
         return redraw(sweat, 'normal');
       }
 
-      // "I beat them" (and the older buttons on cards from before).
+      // Buttons on cards posted before everything moved into the menu
+      // ("I beat them", "Cheating", "Boosting"): still work, and the redraw
+      // drops them.
       case 'beat':
         if (!canEdit) return reply(res, EDIT_WINDOW);
         return save({ [who]: !sweat[who] });
