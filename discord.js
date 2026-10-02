@@ -12,7 +12,8 @@
 //   /stats [person]      numbers on the list, or on one person's beats
 //   /leaderboard         who has beaten / logged the most, or the top sweats
 //   /random [person]     a random sweat (read-only)
-//   /theme [theme]       pick your card theme (the website's five)
+//   /theme [theme]       pick your card theme (the website's five); the
+//                        Sweat Log channel always uses the default (Neon)
 //
 // No always-on gateway connection: Discord sends button clicks and slash
 // commands to POST /discord/interactions as plain HTTP requests, signed with
@@ -169,7 +170,6 @@ module.exports = function setupDiscord({
   const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
   const publicKey = loadPublicKey(process.env.DISCORD_PUBLIC_KEY);
   const roster = parseRoster(process.env.DISCORD_ROSTER, ROSTER_FIELDS);
-  const discordIdOf = new Map([...roster].map(([id, who]) => [who, id]));
   const enabled = !!(APP_ID && TOKEN && CHANNEL_ID && publicKey);
   const bot = axios.create({ baseURL: API, timeout: 10000, headers: { Authorization: `Bot ${TOKEN}` } });
 
@@ -187,8 +187,6 @@ module.exports = function setupDiscord({
       .catch(err => console.error('Discord: loading themes failed', err.message));
   }
   const themeOf = userId => themes.get(userId) || DEFAULT_THEME;
-  // A roster member's theme (for sweats they log, even from the website).
-  const themeOfRoster = who => themeOf(discordIdOf.get(who));
   // The theme a card was drawn in, from its file name ("sweat-skyisles.png"),
   // so redrawing it after someone else clicks keeps its look.
   const themeOfMessage = msg => {
@@ -391,10 +389,11 @@ module.exports = function setupDiscord({
 
   // --- New sweats ---
   // Fire-and-forget like logActivity: Discord being down or slow never delays
-  // or fails the add itself. Drawn in the theme of whoever logged it.
+  // or fails the add itself. Always the default theme, so the channel looks
+  // the same whoever logged it.
   function postNewSweat(sweat, who) {
     if (!enabled || !sweat) return;
-    const theme = themeOfRoster(who);
+    const theme = DEFAULT_THEME;
     const post = { channelId: CHANNEL_ID, theme, caption: postCaption(sweat, who) };
     // Footer number = how many sweats are on the list now, this one included.
     Sweat.countDocuments(LIVE)
@@ -425,7 +424,7 @@ module.exports = function setupDiscord({
     if (!post || !post.messageId || post.messageId === skipMessageId) return;
     try {
       const removed = !!sweat.deletedAt;
-      const msg = await sweatMessage(sweat, post.theme || DEFAULT_THEME, {
+      const msg = await sweatMessage(sweat, DEFAULT_THEME, {
         ...post, caption: removed ? removedCaption(sweat, post.caption) : post.caption
       }, removed ? 'removed' : 'normal');
       await bot.patch(`/channels/${post.channelId}/messages/${post.messageId}`, form(msg));
@@ -870,7 +869,7 @@ module.exports = function setupDiscord({
         themes.set(userId, pick);
         await DiscordPref.updateOne({ _id: userId }, { $set: { theme: pick } }, { upsert: true })
           .catch(err => console.error('Discord: saving theme failed', err.message));
-        content = `Your cards are now **${cards.THEMES[pick].label}**. Everything you ask the bot for uses it, and so do sweats you log.`;
+        content = `Your cards are now **${cards.THEMES[pick].label}**. Everything you ask the bot for uses it. (New sweats in the Sweat Log channel stay ${cards.THEMES[DEFAULT_THEME].label} so they all match.)`;
       } else {
         content = `Your cards are **${cards.THEMES[themeOf(userId)].label}**. Pick another with **/theme**: ${cards.THEME_IDS.map(id => cards.THEMES[id].label).join(', ')}.`;
       }
@@ -900,7 +899,9 @@ module.exports = function setupDiscord({
     if (!who) return reply(res, NOT_LINKED);
     const msg = interaction.message || {};
     const req = { keyOwner: who, discordMessageId: msg.id };
-    const theme = themeOfMessage(msg) || themeOf(userOf(interaction));
+    // Channel posts are always the default theme; other cards keep theirs.
+    const isPost = !!msg.id && msg.channel_id === CHANNEL_ID && !msg.interaction_metadata && !msg.interaction && !msg.webhook_id;
+    const theme = isPost ? DEFAULT_THEME : (themeOfMessage(msg) || themeOf(userOf(interaction)));
     const hadNav = JSON.stringify(msg.components || []).includes('sweat:entry:');
 
     // Arrows between a player's entries: show that entry instead.
@@ -913,9 +914,8 @@ module.exports = function setupDiscord({
 
     const sweat = await Sweat.findOne({ _id: id, ...LIVE }).lean();
     if (!sweat) return reply(res, GONE);
-    // Is this card the sweat's channel post? Cards posted before the bot
-    // remembered its messages get recorded on their first click.
-    const isPost = !!msg.id && msg.channel_id === CHANNEL_ID && !msg.interaction_metadata && !msg.interaction && !msg.webhook_id;
+    // Cards posted before the bot remembered its messages get recorded on
+    // their first click.
     if (isPost && !sweat.discordPost) {
       sweat.discordPost = { channelId: CHANNEL_ID, messageId: msg.id, theme, caption: postCaption(sweat, sweat.addedBy), footer: [`Logged by ${ROSTER_LABELS[sweat.addedBy] || 'someone'}`, addedOn(sweat)] };
       rememberPost(id, sweat.discordPost);
