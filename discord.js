@@ -34,10 +34,24 @@ const ROSTER_LABELS = {
 // website's cyan accent.
 const COLORS = { cheating: 0xed4245, boosting: 0xf0b232, normal: 0x00d9ff, removed: 0x4e5058 };
 // Discord's numbers for the bits of the interactions API used here.
-const PING = 1, COMMAND = 2, COMPONENT = 3, MODAL_SUBMIT = 5;
-const REPLY = 4, UPDATE = 7, MODAL = 9, PONG = 1, EPHEMERAL = 64;
+const PING = 1, COMMAND = 2, COMPONENT = 3, AUTOCOMPLETE = 4, MODAL_SUBMIT = 5;
+const REPLY = 4, DEFER = 5, UPDATE = 7, CHOICES = 8, MODAL = 9, PONG = 1, EPHEMERAL = 64;
+const DAY_MS = 24 * 60 * 60 * 1000;
 const ROW = 1, BUTTON = 2, SELECT = 3, TEXT = 4;
 const STYLE = { blurple: 1, grey: 2, red: 4 };
+// /leaderboard: what it can rank, and over which sweats.
+const LEADERBOARDS = [
+  { id: 'beaten', name: 'Most sweats beaten', title: 'Most sweats beaten', kind: 'people' },
+  { id: 'logged', name: 'Most sweats logged', title: 'Most sweats logged', kind: 'people' },
+  { id: 'fkdr', name: 'Highest FKDR sweats', title: 'Highest FKDR', kind: 'sweats', stat: 'fkdr', format: s => `**${s.fkdr.toFixed(2)}** FKDR` },
+  { id: 'star', name: 'Highest star sweats', title: 'Highest star', kind: 'sweats', stat: 'star', format: s => `**${Math.floor(s.star).toLocaleString('en-US')}✫**` },
+  { id: 'wlr', name: 'Highest WLR sweats', title: 'Highest WLR', kind: 'sweats', stat: 'wlr', format: s => `**${s.wlr.toFixed(2)}** WLR` }
+];
+const PERIODS = [
+  { id: 'all', name: 'All time', days: 0 },
+  { id: 'month', name: 'Last 30 days', days: 30 },
+  { id: 'week', name: 'Last 7 days', days: 7 }
+];
 // The stats the website's edit form changes - five, which is also the most
 // boxes a Discord pop-up can hold.
 const STAT_INPUTS = [
@@ -102,7 +116,8 @@ function parseRoster(text, rosterFields) {
 
 module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
-  cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError
+  cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -297,6 +312,8 @@ module.exports = function setupDiscord({
       });
   }
 
+  const rosterChoices = ROSTER_FIELDS.map(f => ({ name: ROSTER_LABELS[f], value: f }));
+
   // --- Slash commands ---
   // Overwrites the app's commands with this list on every start, so adding
   // or changing one here is all it takes. Unchanged commands don't count
@@ -305,7 +322,44 @@ module.exports = function setupDiscord({
     name: 'sweat',
     description: 'Look a player up on the sweat list',
     type: 1,
-    options: [{ type: 3, name: 'name', description: 'Minecraft username', required: true, min_length: 1, max_length: 16 }]
+    options: [{ type: 3, name: 'name', description: 'Minecraft username', required: true, min_length: 1, max_length: 16, autocomplete: true }]
+  }, {
+    name: 'leaderboard',
+    description: 'Who has beaten the most sweats, and more',
+    type: 1,
+    options: [{
+      type: 3, name: 'type', description: 'What to rank (default: most sweats beaten)', required: false,
+      choices: LEADERBOARDS.map(b => ({ name: b.name, value: b.id }))
+    }, {
+      type: 3, name: 'period', description: 'Which sweats count (default: all time)', required: false,
+      choices: PERIODS.map(p => ({ name: p.name, value: p.id }))
+    }]
+  }, {
+    name: 'add',
+    description: 'Log a sweat - stats are filled in automatically',
+    type: 1,
+    options: [
+      { type: 3, name: 'name', description: 'Minecraft username', required: true, min_length: 1, max_length: 16 },
+      { type: 5, name: 'beat', description: 'Add you to Beaten by (default: yes)', required: false },
+      { type: 3, name: 'note', description: 'A note on them', required: false, max_length: NOTE_MAX_LENGTH },
+      { type: 5, name: 'cheating', description: 'Flag as cheating', required: false },
+      { type: 5, name: 'boosting', description: 'Flag as boosting', required: false }
+    ]
+  }, {
+    name: 'beaten',
+    description: 'Every sweat someone has beaten',
+    type: 1,
+    options: [{ type: 3, name: 'person', description: 'Whose (default: you)', required: false, choices: rosterChoices }]
+  }, {
+    name: 'stats',
+    description: 'Numbers on the whole sweat list, or one person\'s',
+    type: 1,
+    options: [{ type: 3, name: 'person', description: 'Only sweats this person has beaten', required: false, choices: rosterChoices }]
+  }, {
+    name: 'random',
+    description: 'A random sweat from the list',
+    type: 1,
+    options: [{ type: 3, name: 'person', description: 'Only sweats this person has beaten', required: false, choices: rosterChoices }]
   }];
   if (enabled) {
     bot.put(`/applications/${APP_ID}/commands`, COMMANDS)
@@ -324,6 +378,241 @@ module.exports = function setupDiscord({
       .sort({ createdAt: -1 }).lean();
     if (!sweat) return reply(res, `**${name}** isn't on the sweat list.`);
     return res.json({ type: REPLY, data: sweatCard(sweat, { author: `Added ${sweat.dateAdded || 'a while ago'}` }) });
+  }
+
+  // --- /sweat autocomplete ---
+  // Names on the list starting with what's typed so far, newest first.
+  async function onAutocomplete(interaction, res) {
+    const focused = (interaction.data.options || []).find(o => o.focused);
+    const typed = String((focused && focused.value) || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16);
+    const filter = typed ? { ...LIVE, username: new RegExp(`^${typed}`, 'i') } : LIVE;
+    const docs = await Sweat.find(filter, { username: 1 }).sort({ createdAt: -1 }).limit(50).lean();
+    const seen = new Set();
+    const choices = [];
+    for (const d of docs) {
+      const key = d.username.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      choices.push({ name: d.username, value: d.username });
+      if (choices.length === 25) break; // Discord's limit
+    }
+    return res.json({ type: CHOICES, data: { choices } });
+  }
+
+  // --- /leaderboard ---
+  async function onLeaderboard(interaction, res) {
+    const opt = name => ((interaction.data.options || []).find(o => o.name === name) || {}).value;
+    const board = LEADERBOARDS.find(b => b.id === opt('type')) || LEADERBOARDS[0];
+    const period = PERIODS.find(p => p.id === opt('period')) || PERIODS[0];
+    const filter = period.days ? { ...LIVE, createdAt: { $gte: new Date(Date.now() - period.days * 24 * 3600 * 1000) } } : LIVE;
+    const fields = ['username', 'addedBy', 'createdAt', 'star', 'fkdr', 'wlr', ...ROSTER_FIELDS]
+      .reduce((o, f) => { o[f] = 1; return o; }, {});
+    const sweats = await Sweat.find(filter, fields).lean();
+
+    const medal = i => ['🥇', '🥈', '🥉'][i] || `\`#${i + 1}\``;
+    let lines;
+    if (board.kind === 'people') {
+      // Sweats added with the admin key count as "Admin" for who logged most.
+      const people = board.id === 'logged' ? [...ROSTER_FIELDS, 'admin'] : ROSTER_FIELDS;
+      const counts = {};
+      people.forEach(f => { counts[f] = 0; });
+      sweats.forEach(sw => {
+        if (board.id === 'logged') { if (counts[sw.addedBy] !== undefined) counts[sw.addedBy]++; }
+        else ROSTER_FIELDS.forEach(f => { if (sw[f]) counts[f]++; });
+      });
+      const ranked = people.filter(f => counts[f] > 0).sort((a, b) => counts[b] - counts[a]);
+      const top = Math.max(1, ...ranked.map(f => counts[f]));
+      // A ten-block bar scaled to the leader, so the gaps read at a glance.
+      const bar = n => '▰'.repeat(Math.max(1, Math.round(n / top * 10))) + '▱'.repeat(10 - Math.max(1, Math.round(n / top * 10)));
+      lines = ranked.map((f, i) => `${medal(i)} **${ROSTER_LABELS[f]}** ${bar(counts[f])} ${counts[f]}`);
+    } else {
+      const key = board.stat;
+      lines = sweats.filter(sw => Number.isFinite(sw[key]) && sw[key] > 0)
+        .sort((a, b) => b[key] - a[key]).slice(0, 10)
+        .map((sw, i) => `${medal(i)} [**${sw.username}**](${SITE_URL}?player=${encodeURIComponent(sw.username)}) · ${board.format(sw)}`);
+    }
+
+    const embed = {
+      author: { name: '🏆 Leaderboard' },
+      title: `${board.title} · ${period.name.toLowerCase()}`,
+      url: `${SITE_URL}?view=leaderboard`,
+      color: 0xf1c40f,
+      description: lines.length ? lines.join('\n') : '*Nothing here yet.*',
+      footer: { text: `${sweats.length.toLocaleString('en-US')} sweat${sweats.length === 1 ? '' : 's'} counted · Sweat Log` },
+      image: { url: `${BACKEND_URL}/discord/spacer.png` }
+    };
+    return res.json({ type: REPLY, data: { embeds: [embed], allowed_mentions: { parse: [] } } });
+  }
+
+  const userOf = interaction => (interaction.member && interaction.member.user && interaction.member.user.id) || (interaction.user && interaction.user.id);
+  const optionOf = (interaction, name) => ((interaction.data.options || []).find(o => o.name === name) || {}).value;
+  const playerLink = sw => `[**${sw.username}**](${SITE_URL}?player=${encodeURIComponent(sw.username)})`;
+
+  // --- /add ---
+  // Looking a player up can take longer than the 3 seconds Discord waits,
+  // so it answers "thinking..." straight away (only you see it) and fills
+  // the answer in when done. The card itself is posted in the Sweat Log
+  // channel like any other new sweat.
+  async function onAdd(interaction, res) {
+    const who = roster.get(userOf(interaction));
+    if (!who) return reply(res, NOT_LINKED);
+    const name = String(optionOf(interaction, 'name') || '').trim();
+    if (!NAME_RE.test(name)) return reply(res, 'That isn\'t a valid Minecraft username.');
+    const noteText = cleanNoteText(optionOf(interaction, 'note'));
+    if (noteText === null) return reply(res, `Notes can be at most ${NOTE_MAX_LENGTH} characters.`);
+
+    res.json({ type: DEFER, data: { flags: EPHEMERAL } });
+    const answer = content => bot.patch(`/webhooks/${APP_ID}/${interaction.token}/messages/@original`, { content, allowed_mentions: { parse: [] } })
+      .catch(err => console.error('Discord /add reply failed', describeAxiosError(err)));
+
+    try {
+      let player;
+      try {
+        player = await lookupPlayerStats(name);
+      } catch (err) {
+        const notFound = err.status === 404 || (err.response && [204, 404].includes(err.response.status));
+        return answer(notFound ? `Couldn't find a player called **${name}**.` : `Couldn't reach the stats service right now, so **${name}** wasn't added. Try again in a minute.`);
+      }
+
+      // The same player added in the last day is almost always a double add.
+      const bare = player.uuid.replace(/-/g, '');
+      const dashed = bare.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+      const earlier = await Sweat.find({ ...LIVE, uuid: { $in: [bare, dashed] } }, { createdAt: 1, addedBy: 1, dateAdded: 1 }).sort({ createdAt: -1 }).lean();
+      const recent = earlier.find(d => d.createdAt && Date.now() - new Date(d.createdAt).getTime() < DAY_MS);
+      if (recent) {
+        return answer(`**${player.username}** was already added today${recent.addedBy ? ` by ${ROSTER_LABELS[recent.addedBy] || recent.addedBy}` : ''}, so they weren't added again.`);
+      }
+
+      const fields = { username: player.username, uuid: bare, dateAdded: new Date().toISOString().slice(0, 10) };
+      NUMERIC_FIELDS.forEach(f => { fields[f] = cleanStat(player.stats[f]) ?? 0; });
+      BOOLEAN_FIELDS.forEach(f => { fields[f] = false; });
+      if (optionOf(interaction, 'beat') !== false) fields[who] = true;
+      if (optionOf(interaction, 'cheating') || player.cheaterTagged) fields.cheating = true;
+      if (optionOf(interaction, 'boosting')) fields.boosting = true;
+
+      await createSweat(fields, who, noteText);
+      const extras = [];
+      if (player.cheaterTagged && !optionOf(interaction, 'cheating')) extras.push('flagged as cheating because Urchin tags them');
+      if (earlier.length) extras.push(`they were already on the list ${earlier.length === 1 ? 'once' : `${earlier.length} times`}`);
+      return answer(`✅ Added **${player.username}** [${Math.floor(fields.star)}✫, ${fields.fkdr.toFixed(2)} FKDR]${extras.length ? ` - ${extras.join('; ')}` : ''}. The card is in the Sweat Log channel.`);
+    } catch (err) {
+      console.error('Discord /add error', err);
+      return answer('Something went wrong on the server, so nothing was added.');
+    }
+  }
+
+  // --- /beaten ---
+  async function onBeaten(interaction, res) {
+    const person = optionOf(interaction, 'person') || roster.get(userOf(interaction));
+    if (!person) return reply(res, 'Pick a person - your Discord account isn\'t linked to the roster, so I can\'t tell who "you" are.');
+    const all = await Sweat.find({ ...LIVE, [person]: true }, { username: 1, star: 1, fkdr: 1, cheating: 1, boosting: 1, createdAt: 1 })
+      .sort({ createdAt: -1 }).lean();
+    const SHOW = 15;
+    const lines = all.slice(0, SHOW).map(sw => {
+      const flags = `${sw.cheating ? ' 🚩' : ''}${sw.boosting ? ' ⚠️' : ''}`;
+      const star = Number.isFinite(sw.star) && sw.star > 0 ? `${Math.floor(sw.star).toLocaleString('en-US')}✫ · ` : '';
+      return `${playerLink(sw)} · ${star}${fmtStat(sw.fkdr, 2)} FKDR${flags}`;
+    });
+    if (all.length > SHOW) lines.push(`*…and ${all.length - SHOW} more on the site*`);
+    // Where they stand on the "most beaten" leaderboard.
+    const counts = await Promise.all(ROSTER_FIELDS.map(f => Sweat.countDocuments({ ...LIVE, [f]: true })));
+    const rank = 1 + counts.filter(c => c > all.length).length;
+    const embed = {
+      author: { name: `⚔️ Beaten by ${ROSTER_LABELS[person]}` },
+      title: `${all.length.toLocaleString('en-US')} sweat${all.length === 1 ? '' : 's'}`,
+      url: `${SITE_URL}?view=leaderboard&lb=${person}`,
+      color: COLORS.normal,
+      description: lines.length ? lines.join('\n') : '*Nobody yet.*',
+      footer: { text: `#${rank} on the leaderboard · newest first · Sweat Log` },
+      image: { url: `${BACKEND_URL}/discord/spacer.png` }
+    };
+    return res.json({ type: REPLY, data: { embeds: [embed], allowed_mentions: { parse: [] } } });
+  }
+
+  // --- /stats ---
+  async function onStats(interaction, res) {
+    const person = optionOf(interaction, 'person');
+    const fields = ['username', 'uuid', 'star', 'fkdr', 'wlr', 'bblr', 'cheating', 'boosting', 'createdAt', 'addedBy', 'notes', ...ROSTER_FIELDS]
+      .reduce((o, f) => { o[f] = 1; return o; }, {});
+    const everything = await Sweat.find(LIVE, fields).lean();
+    const list = person ? everything.filter(sw => sw[person]) : everything;
+    const n = list.length;
+    const pct = (a, b) => (b ? `${Math.round(a / b * 100)}%` : '0%');
+    const num = x => x.toLocaleString('en-US');
+    const vals = k => list.map(sw => sw[k]).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+    const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+    const median = a => (a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2) : 0);
+    const top = k => list.filter(sw => Number.isFinite(sw[k])).sort((a, b) => b[k] - a[k])[0];
+    const since = days => list.filter(sw => sw.createdAt && Date.now() - new Date(sw.createdAt).getTime() < days * DAY_MS).length;
+    const dates = list.map(sw => sw.createdAt && new Date(sw.createdAt).getTime()).filter(Boolean).sort((a, b) => a - b);
+    const day = ms => `<t:${Math.floor(ms / 1000)}:D>`; // shown in each viewer's own date format
+    const weeks = dates.length ? Math.max(1, (Date.now() - dates[0]) / (7 * DAY_MS)) : 1;
+    const players = new Set(list.map(sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase())).size;
+
+    const stars = vals('star'), fkdrs = vals('fkdr'), wlrs = vals('wlr');
+    const topStar = top('star'), topFkdr = top('fkdr');
+    const cheating = list.filter(sw => sw.cheating).length;
+    const boosting = list.filter(sw => sw.boosting).length;
+    const notes = list.reduce((t, sw) => t + ((sw.notes || []).length), 0);
+
+    const out = [
+      { name: 'Sweats', value: `**${num(n)}**`, inline: true },
+      { name: 'Different players', value: num(players), inline: true },
+      { name: 'Last 7 / 30 days', value: `${num(since(7))} / ${num(since(30))}`, inline: true },
+      { name: 'Average star', value: `${num(Math.round(mean(stars)))}✫`, inline: true },
+      { name: 'Average FKDR', value: `${mean(fkdrs).toFixed(2)} *(median ${median(fkdrs).toFixed(2)})*`, inline: true },
+      { name: 'Average WLR', value: mean(wlrs).toFixed(2), inline: true },
+      { name: 'Highest star', value: topStar ? `${playerLink(topStar)} · ${num(Math.floor(topStar.star))}✫` : '—', inline: true },
+      { name: 'Highest FKDR', value: topFkdr ? `${playerLink(topFkdr)} · ${topFkdr.fkdr.toFixed(2)}` : '—', inline: true },
+      { name: 'Per week', value: (n / weeks).toFixed(1), inline: true },
+      { name: '🚩 Cheating', value: `${num(cheating)} *(${pct(cheating, n)})*`, inline: true },
+      { name: '⚠️ Boosting', value: `${num(boosting)} *(${pct(boosting, n)})*`, inline: true },
+      { name: '📝 Notes', value: num(notes), inline: true }
+    ];
+    if (person) {
+      // Their place on the leaderboard, and who they share the most beats with.
+      const counts = ROSTER_FIELDS.map(f => [f, everything.filter(sw => sw[f]).length]);
+      const rank = 1 + counts.filter(([, c]) => c > n).length;
+      const partner = ROSTER_FIELDS.filter(f => f !== person)
+        .map(f => [f, list.filter(sw => sw[f]).length]).sort((a, b) => b[1] - a[1])[0];
+      out.push(
+        { name: 'Leaderboard', value: `#${rank} *(${pct(n, everything.length)} of the list)*`, inline: true },
+        { name: 'Most beaten together with', value: partner && partner[1] ? `${ROSTER_LABELS[partner[0]]} *(${num(partner[1])})*` : '—', inline: true },
+        { name: 'First / latest', value: dates.length ? `${day(dates[0])} / ${day(dates[dates.length - 1])}` : '—', inline: true }
+      );
+    } else {
+      const beat = ROSTER_FIELDS.map(f => [f, list.filter(sw => sw[f]).length]).sort((a, b) => b[1] - a[1])[0];
+      const logged = {};
+      list.forEach(sw => { if (sw.addedBy) logged[sw.addedBy] = (logged[sw.addedBy] || 0) + 1; });
+      const logger = Object.entries(logged).sort((a, b) => b[1] - a[1])[0];
+      out.push(
+        { name: 'Beaten the most', value: beat && beat[1] ? `${ROSTER_LABELS[beat[0]]} *(${num(beat[1])})*` : '—', inline: true },
+        { name: 'Logged the most', value: logger ? `${ROSTER_LABELS[logger[0]] || logger[0]} *(${num(logger[1])})*` : '—', inline: true },
+        { name: 'First / latest', value: dates.length ? `${day(dates[0])} / ${day(dates[dates.length - 1])}` : '—', inline: true }
+      );
+    }
+    const embed = {
+      author: { name: '📊 Sweat stats' },
+      title: person ? `Sweats ${ROSTER_LABELS[person]} has beaten` : 'The whole sweat list',
+      url: person ? `${SITE_URL}?view=leaderboard&lb=${person}` : SITE_URL,
+      color: COLORS.normal,
+      fields: out,
+      footer: { text: 'Sweat Log' },
+      image: { url: `${BACKEND_URL}/discord/spacer.png` }
+    };
+    return res.json({ type: REPLY, data: { embeds: [embed], allowed_mentions: { parse: [] } } });
+  }
+
+  // --- /random ---
+  async function onRandom(interaction, res) {
+    const person = optionOf(interaction, 'person');
+    const filter = person ? { ...LIVE, [person]: true } : LIVE;
+    const ids = await Sweat.find(filter, { _id: 1 }).lean();
+    if (!ids.length) return reply(res, person ? `${ROSTER_LABELS[person]} hasn't beaten anyone yet.` : 'The list is empty.');
+    const pick = ids[Math.floor(Math.random() * ids.length)];
+    const sweat = await Sweat.findOne({ _id: pick._id, ...LIVE }).lean();
+    if (!sweat) return reply(res, 'Try again - that one was just removed.');
+    return res.json({ type: REPLY, data: sweatCard(sweat, { author: `🎲 Random sweat${person ? ` beaten by ${ROSTER_LABELS[person]}` : ''} · added ${sweat.dateAdded || 'a while ago'}` }) });
   }
 
   // --- Clicks, picks and form submits ---
@@ -497,6 +786,12 @@ module.exports = function setupDiscord({
     try {
       if (interaction.type === PING) return res.json({ type: PONG });
       if (interaction.type === COMMAND && interaction.data && interaction.data.name === 'sweat') return await onSweatCommand(interaction, res);
+      if (interaction.type === COMMAND && interaction.data && interaction.data.name === 'leaderboard') return await onLeaderboard(interaction, res);
+      if (interaction.type === COMMAND && interaction.data && interaction.data.name === 'add') return await onAdd(interaction, res);
+      if (interaction.type === COMMAND && interaction.data && interaction.data.name === 'beaten') return await onBeaten(interaction, res);
+      if (interaction.type === COMMAND && interaction.data && interaction.data.name === 'stats') return await onStats(interaction, res);
+      if (interaction.type === COMMAND && interaction.data && interaction.data.name === 'random') return await onRandom(interaction, res);
+      if (interaction.type === AUTOCOMPLETE) return await onAutocomplete(interaction, res);
       if (interaction.type === COMPONENT || interaction.type === MODAL_SUBMIT) return await onInteraction(interaction, res);
       return reply(res, 'Unknown command.');
     } catch (err) {

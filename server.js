@@ -620,10 +620,59 @@ app.get('/denicker/history/:uuid', validUuid('uuid'), requireKeyForDenicker, den
   }
 });
 
+// Saves a new sweat with its optional first note, logs it and posts it to
+// the Sweat Log channel. Shared by POST /sweats and the bot's /add.
+async function createSweat(fields, who, noteText) {
+  fields.addedBy = who;
+  fields.notes = noteText ? [{ text: noteText, author: who }] : [];
+  const saved = await new Sweat(fields).save();
+  logActivity({ keyOwner: who }, 'sweat.add', saved, noteText ? { noteId: saved.notes[0]._id, noteText } : {});
+  discord.postNewSweat(saved, who);
+  return saved;
+}
+
+// A player's current Bed Wars stats by name, worked out the same way the
+// website's add form does, plus whether Urchin tags them as a cheater (the
+// site ticks Cheating for that). Used by the bot's /add.
+async function lookupPlayerStats(name) {
+  const { id, name: ign } = await resolvePlayer(name);
+  const { player } = await getHypixelPlayer(id);
+  if (!player) {
+    const err = new Error('No Hypixel data');
+    err.status = 404;
+    throw err;
+  }
+  const bw = player.stats?.Bedwars || {};
+  const n = k => bw[k] || 0;
+  const ratio = (a, b) => a / (b === 0 ? 1 : b);
+  const stats = {
+    star: player.achievements?.bedwars_level || 0,
+    wlr: ratio(n('wins_bedwars'), n('losses_bedwars')),
+    fkdr: ratio(n('final_kills_bedwars'), n('final_deaths_bedwars')),
+    kdr: ratio(n('kills_bedwars'), n('deaths_bedwars')),
+    bblr: n('beds_lost_bedwars') === 0 ? n('beds_broken_bedwars') : n('beds_broken_bedwars') / n('beds_lost_bedwars'),
+    finals: n('final_kills_bedwars'),
+    finalDeaths: n('final_deaths_bedwars'),
+    beds: n('beds_broken_bedwars'),
+    bedsLost: n('beds_lost_bedwars'),
+    kills: n('kills_bedwars'),
+    deaths: n('deaths_bedwars')
+  };
+  let cheaterTagged = false;
+  try {
+    const data = await coralGet('/player/tags', { player: ign });
+    cheaterTagged = (data.tags || []).some(t => String(t.tag_type || '').includes('cheater') || t.tag_type === 'sniper');
+  } catch {
+    // No tags, or Urchin down: just don't auto-flag.
+  }
+  return { username: ign || player.displayname || name, uuid: id, stats, cheaterTagged };
+}
+
 // --- Discord bot (see discord.js) ---
 const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
-  cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError
+  cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats
 });
 
 // --- Sweats API: shared DB ---
@@ -722,11 +771,7 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
     // Optional first note, written alongside the sweat itself.
     const noteText = cleanNoteText(body.note);
     if (noteText === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
-    fields.notes = noteText ? [{ text: noteText, author: req.keyOwner }] : [];
-
-    const saved = await new Sweat(fields).save();
-    logActivity(req, 'sweat.add', saved, noteText ? { noteId: saved.notes[0]._id, noteText } : {});
-    discord.postNewSweat(saved, req.keyOwner);
+    const saved = await createSweat(fields, req.keyOwner, noteText);
     return res.status(201).json(saved);
   } catch (err) {
     console.error('/sweats POST error', err);
