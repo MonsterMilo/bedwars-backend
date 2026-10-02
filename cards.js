@@ -321,32 +321,34 @@ function sweatCard(sweat, themeId, opts = {}) {
 
 // --- /beaten: one page of a person's list ---
 // rows: [{ n, star, username, fkdr, wlr, cheating, boosting, ago }]
+// Two columns of five, so the card is wide and short: Discord caps how
+// tall an image shows, and a tall card gets shrunk to fit.
 function listCard(themeId, { title, who, lines, rows, footer, empty }) {
   const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
   const head = h('div', { alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar },
     h('div', { alignItems: 'center', gap: 16 },
       text(title, { fontFamily: t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }),
-      who ? chip(t, who, 26) : null));
-  const sub = h('div', { flexDirection: 'column', marginTop: 14, gap: 4 },
-    lines.map(l => text(l, { fontFamily: t.body, fontSize: size(t, 21), fontWeight: 700, color: t.dim })));
-  const header = h('div', { padding: '0 14px', marginTop: 16 },
-    label(t, '#', { width: 56 }), label(t, 'Player', { flexGrow: 1 }),
-    label(t, 'FKDR', { width: 120, justifyContent: 'flex-end' }), label(t, 'WLR', { width: 110, justifyContent: 'flex-end' }),
-    label(t, 'Added', { width: 150, justifyContent: 'flex-end' }));
-  const list = rows.length ? rows.map((r, i) => h('div', {
-    alignItems: 'center', padding: '9px 14px', marginTop: 8, ...t.slot, ...(i % 2 ? {} : {})
-  },
-    text(r.n, { fontFamily: t.font, fontSize: size(t, 24), fontWeight: 800, color: t.slotLabel || t.dim, width: 56 }),
-    h('div', { alignItems: 'center', flexGrow: 1, gap: 12 },
-      r.star > 0 ? starTag(t, r.star, size(t, 26)) : null,
-      text(r.username, { fontFamily: t.font, fontSize: size(t, 28), fontWeight: 800, color: t.slotText || t.text, lineHeight: 1 }),
+      who ? chip(t, who, 26) : null),
+    lines && lines[0] ? text(lines[0], { fontFamily: t.body, fontSize: size(t, 21), fontWeight: 700, color: t.barDim || t.dim }) : null);
+  const ratio = (v, steps, name) => h('div', { alignItems: 'baseline', gap: 6 },
+    text(fmt(v, 2), { fontFamily: t.font, fontSize: size(t, 26), fontWeight: 800, color: ratioColor(t, v, steps), lineHeight: 1, textShadow: t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : 'none' }),
+    label(t, name, { fontSize: size(t, 15), color: t.slotLabel || t.dim }));
+  const row = r => h('div', { flexDirection: 'column', padding: '9px 16px 11px', marginTop: 10, gap: 6, ...t.slot, overflow: 'hidden' },
+    h('div', { alignItems: 'center', gap: 10 },
+      text(r.n, { fontFamily: t.font, fontSize: size(t, 20), fontWeight: 800, color: t.slotLabel || t.dim, minWidth: 30 }),
+      r.star > 0 ? starTag(t, r.star, size(t, 24)) : null,
+      text(r.username, { fontFamily: t.font, fontSize: size(t, 28), fontWeight: 800, color: t.slotText || t.text, lineHeight: 1.25, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1 }),
       r.cheating ? text('⚑', { fontFamily: 'Symbols', fontSize: 22, color: t.cheating }) : null,
       r.boosting ? text('⚠', { fontFamily: 'Symbols', fontSize: 22, color: t.boosting }) : null),
-    text(fmt(r.fkdr, 2), { fontFamily: t.font, fontSize: size(t, 26), fontWeight: 800, color: ratioColor(t, r.fkdr, FKDR_STEPS), width: 120, justifyContent: 'flex-end', textShadow: t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : 'none' }),
-    text(fmt(r.wlr, 2), { fontFamily: t.font, fontSize: size(t, 26), fontWeight: 800, color: ratioColor(t, r.wlr, WLR_STEPS), width: 110, justifyContent: 'flex-end', textShadow: t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : 'none' }),
-    text(r.ago || '', { fontFamily: t.body, fontSize: size(t, 20), fontWeight: 700, color: t.slotLabel || t.dim, width: 150, justifyContent: 'flex-end' })))
-    : [h('div', { justifyContent: 'center', padding: 30, marginTop: 8, ...t.slot }, text(empty || 'Nobody matches.', { fontFamily: t.body, fontSize: size(t, 26), color: t.slotLabel || t.dim }))];
-  return frame(t, footer, head, sub, rows.length ? header : null, list);
+    h('div', { alignItems: 'center', gap: 22, paddingLeft: 40 },
+      ratio(r.fkdr, FKDR_STEPS, 'FKDR'), ratio(r.wlr, WLR_STEPS, 'WLR'),
+      h('div', { flexGrow: 1, justifyContent: 'flex-end' },
+        text(r.ago || '', { fontFamily: t.body, fontSize: size(t, 20), fontWeight: 700, color: t.slotLabel || t.dim }))));
+  const column = list => h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0 }, list.map(row));
+  const body = rows.length
+    ? h('div', { gap: 16, marginTop: 6 }, column(rows.slice(0, 5)), rows.length > 5 ? column(rows.slice(5)) : null)
+    : h('div', { justifyContent: 'center', padding: 30, marginTop: 16, ...t.slot }, text(empty || 'Nobody matches.', { fontFamily: t.body, fontSize: size(t, 26), color: t.slotLabel || t.dim }));
+  return frame(t, footer, head, body);
 }
 
 // --- /stats ---
