@@ -1,7 +1,9 @@
 // --- Discord bot: Sweat Log ---
-// Posts every newly added sweat to a channel as a card with an "Edit this
-// sweat" menu (stats, beaten by, flags, add note, remove) and an "I beat them"
-// button (adds or removes you), and answers slash commands:
+// Every reply is an image card (see cards.js) in the theme of whoever asked,
+// with buttons and menus underneath:
+//   new sweats           posted to the Sweat Log channel, with an "Edit this
+//                        sweat" menu (stats, beaten by, flags, add note,
+//                        remove) and an "I beat them" button
 //   /sweat <name>        a player's card (renamed players found by uuid; arrows
 //                        between their entries when they're on the list twice)
 //   /add <name> [note]   log a sweat: a private preview to pick who beat them
@@ -10,10 +12,13 @@
 //   /stats [person]      numbers on the list, or on one person's beats
 //   /leaderboard         who has beaten / logged the most, or the top sweats
 //   /random [person]     a random sweat (read-only)
+//   /theme [theme]       pick your card theme (the website's five)
 //
 // No always-on gateway connection: Discord sends button clicks and slash
 // commands to POST /discord/interactions as plain HTTP requests, signed with
-// the app's key, so it all runs inside this Express server.
+// the app's key, so it all runs inside this Express server. Drawing a card
+// can take longer than Discord's 3-second answer window, so replies say
+// "thinking..." first and the card is filled in when it's ready.
 //
 // Env vars (all from the Discord Developer Portal, except the last two):
 //   DISCORD_APP_ID      General Information > Application ID
@@ -26,28 +31,20 @@
 const crypto = require('crypto');
 const zlib = require('zlib');
 const axios = require('axios');
+const mongoose = require('mongoose');
+const cards = require('./cards');
 
 const API = 'https://discord.com/api/v10';
-const SITE_URL = process.env.SITE_URL || 'https://monstermilo.github.io/bedwars-frontend/';
-// This backend's public address, for the spacer image below. Render sets
-// RENDER_EXTERNAL_URL itself.
-const BACKEND_URL = (process.env.RENDER_EXTERNAL_URL || 'https://bedwars-backend.onrender.com').replace(/\/$/, '');
-const SPACER = { url: `${BACKEND_URL}/discord/spacer.png` };
+const DEFAULT_THEME = cards.THEMES[process.env.DISCORD_DEFAULT_THEME] ? process.env.DISCORD_DEFAULT_THEME : 'neon';
 
 // Display names for the roster ids, matching the website's.
 const ROSTER_LABELS = {
   milo: 'Milo', potat: 'Potat', aballs: 'ABoi', zoiv: 'Zoiv', max: 'Max',
   sqoz: 'Sqoz', kermit: 'Kermit', ssent: 'Ssent', key: 'Key', admin: 'Admin'
 };
-// Sidebar colour: red for cheating, yellow for boosting only, otherwise the
-// website's cyan accent. Gold for leaderboards, purple for stats.
-const COLORS = {
-  cheating: 0xed4245, boosting: 0xf0b232, normal: 0x00d9ff, removed: 0x4e5058,
-  gold: 0xf1c40f, stats: 0x9b6bff, added: 0x3ba55c
-};
 // Discord's numbers for the bits of the interactions API used here.
 const PING = 1, COMMAND = 2, COMPONENT = 3, AUTOCOMPLETE = 4, MODAL_SUBMIT = 5;
-const REPLY = 4, DEFER = 5, UPDATE = 7, CHOICES = 8, MODAL = 9, PONG = 1, EPHEMERAL = 64;
+const REPLY = 4, DEFER = 5, DEFER_UPDATE = 6, UPDATE = 7, CHOICES = 8, MODAL = 9, PONG = 1, EPHEMERAL = 64;
 const ROW = 1, BUTTON = 2, SELECT = 3, TEXT = 4;
 const STYLE = { blurple: 1, grey: 2, green: 3, red: 4 };
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -74,8 +71,8 @@ const SORTS = [
   { id: 'wlr', name: 'Highest WLR', label: 'highest WLR', key: 'wlr', dir: -1 }
 ];
 const FLAG_FILTERS = [
-  { id: 'cheating', name: 'Flagged cheating', label: '🚩 cheating', test: s => !!s.cheating },
-  { id: 'boosting', name: 'Flagged boosting', label: '⚠️ boosting', test: s => !!s.boosting },
+  { id: 'cheating', name: 'Flagged cheating', label: 'cheating', test: s => !!s.cheating },
+  { id: 'boosting', name: 'Flagged boosting', label: 'boosting', test: s => !!s.boosting },
   { id: 'clean', name: 'Not flagged', label: 'not flagged', test: s => !s.cheating && !s.boosting }
 ];
 const PAGE_SIZE = 10;
@@ -89,31 +86,25 @@ const STAT_INPUTS = [
   { key: 'kdr', label: 'KDR', digits: 2 }
 ];
 
-// Stats missing from the request are saved as 0, so 0 is shown as a dash
-// rather than as a real zero.
-const fmtStat = (n, digits = 0) => (Number.isFinite(n) && n !== 0
-  ? n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })
-  : '—');
-// Stars the way Hypixel writes them: no thousands comma (1234✫, [1234✫]).
-const stars = n => `${Math.floor(Number(n) || 0)}✫`;
-const starTag = n => `[${stars(n)}]`;
-const hasStar = s => Number.isFinite(s.star) && s.star > 0;
 const num = n => Math.round(n).toLocaleString('en-US');
 const plural = (n, word) => `${num(n)} ${word}${n === 1 ? '' : 's'}`;
 const pct = (a, b) => (b ? `${Math.round(a / b * 100)}%` : '0%');
-// Discord timestamps show in each viewer's own time zone and date format.
-const when = (date, style = 'D') => `<t:${Math.floor(new Date(date).getTime() / 1000)}:${style}>`;
-const MEDALS = ['🥇', '🥈', '🥉'];
+// Stars the way Hypixel writes them: no thousands comma (1234✫).
+const stars = n => `${Math.floor(Number(n) || 0)}✫`;
 // "Sep 1, 2026" from the saved YYYY-MM-DD, or from when it was created.
-const addedOn = s => {
-  const d = s.dateAdded ? new Date(`${s.dateAdded}T12:00:00Z`) : (s.createdAt ? new Date(s.createdAt) : null);
-  return d && !isNaN(d) ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }) : 'a while ago';
-};
-const rank = i => MEDALS[i] || `\`#${i + 1}\``;
+const day = d => (d && !isNaN(d) ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }) : 'a while ago');
+const addedOn = s => day(s.dateAdded ? new Date(`${s.dateAdded}T12:00:00Z`) : (s.createdAt ? new Date(s.createdAt) : null));
+// "3 days ago" (cards are images, so Discord's own timestamps can't be used).
+function ago(date) {
+  const s = Math.max(0, (Date.now() - new Date(date).getTime()) / 1000);
+  const unit = [[31536000, 'year'], [2592000, 'month'], [604800, 'week'], [86400, 'day'], [3600, 'hour'], [60, 'minute']].find(([u]) => s >= u);
+  if (!unit) return 'just now';
+  const n = Math.floor(s / unit[0]);
+  return `${n} ${unit[1]}${n === 1 ? '' : 's'} ago`;
+}
 
-// Discord sizes a card to its widest line of text, so a short note makes a
-// narrow card. An image always spans the card's full width, so every card
-// gets this invisible 1000x1 PNG to keep them all full width.
+// Old embed cards used this invisible 1000x1 image to stay full width.
+// Cards are images now, but messages posted before still point at it.
 const SPACER_PNG = (() => {
   const W = 1000;
   const crc = (buf) => {
@@ -164,6 +155,10 @@ function uuidForms(uuid) {
   return [bare, bare.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5')];
 }
 
+// Each person's card theme, by Discord user id.
+const DiscordPref = mongoose.models.DiscordPref || mongoose.model('DiscordPref',
+  new mongoose.Schema({ _id: String, theme: String }, { versionKey: false }));
+
 module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
@@ -174,8 +169,9 @@ module.exports = function setupDiscord({
   const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
   const publicKey = loadPublicKey(process.env.DISCORD_PUBLIC_KEY);
   const roster = parseRoster(process.env.DISCORD_ROSTER, ROSTER_FIELDS);
+  const discordIdOf = new Map([...roster].map(([id, who]) => [who, id]));
   const enabled = !!(APP_ID && TOKEN && CHANNEL_ID && publicKey);
-  const bot = axios.create({ baseURL: API, timeout: 5000, headers: { Authorization: `Bot ${TOKEN}` } });
+  const bot = axios.create({ baseURL: API, timeout: 10000, headers: { Authorization: `Bot ${TOKEN}` } });
 
   if (!enabled) {
     console.warn('Discord bot off: set DISCORD_APP_ID, DISCORD_PUBLIC_KEY, DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID to turn it on.');
@@ -183,76 +179,101 @@ module.exports = function setupDiscord({
     console.warn('Discord bot: DISCORD_ROSTER is empty, so nobody can use the buttons yet.');
   }
 
-  const playerUrl = name => `${SITE_URL}?player=${encodeURIComponent(name)}`;
-  const playerLink = sw => `[**${sw.username}**](${playerUrl(sw.username)})`;
-  const headUrl = uuid => `https://mc-heads.net/head/${String(uuid).replace(/-/g, '')}/128`;
+  // --- Themes ---
+  const themes = new Map(); // discord user id -> theme id
+  if (enabled) {
+    DiscordPref.find({}).lean()
+      .then(rows => rows.forEach(r => { if (cards.THEMES[r.theme]) themes.set(r._id, r.theme); }))
+      .catch(err => console.error('Discord: loading themes failed', err.message));
+  }
+  const themeOf = userId => themes.get(userId) || DEFAULT_THEME;
+  // A roster member's theme (for sweats they log, even from the website).
+  const themeOfRoster = who => themeOf(discordIdOf.get(who));
+  // The theme a card was drawn in, from its file name ("sweat-skyisles.png"),
+  // so redrawing it after someone else clicks keeps its look.
+  const themeOfMessage = msg => {
+    const m = /-([a-z]+)\.png$/.exec(((msg && msg.attachments) || [])[0]?.filename || '');
+    return m && cards.THEMES[m[1]] ? m[1] : null;
+  };
+
+  // --- Skins ---
+  // Full-body renders from Visage (the website uses it too), kept for an
+  // hour so redraws don't fetch them again. A failed fetch draws a "?".
+  const skins = new Map(); // uuid -> { data, at }
+  async function skinFor(uuid) {
+    const id = uuidForms(uuid)[0];
+    if (!id) return null;
+    const hit = skins.get(id);
+    if (hit && Date.now() - hit.at < 60 * 60 * 1000) return hit.data;
+    try {
+      const r = await axios.get(`https://visage.surgeplay.com/full/320/${id}`, {
+        responseType: 'arraybuffer', timeout: 5000, headers: { 'User-Agent': 'SweatLog/1.0' }
+      });
+      const data = `data:image/png;base64,${Buffer.from(r.data).toString('base64')}`;
+      if (skins.size > 300) skins.delete(skins.keys().next().value);
+      skins.set(id, { data, at: Date.now() });
+      return data;
+    } catch (err) {
+      console.warn('Skin fetch failed', id, describeAxiosError(err));
+      return null;
+    }
+  }
+
+  // --- Sending cards ---
+  // A message is { content, components, png, kind, theme }: the card goes up
+  // as an attachment named "<kind>-<theme>.png", which also replaces any
+  // card (or old embed) the message had before.
+  function form(msg) {
+    const body = new FormData();
+    const payload = { content: msg.content || '', components: msg.components || [], embeds: [], allowed_mentions: { parse: [] } };
+    if (msg.png) {
+      const filename = `${msg.kind || 'card'}-${msg.theme || DEFAULT_THEME}.png`;
+      payload.attachments = [{ id: 0, filename }];
+      body.append('files[0]', new Blob([msg.png], { type: 'image/png' }), filename);
+    } else {
+      payload.attachments = [];
+    }
+    body.append('payload_json', JSON.stringify(payload));
+    return body;
+  }
+  const original = interaction => `/webhooks/${APP_ID}/${interaction.token}/messages/@original`;
+  const editOriginal = (interaction, msg) => bot.patch(original(interaction), form(msg))
+    .catch(err => console.error('Discord reply failed', describeAxiosError(err)));
+  const followUp = (interaction, content) => bot.post(`/webhooks/${APP_ID}/${interaction.token}`, { content, flags: EPHEMERAL, allowed_mentions: { parse: [] } })
+    .catch(err => console.error('Discord reply failed', describeAxiosError(err)));
+  // After a public "thinking..." reply: swap it for a message only the asker sees.
+  const privately = (interaction, content) => bot.delete(original(interaction))
+    .catch(() => {})
+    .then(() => followUp(interaction, content));
+  const reply = (res, content) => res.json({ type: REPLY, data: { content, flags: EPHEMERAL, allowed_mentions: { parse: [] } } });
 
   // --- The sweat card ---
-  // header: { author, footer, note } - the top line and footer text, which
-  // differ between a new post and a /sweat lookup and are kept as they are
-  // when a click redraws the card; note is an extra line under the tags
-  // (e.g. "Now known as …").
+  // header: { footer, line, caption } - the card's footer ([left, right]),
+  // an extra line under the name, and the text above the card; they differ
+  // between a channel post and a /sweat lookup and are kept when a click
+  // redraws the card.
   // mode picks the controls under it:
-  //   normal    the "Edit this sweat" menu and the Beaten by button
+  //   normal    the "Edit this sweat" menu and the "I beat them" button
   //   beaten    a pick-list of the roster, ticked for who has beaten them
   //   flags     a pick-list of Cheating / Boosting
   //   remove    "Yes, remove" / "Cancel"
-  //   removed   no controls; the card is greyed out and says who removed it
-  //   readonly  no controls (/random)
+  //   removed   no controls; the card is stamped REMOVED
+  //   readonly  no controls (/random, /theme)
   // nav: { index, total, prevId, nextId } adds arrows between a player's
   // entries when they're on the list more than once.
-  function sweatCard(sweat, header, mode = 'normal', nav = null) {
-    const beatenBy = ROSTER_FIELDS.filter(f => sweat[f]).map(f => ROSTER_LABELS[f]);
-
-    const lines = [];
-    if (mode === 'removed') lines.push(`🗑️ **Removed from the list** by ${ROSTER_LABELS[sweat.deletedBy] || sweat.deletedBy || 'someone'}`);
-    const tags = [];
-    if (sweat.cheating) tags.push('🚩 **Cheating**');
-    if (sweat.boosting) tags.push('⚠️ **Boosting**');
-    if (tags.length) lines.push(tags.join('   '));
-    if (header.note) lines.push(header.note);
-    const color = mode === 'removed' ? COLORS.removed
-      : sweat.cheating ? COLORS.cheating : sweat.boosting ? COLORS.boosting : COLORS.normal;
-
-    // Two rows of three: ratios on top, totals underneath. Left out entirely
-    // when the sweat was added with no stats at all.
-    const hasStats = ['fkdr', 'wlr', 'bblr', 'finals', 'beds', 'kills'].some(f => sweat[f]);
-    const fields = !hasStats ? [] : [
-      { name: 'FKDR', value: `**${fmtStat(sweat.fkdr, 2)}**`, inline: true },
-      { name: 'WLR', value: `**${fmtStat(sweat.wlr, 2)}**`, inline: true },
-      { name: 'BBLR', value: `**${fmtStat(sweat.bblr, 2)}**`, inline: true },
-      { name: 'Finals', value: fmtStat(sweat.finals), inline: true },
-      { name: 'Beds', value: fmtStat(sweat.beds), inline: true },
-      { name: 'Kills', value: fmtStat(sweat.kills), inline: true }
-    ];
-    if (beatenBy.length) fields.push({ name: '⚔️ Beaten by', value: beatenBy.join(' · ') });
-    // The latest note, signed, like the website's cards.
+  async function sweatMessage(sweat, themeId, header = {}, mode = 'normal', nav = null) {
     const notes = sweat.notes || [];
-    const note = notes[notes.length - 1];
-    if (note && note.text) {
-      const by = ROSTER_LABELS[note.author] || note.author;
-      fields.push({
-        name: notes.length > 1 ? `📝 Latest note (of ${notes.length})` : '📝 Note',
-        value: `> ${note.text.replace(/\n/g, '\n> ')}${by ? `\n— ${by}` : ''}`
-      });
-    }
-
-    const embed = {
-      title: `${hasStar(sweat) ? `${starTag(sweat.star)} ` : ''}${sweat.username}`,
-      url: playerUrl(sweat.username),
-      color,
-      fields,
-      footer: { text: header.footer || 'Sweat Log' },
-      timestamp: new Date(sweat.createdAt || Date.now()).toISOString(),
-      image: SPACER
-    };
-    if (header.author) embed.author = { name: header.author };
-    if (lines.length) embed.description = lines.join('\n');
-    if (sweat.uuid) embed.thumbnail = { url: headUrl(sweat.uuid) };
-
+    const last = notes[notes.length - 1];
+    const png = await cards.render(cards.sweatCard(sweat, themeId, {
+      skin: await skinFor(sweat.uuid),
+      footer: header.footer,
+      line: header.line,
+      note: last && last.text ? { text: last.text, by: ROSTER_LABELS[last.author] || last.author, count: notes.length } : null,
+      removedBy: mode === 'removed' ? (ROSTER_LABELS[sweat.deletedBy] || sweat.deletedBy || 'someone') : null
+    }));
     const components = mode === 'readonly' ? [] : controls(sweat, mode);
     if (nav && nav.total > 1 && mode !== 'removed') components.push(navRow(nav));
-    return { embeds: [embed], components, allowed_mentions: { parse: [] } };
+    return { png, kind: 'sweat', theme: themeId, components, content: header.caption || '' };
   }
 
   function controls(sweat, mode) {
@@ -269,14 +290,7 @@ module.exports = function setupDiscord({
       ] }];
     }
     if (mode === 'beaten') {
-      return [{ type: ROW, components: [{
-        type: SELECT,
-        custom_id: `sweat:setbeaten:${id}`,
-        placeholder: 'Who has beaten them?',
-        min_values: 0,
-        max_values: ROSTER_FIELDS.length,
-        options: ROSTER_FIELDS.map(f => ({ label: ROSTER_LABELS[f], value: f, default: !!sweat[f] }))
-      }] }, cancel];
+      return [{ type: ROW, components: [rosterSelect(`sweat:setbeaten:${id}`, f => !!sweat[f], 'Who has beaten them?')] }, cancel];
     }
     if (mode === 'flags') {
       return [{ type: ROW, components: [flagSelect(`sweat:setflags:${id}`, sweat.cheating, sweat.boosting)] }, cancel];
@@ -298,19 +312,17 @@ module.exports = function setupDiscord({
     ];
   }
 
-  function flagSelect(customId, cheating, boosting) {
-    return {
-      type: SELECT,
-      custom_id: customId,
-      placeholder: 'Flags (optional)',
-      min_values: 0,
-      max_values: 2,
-      options: [
-        { label: 'Cheating', value: 'cheating', emoji: { name: '🚩' }, default: !!cheating },
-        { label: 'Boosting', value: 'boosting', emoji: { name: '⚠️' }, default: !!boosting }
-      ]
-    };
-  }
+  const rosterSelect = (customId, ticked, placeholder) => ({
+    type: SELECT, custom_id: customId, placeholder, min_values: 0, max_values: ROSTER_FIELDS.length,
+    options: ROSTER_FIELDS.map(f => ({ label: ROSTER_LABELS[f], value: f, default: !!ticked(f) }))
+  });
+  const flagSelect = (customId, cheating, boosting) => ({
+    type: SELECT, custom_id: customId, placeholder: 'Flags (optional)', min_values: 0, max_values: 2,
+    options: [
+      { label: 'Cheating', value: 'cheating', emoji: { name: '🚩' }, default: !!cheating },
+      { label: 'Boosting', value: 'boosting', emoji: { name: '⚠️' }, default: !!boosting }
+    ]
+  });
 
   // [◀ Older] [Entry 2 of 3] [Newer ▶] - entries counted oldest first.
   function navRow(nav) {
@@ -344,12 +356,13 @@ module.exports = function setupDiscord({
     };
   }
 
-  // The top line of a /sweat card: when it was added, and which entry it is.
-  const lookupHeader = (sweat, nav, extra = {}) => ({
-    author: `Added ${addedOn(sweat)}${sweat.addedBy ? ` by ${ROSTER_LABELS[sweat.addedBy] || sweat.addedBy}` : ''}`,
-    footer: nav && nav.total > 1 ? `On the list ${nav.total} times · Sweat Log` : 'Sweat Log',
+  // Footers: a channel post says who logged it and its number; a lookup
+  // says when it was added and by whom.
+  const lookupHeader = (sweat, extra = {}) => ({
+    footer: [`Added ${addedOn(sweat)}${sweat.addedBy ? ` by ${ROSTER_LABELS[sweat.addedBy] || sweat.addedBy}` : ''}`, 'Sweat Log'],
     ...extra
   });
+  const postCaption = (sweat, who) => `**${ROSTER_LABELS[who] || who || 'Someone'}** logged **${sweat.username}**`;
 
   // --- Pop-up forms ---
   function statsForm(sweat) {
@@ -378,40 +391,49 @@ module.exports = function setupDiscord({
 
   // --- New sweats ---
   // Fire-and-forget like logActivity: Discord being down or slow never delays
-  // or fails the add itself.
+  // or fails the add itself. Drawn in the theme of whoever logged it.
   function postNewSweat(sweat, who) {
     if (!enabled || !sweat) return;
-    const header = { author: `${ROSTER_LABELS[who] || who || 'Someone'} logged a new sweat` };
+    const theme = themeOfRoster(who);
+    const post = { channelId: CHANNEL_ID, theme, caption: postCaption(sweat, who) };
     // Footer number = how many sweats are on the list now, this one included.
-    // If the count fails the message still goes, just without the number.
     Sweat.countDocuments(LIVE)
-      .then(n => { header.footer = `Sweat #${num(n)}`; })
-      .catch(err => console.error('Discord sweat count failed', err.message))
-      .then(() => bot.post(`/channels/${CHANNEL_ID}/messages`, sweatCard(sweat, header)))
-      .then(r => rememberPost(sweat._id, { channelId: CHANNEL_ID, messageId: r.data.id, ...header }))
+      .then(n => `Sweat #${num(n)} · ${addedOn(sweat)}`)
+      .catch(err => { console.error('Discord sweat count failed', err.message); return addedOn(sweat); })
+      .then(async right => {
+        post.footer = [`Logged by ${ROSTER_LABELS[who] || who || 'someone'}`, right];
+        const msg = await sweatMessage(sweat, theme, post);
+        const r = await bot.post(`/channels/${CHANNEL_ID}/messages`, form(msg));
+        return rememberPost(sweat._id, { ...post, messageId: r.data.id });
+      })
       .catch(err => console.error('Discord post failed', describeAxiosError(err)));
   }
 
   // --- Keeping the card up to date ---
   // Each sweat remembers its Sweat Log message, so a change made on the
-  // website (or from a /sweat lookup) edits that message to match.
+  // website (or from a /sweat lookup) redraws that message to match.
   function rememberPost(id, post) {
     return Sweat.updateOne({ _id: id }, { $set: { discordPost: post } })
       .catch(err => console.error('Discord: saving the message id failed', err.message));
   }
+  const removedCaption = (s, caption) => `${caption || postCaption(s, s.addedBy)} · removed by ${ROSTER_LABELS[s.deletedBy] || s.deletedBy || 'someone'}`;
 
   // Fire-and-forget. skipMessageId: the card a click came from, which that
-  // click's own reply already redraws.
-  function refreshCard(sweat, skipMessageId) {
+  // click redraws itself.
+  async function refreshCard(sweat, skipMessageId) {
     const post = enabled && sweat && sweat.discordPost;
     if (!post || !post.messageId || post.messageId === skipMessageId) return;
-    const mode = sweat.deletedAt ? 'removed' : 'normal';
-    bot.patch(`/channels/${post.channelId}/messages/${post.messageId}`, sweatCard(sweat, post, mode))
-      .catch(err => {
-        // Someone deleted the message in Discord: stop trying to edit it.
-        if (err.response && err.response.status === 404) rememberPost(sweat._id, null);
-        else console.error('Discord card update failed', describeAxiosError(err));
-      });
+    try {
+      const removed = !!sweat.deletedAt;
+      const msg = await sweatMessage(sweat, post.theme || DEFAULT_THEME, {
+        ...post, caption: removed ? removedCaption(sweat, post.caption) : post.caption
+      }, removed ? 'removed' : 'normal');
+      await bot.patch(`/channels/${post.channelId}/messages/${post.messageId}`, form(msg));
+    } catch (err) {
+      // Someone deleted the message in Discord: stop trying to edit it.
+      if (err.response && err.response.status === 404) rememberPost(sweat._id, null);
+      else console.error('Discord card update failed', describeAxiosError(err));
+    }
   }
 
   // --- Slash commands ---
@@ -466,6 +488,12 @@ module.exports = function setupDiscord({
     description: 'A random sweat from the list',
     type: 1,
     options: [personOption('Only sweats this person has beaten')]
+  }, {
+    name: 'theme',
+    description: 'Pick the look of the cards you get (the website\'s themes)',
+    type: 1,
+    options: [{ type: 3, name: 'theme', description: 'Leave empty to see yours', required: false,
+      choices: cards.THEME_IDS.map(id => ({ name: cards.THEMES[id].label, value: id })) }]
   }];
   if (enabled) {
     bot.put(`/applications/${APP_ID}/commands`, COMMANDS)
@@ -473,21 +501,26 @@ module.exports = function setupDiscord({
       .catch(err => console.error('Discord command registration failed', describeAxiosError(err)));
   }
 
-  const reply = (res, content) => res.json({ type: REPLY, data: { content, flags: EPHEMERAL, allowed_mentions: { parse: [] } } });
   const userOf = interaction => (interaction.member && interaction.member.user && interaction.member.user.id) || (interaction.user && interaction.user.id);
   const optionOf = (interaction, name) => ((interaction.data.options || []).find(o => o.name === name) || {}).value;
   const NOT_LINKED = 'Your Discord account isn\'t linked to the roster yet, so the bot can\'t tell who you are. Ask Milo to add you.';
   const GONE = 'That sweat has been removed from the list.';
   const EDIT_WINDOW = 'You can only change sweats added in the last 30 days.';
+  const OOPS = 'Something went wrong on the server. Try again in a moment.';
 
-  // After a "thinking..." reply: fills in the answer, or swaps it for a
-  // message only the person who asked can see.
-  const original = interaction => `/webhooks/${APP_ID}/${interaction.token}/messages/@original`;
-  const fillIn = (interaction, data) => bot.patch(original(interaction), { allowed_mentions: { parse: [] }, ...data })
-    .catch(err => console.error('Discord reply failed', describeAxiosError(err)));
-  const privately = (interaction, content) => bot.delete(original(interaction))
-    .then(() => bot.post(`/webhooks/${APP_ID}/${interaction.token}`, { content, flags: EPHEMERAL, allowed_mentions: { parse: [] } }))
-    .catch(err => console.error('Discord reply failed', describeAxiosError(err)));
+  // Runs a command that answers with a card: "thinking..." straight away,
+  // then the card. work() returns a message, or a string to say privately.
+  function withCard(interaction, res, work, ephemeral = false) {
+    res.json({ type: DEFER, ...(ephemeral ? { data: { flags: EPHEMERAL } } : {}) });
+    return Promise.resolve().then(work)
+      .then(out => (typeof out === 'string'
+        ? (ephemeral ? editOriginal(interaction, { content: out }) : privately(interaction, out))
+        : editOriginal(interaction, out)))
+      .catch(err => {
+        console.error('Discord command error', err);
+        return ephemeral ? editOriginal(interaction, { content: OOPS }) : privately(interaction, OOPS);
+      });
+  }
 
   // --- /sweat ---
   // By name first. If nobody on the list has that name, it may be a renamed
@@ -495,34 +528,24 @@ module.exports = function setupDiscord({
   async function onSweatCommand(interaction, res) {
     const name = String(optionOf(interaction, 'name') || '').trim();
     if (!NAME_RE.test(name)) return reply(res, 'That isn\'t a valid Minecraft username.');
-    // NAME_RE only allows letters, digits and underscores, so the name is
-    // safe to put in a regex as is.
-    const byName = await Sweat.findOne({ ...LIVE, username: new RegExp(`^${name}$`, 'i') }).sort({ createdAt: -1 }).lean();
-    if (byName) {
-      const nav = await entriesOf(byName);
-      return res.json({ type: REPLY, data: sweatCard(byName, lookupHeader(byName, nav), 'normal', nav) });
-    }
-
-    // Looking the uuid up can take longer than Discord's 3 seconds.
-    res.json({ type: DEFER });
-    try {
-      let player;
-      try {
-        player = await resolvePlayer(name);
-      } catch {
-        return privately(interaction, `**${name}** isn't on the sweat list.`);
+    const theme = themeOf(userOf(interaction));
+    return withCard(interaction, res, async () => {
+      // NAME_RE only allows letters, digits and underscores, so the name is
+      // safe to put in a regex as is.
+      let sweat = await Sweat.findOne({ ...LIVE, username: new RegExp(`^${name}$`, 'i') }).sort({ createdAt: -1 }).lean();
+      let line = null;
+      if (!sweat) {
+        let player;
+        try { player = await resolvePlayer(name); } catch { return `**${name}** isn't on the sweat list.`; }
+        const forms = uuidForms(player.id);
+        sweat = forms.length ? await Sweat.findOne({ ...LIVE, uuid: { $in: forms } }).sort({ createdAt: -1 }).lean() : null;
+        if (!sweat) return `**${player.name || name}** isn't on the sweat list.`;
+        const now = player.name || name;
+        if (now.toLowerCase() !== sweat.username.toLowerCase()) line = `Now known as ${now}`;
       }
-      const forms = uuidForms(player.id);
-      const byUuid = forms.length && await Sweat.findOne({ ...LIVE, uuid: { $in: forms } }).sort({ createdAt: -1 }).lean();
-      if (!byUuid) return privately(interaction, `**${player.name || name}** isn't on the sweat list.`);
-      const nav = await entriesOf(byUuid);
-      const now = player.name || name;
-      const header = lookupHeader(byUuid, nav, now.toLowerCase() !== byUuid.username.toLowerCase() ? { note: `🔁 Now known as **${now}**` } : {});
-      return fillIn(interaction, sweatCard(byUuid, header, 'normal', nav));
-    } catch (err) {
-      console.error('Discord /sweat error', err);
-      return privately(interaction, 'Something went wrong on the server. Try again in a moment.');
-    }
+      const nav = await entriesOf(sweat);
+      return sweatMessage(sweat, theme, lookupHeader(sweat, { line }), 'normal', nav);
+    });
   }
 
   // --- /sweat autocomplete ---
@@ -545,11 +568,11 @@ module.exports = function setupDiscord({
   }
 
   // --- /add ---
-  // Looks the player up, then shows a preview only you can see: their
-  // current stats, a pick-list of who beat them (you're ticked), flags
+  // Looks the player up, then shows a preview only you can see: their card
+  // as it would be, a pick-list of who beat them (you're ticked), flags
   // (Cheating ticked if Urchin tags them) and [Add to the list]. Nothing is
   // saved until that's clicked. Linked roster members only.
-  const pendingAdds = new Map(); // key -> { who, player, noteText, beaten, flags, earlier, at }
+  const pendingAdds = new Map(); // key -> { who, theme, player, noteText, beaten, flags, earlier, at }
   const ADD_TTL_MS = 15 * 60 * 1000; // Discord's limit for editing the reply
   const dupWindow = earlier => earlier.find(d => d.createdAt && Date.now() - new Date(d.createdAt).getTime() < DAY_MS);
 
@@ -561,71 +584,49 @@ module.exports = function setupDiscord({
     const noteText = cleanNoteText(optionOf(interaction, 'note'));
     if (noteText === null) return reply(res, `Notes can be at most ${NOTE_MAX_LENGTH} characters.`);
 
-    res.json({ type: DEFER, data: { flags: EPHEMERAL } });
-    const answer = content => fillIn(interaction, { content, embeds: [], components: [] });
-    try {
+    return withCard(interaction, res, async () => {
       let player;
       try {
         player = await lookupPlayerStats(name);
       } catch (err) {
         const notFound = err.status === 404 || (err.response && [204, 404].includes(err.response.status));
-        return answer(notFound ? `Couldn't find a player called **${name}**.` : `Couldn't reach the stats service right now, so **${name}** wasn't added. Try again in a minute.`);
+        return notFound ? `Couldn't find a player called **${name}**.` : `Couldn't reach the stats service right now, so **${name}** wasn't added. Try again in a minute.`;
       }
       const earlier = await Sweat.find({ ...LIVE, uuid: { $in: uuidForms(player.uuid) } }, { createdAt: 1, addedBy: 1 }).lean();
       const recent = dupWindow(earlier);
       if (recent) {
-        return answer(`**${player.username}** was already added today${recent.addedBy ? ` by ${ROSTER_LABELS[recent.addedBy] || recent.addedBy}` : ''}, so they won't be added again.`);
+        return `**${player.username}** was already added today${recent.addedBy ? ` by ${ROSTER_LABELS[recent.addedBy] || recent.addedBy}` : ''}, so they won't be added again.`;
       }
       for (const [k, p] of pendingAdds) if (Date.now() - p.at > ADD_TTL_MS) pendingAdds.delete(k);
       const key = crypto.randomBytes(6).toString('hex');
       pendingAdds.set(key, {
         who, player, noteText, earlier: earlier.length, at: Date.now(),
+        theme: themeOf(userOf(interaction)),
         beaten: new Set([who]),
         flags: new Set(player.cheaterTagged ? ['cheating'] : [])
       });
-      return fillIn(interaction, addPreview(key));
-    } catch (err) {
-      console.error('Discord /add error', err);
-      return answer('Something went wrong on the server, so nothing was added.');
-    }
+      return addPreview(key);
+    }, true);
   }
 
-  function addPreview(key) {
+  async function addPreview(key) {
     const p = pendingAdds.get(key);
-    const s = p.player.stats;
-    const lines = [];
-    if (p.flags.has('cheating')) lines.push('🚩 **Cheating**' + (p.player.cheaterTagged ? ' *(Urchin tags them)*' : ''));
-    if (p.flags.has('boosting')) lines.push('⚠️ **Boosting**');
-    if (p.earlier) lines.push(`ℹ️ Already on the list ${p.earlier === 1 ? 'once' : `${p.earlier} times`} - this adds another entry.`);
-    const fields = [
-      { name: 'FKDR', value: `**${fmtStat(s.fkdr, 2)}**`, inline: true },
-      { name: 'WLR', value: `**${fmtStat(s.wlr, 2)}**`, inline: true },
-      { name: 'BBLR', value: `**${fmtStat(s.bblr, 2)}**`, inline: true },
-      { name: 'Finals', value: fmtStat(s.finals), inline: true },
-      { name: 'Beds', value: fmtStat(s.beds), inline: true },
-      { name: 'Kills', value: fmtStat(s.kills), inline: true },
-      { name: '⚔️ Beaten by', value: p.beaten.size ? ROSTER_FIELDS.filter(f => p.beaten.has(f)).map(f => ROSTER_LABELS[f]).join(' · ') : '*Nobody picked*' }
-    ];
-    if (p.noteText) fields.push({ name: '📝 Note', value: `> ${p.noteText.replace(/\n/g, '\n> ')}` });
-    const color = p.flags.has('cheating') ? COLORS.cheating : p.flags.has('boosting') ? COLORS.boosting : COLORS.normal;
+    const sweat = { username: p.player.username, uuid: p.player.uuid, ...p.player.stats, cheating: p.flags.has('cheating'), boosting: p.flags.has('boosting') };
+    ROSTER_FIELDS.forEach(f => { sweat[f] = p.beaten.has(f); });
+    const notes = [];
+    if (p.player.cheaterTagged) notes.push('Urchin tags them as a cheater, so Cheating is ticked.');
+    if (p.earlier) notes.push(`Already on the list ${p.earlier === 1 ? 'once' : `${p.earlier} times`} - this adds another entry.`);
+    const png = await cards.render(cards.sweatCard(sweat, p.theme, {
+      skin: await skinFor(p.player.uuid),
+      preview: true,
+      footer: ['Preview · not saved yet', 'Sweat Log'],
+      note: p.noteText ? { text: p.noteText, by: ROSTER_LABELS[p.who], count: 1 } : null
+    }));
     return {
-      content: '',
-      embeds: [{
-        author: { name: 'New sweat · check it, then add it' },
-        title: `${starTag(s.star)} ${p.player.username}`,
-        url: playerUrl(p.player.username),
-        color,
-        ...(lines.length ? { description: lines.join('\n') } : {}),
-        fields,
-        thumbnail: { url: headUrl(p.player.uuid) },
-        footer: { text: 'Only you can see this · nothing is saved until you add it' },
-        image: SPACER
-      }],
+      png, kind: 'add', theme: p.theme,
+      content: ['Check it, pick who beat them, then add it.', ...notes.map(n => `-# ${n}`)].join('\n'),
       components: [
-        { type: ROW, components: [{
-          type: SELECT, custom_id: `add:beaten:${key}`, placeholder: 'Who beat them?', min_values: 0, max_values: ROSTER_FIELDS.length,
-          options: ROSTER_FIELDS.map(f => ({ label: ROSTER_LABELS[f], value: f, default: p.beaten.has(f) }))
-        }] },
+        { type: ROW, components: [rosterSelect(`add:beaten:${key}`, f => p.beaten.has(f), 'Who beat them?')] },
         { type: ROW, components: [flagSelect(`add:flags:${key}`, p.flags.has('cheating'), p.flags.has('boosting'))] },
         { type: ROW, components: [
           { type: BUTTON, style: STYLE.green, label: 'Add to the list', emoji: { name: '✅' }, custom_id: `add:confirm:${key}` },
@@ -637,7 +638,7 @@ module.exports = function setupDiscord({
 
   async function onAddInteraction(interaction, res, action, key) {
     const p = pendingAdds.get(key);
-    const done = (content, embed) => res.json({ type: UPDATE, data: { content, embeds: embed ? [embed] : [], components: [] } });
+    const done = content => res.json({ type: UPDATE, data: { content, embeds: [], components: [], attachments: [] } });
     if (!p || Date.now() - p.at > ADD_TTL_MS) {
       pendingAdds.delete(key);
       return done('This add has expired - run **/add** again.');
@@ -648,7 +649,8 @@ module.exports = function setupDiscord({
     }
     if (action === 'beaten' || action === 'flags') {
       p[action] = new Set(interaction.data.values || []);
-      return res.json({ type: UPDATE, data: addPreview(key) });
+      res.json({ type: DEFER_UPDATE });
+      return editOriginal(interaction, await addPreview(key));
     }
     if (action !== 'confirm') return done('That doesn\'t do anything any more.');
 
@@ -665,20 +667,13 @@ module.exports = function setupDiscord({
     if (p.flags.has('cheating')) fields.cheating = true;
     if (p.flags.has('boosting')) fields.boosting = true;
     await createSweat(fields, p.who, p.noteText);
-    return done('', {
-      author: { name: '✅ Added to the list' },
-      title: `${starTag(fields.star)} ${p.player.username}`,
-      url: playerUrl(p.player.username),
-      color: COLORS.added,
-      description: 'The card is in the Sweat Log channel.',
-      thumbnail: { url: headUrl(p.player.uuid) }
-    });
+    return done(`✅ Added **${stars(fields.star)} ${p.player.username}** - the card is in the Sweat Log channel.`);
   }
 
   // --- /beaten ---
   // Everyone a person has beaten, ten a page, with the filters kept in the
   // page buttons. Anyone can use it and page through it.
-  const BEATEN_STATE = /^bt:([fpnl]):(\d+):(\w+):(\w*):(\w*):(\d*):([\d.]*):(\w*)$/;
+  const BEATEN_STATE = /^bt:([fpnl]):(-?\d+):(\w+):(\w*):(\w*):(\d*):([\d.]*):(\w*)$/;
 
   async function onBeaten(interaction, res) {
     const person = optionOf(interaction, 'person') || roster.get(userOf(interaction));
@@ -693,17 +688,19 @@ module.exports = function setupDiscord({
       minFkdr: Number.isFinite(minFkdr) ? String(minFkdr) : '',
       name: String(optionOf(interaction, 'name') || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16)
     };
-    return res.json({ type: REPLY, data: await beatenPage(state) });
+    const theme = themeOf(userOf(interaction));
+    return withCard(interaction, res, () => beatenPage(state, theme));
   }
 
   async function onBeatenPage(interaction, res) {
     const m = BEATEN_STATE.exec(interaction.data.custom_id || '');
     if (!m || !ROSTER_FIELDS.includes(m[3])) return reply(res, 'That doesn\'t do anything any more.');
     const state = { page: Number(m[2]), person: m[3], sort: m[4], flag: m[5], minStar: m[6], minFkdr: m[7], name: m[8] };
-    return res.json({ type: UPDATE, data: await beatenPage(state) });
+    res.json({ type: DEFER_UPDATE });
+    return editOriginal(interaction, await beatenPage(state, themeOfMessage(interaction.message) || themeOf(userOf(interaction))));
   }
 
-  async function beatenPage(state) {
+  async function beatenPage(state, theme) {
     const sort = SORTS.find(s => s.id === state.sort) || SORTS[0];
     const flag = FLAG_FILTERS.find(f => f.id === state.flag);
     const all = await Sweat.find({ ...LIVE, [state.person]: true },
@@ -711,7 +708,7 @@ module.exports = function setupDiscord({
     const filters = [];
     let list = all;
     if (flag) { list = list.filter(flag.test); filters.push(flag.label); }
-    if (state.minStar) { list = list.filter(s => (s.star || 0) >= Number(state.minStar)); filters.push(`${state.minStar}✫+`); }
+    if (state.minStar) { list = list.filter(s => (s.star || 0) >= Number(state.minStar)); filters.push(`${state.minStar}✫ or more`); }
     if (state.minFkdr) { list = list.filter(s => (s.fkdr || 0) >= Number(state.minFkdr)); filters.push(`${state.minFkdr}+ FKDR`); }
     if (state.name) { list = list.filter(s => s.username.toLowerCase().includes(state.name.toLowerCase())); filters.push(`name has "${state.name}"`); }
     const value = s => (sort.key === 'createdAt' ? new Date(s.createdAt || 0).getTime() : (s[sort.key] || 0));
@@ -719,29 +716,21 @@ module.exports = function setupDiscord({
 
     const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
     const page = Math.min(Math.max(0, state.page), pages - 1);
-    const rows = list.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((s, i) => {
-      const n = page * PAGE_SIZE + i + 1;
-      const flags = `${s.cheating ? ' 🚩' : ''}${s.boosting ? ' ⚠️' : ''}`;
-      const star = hasStar(s) ? `\`${starTag(s.star)}\` ` : '';
-      const added = s.createdAt ? ` · ${when(s.createdAt, 'R')}` : '';
-      return `\`${String(n).padStart(3)}\` ${star}${playerLink(s)}${flags}\n${' '.repeat(2)}**${fmtStat(s.fkdr, 2)}** FKDR · **${fmtStat(s.wlr, 2)}** WLR${added}`;
-    });
-
+    const rows = list.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((s, i) => ({
+      n: page * PAGE_SIZE + i + 1, star: s.star, username: s.username, fkdr: s.fkdr, wlr: s.wlr,
+      cheating: s.cheating, boosting: s.boosting, ago: s.createdAt ? ago(s.createdAt) : ''
+    }));
     const counts = await Promise.all(ROSTER_FIELDS.map(f => Sweat.countDocuments({ ...LIVE, [f]: true })));
     const place = 1 + counts.filter(c => c > all.length).length;
-    const summary = [`**${plural(all.length, 'sweat')}** beaten · **#${place}** on the leaderboard`];
-    if (filters.length) summary.push(`🔎 ${filters.join(' · ')} → **${num(list.length)}** match`);
-    summary.push(`↕️ Sorted by ${sort.label}`);
+    const lines = [`${plural(all.length, 'sweat')} beaten · #${place} on the leaderboard`];
+    if (filters.length) lines.push(`Only ${filters.join(', ')}: ${num(list.length)} match`);
+    lines.push(`Sorted by ${sort.label}`);
+    const png = await cards.render(cards.listCard(theme, {
+      title: 'Beaten by', who: state.person, lines, rows,
+      empty: filters.length ? 'Nobody matches those filters.' : 'Nobody yet.',
+      footer: [`Page ${page + 1} of ${pages}`, 'Sweat Log']
+    }));
 
-    const embed = {
-      author: { name: `⚔️ Beaten by ${ROSTER_LABELS[state.person]}` },
-      title: 'Open the full list on the site',
-      url: `${SITE_URL}?view=leaderboard&lb=${state.person}`,
-      color: COLORS.normal,
-      description: `${summary.join('\n')}\n\n${rows.length ? rows.join('\n') : '*Nobody matches.*'}`,
-      footer: { text: `Page ${page + 1} of ${pages} · Sweat Log` },
-      image: SPACER
-    };
     const id = (k, p) => `bt:${k}:${p}:${state.person}:${sort.id}:${state.flag}:${state.minStar}:${state.minFkdr}:${state.name}`;
     const components = pages > 1 ? [{ type: ROW, components: [
       { type: BUTTON, style: STYLE.grey, label: '⏮', custom_id: id('f', 0), disabled: page === 0 },
@@ -749,153 +738,148 @@ module.exports = function setupDiscord({
       { type: BUTTON, style: STYLE.blurple, label: 'Next ▶', custom_id: id('n', page + 1), disabled: page >= pages - 1 },
       { type: BUTTON, style: STYLE.grey, label: '⏭', custom_id: id('l', pages - 1), disabled: page >= pages - 1 }
     ] }] : [];
-    return { embeds: [embed], components, allowed_mentions: { parse: [] } };
+    return { png, kind: 'beaten', theme, components };
   }
 
   // --- /stats ---
   async function onStats(interaction, res) {
     const person = optionOf(interaction, 'person');
-    const keep = ['username', 'uuid', 'star', 'fkdr', 'wlr', 'cheating', 'boosting', 'createdAt', 'addedBy', 'notes', ...ROSTER_FIELDS]
-      .reduce((o, f) => { o[f] = 1; return o; }, {});
-    const everything = await Sweat.find(LIVE, keep).lean();
-    const list = person ? everything.filter(sw => sw[person]) : everything;
-    const n = list.length;
+    const theme = themeOf(userOf(interaction));
+    return withCard(interaction, res, async () => {
+      const keep = ['username', 'uuid', 'star', 'fkdr', 'wlr', 'cheating', 'boosting', 'createdAt', 'addedBy', 'notes', ...ROSTER_FIELDS]
+        .reduce((o, f) => { o[f] = 1; return o; }, {});
+      const everything = await Sweat.find(LIVE, keep).lean();
+      const list = person ? everything.filter(sw => sw[person]) : everything;
+      const n = list.length;
 
-    const vals = k => list.map(sw => sw[k]).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
-    const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
-    const median = a => (a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2) : 0);
-    const top = k => list.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])[0];
-    const since = days => list.filter(sw => sw.createdAt && Date.now() - new Date(sw.createdAt).getTime() < days * DAY_MS).length;
-    const dates = list.map(sw => sw.createdAt && new Date(sw.createdAt).getTime()).filter(Boolean).sort((a, b) => a - b);
-    const weeks = dates.length ? Math.max(1, (Date.now() - dates[0]) / (7 * DAY_MS)) : 1;
-    const players = new Set(list.map(sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase())).size;
-    const starV = vals('star'), fkdrV = vals('fkdr'), wlrV = vals('wlr');
-    const topStar = top('star'), topFkdr = top('fkdr'), topWlr = top('wlr');
-    const cheating = list.filter(sw => sw.cheating).length;
-    const boosting = list.filter(sw => sw.boosting).length;
-    const notes = list.reduce((t, sw) => t + ((sw.notes || []).length), 0);
-    const ranked = (counts, max = 3) => Object.entries(counts).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]).slice(0, max)
-      .map(([who, c], i) => `${MEDALS[i]} ${ROSTER_LABELS[who] || who} · **${num(c)}**`).join('\n') || '—';
+      const vals = k => list.map(sw => sw[k]).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+      const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+      const median = a => (a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2) : 0);
+      const top = k => list.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])[0];
+      const since = days => list.filter(sw => sw.createdAt && Date.now() - new Date(sw.createdAt).getTime() < days * DAY_MS).length;
+      const dates = list.map(sw => sw.createdAt && new Date(sw.createdAt).getTime()).filter(Boolean).sort((a, b) => a - b);
+      const weeks = dates.length ? Math.max(1, (Date.now() - dates[0]) / (7 * DAY_MS)) : 1;
+      const players = new Set(list.map(sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase())).size;
+      const starV = vals('star'), fkdrV = vals('fkdr'), wlrV = vals('wlr');
+      const cheating = list.filter(sw => sw.cheating).length;
+      const boosting = list.filter(sw => sw.boosting).length;
+      const notes = list.reduce((t, sw) => t + ((sw.notes || []).length), 0);
+      const fk = v => cards.ratioColor(theme, v, 'fkdr');
+      const wl = v => cards.ratioColor(theme, v, 'wlr');
+      const ranked = counts => Object.entries(counts).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]).slice(0, 3);
 
-    const description = [
-      `**${plural(n, 'sweat')}** · **${plural(players, 'player')}** · **${(n / weeks).toFixed(1)}** a week`,
-      dates.length ? `First ${when(dates[0])} · latest ${when(dates[dates.length - 1], 'R')}` : null
-    ].filter(Boolean).join('\n');
-
-    const fields = [
-      { name: '📈 Average', value: `Star **${stars(mean(starV))}**\nFKDR **${mean(fkdrV).toFixed(2)}**\nWLR **${mean(wlrV).toFixed(2)}**`, inline: true },
-      { name: '🎯 Median', value: `Star **${stars(median(starV))}**\nFKDR **${median(fkdrV).toFixed(2)}**\nWLR **${median(wlrV).toFixed(2)}**`, inline: true },
-      { name: '🗓️ Recently', value: `This week **${num(since(7))}**\nThis month **${num(since(30))}**\nThis year **${num(since(365))}**`, inline: true },
-      { name: '🚩 Flags', value: `Cheating **${num(cheating)}** · ${pct(cheating, n)}\nBoosting **${num(boosting)}** · ${pct(boosting, n)}\nNotes **${num(notes)}**`, inline: true }
-    ];
-    if (person) {
-      const counts = Object.fromEntries(ROSTER_FIELDS.map(f => [f, everything.filter(sw => sw[f]).length]));
-      const place = 1 + Object.values(counts).filter(c => c > n).length;
-      const together = Object.fromEntries(ROSTER_FIELDS.filter(f => f !== person).map(f => [f, list.filter(sw => sw[f]).length]));
-      fields.push(
-        { name: `👤 ${ROSTER_LABELS[person]}`, value: `Leaderboard **#${place}**\n**${pct(n, everything.length)}** of the list`, inline: true },
-        { name: '🤝 Most often with', value: ranked(together), inline: true }
-      );
-    } else {
-      const beaten = Object.fromEntries(ROSTER_FIELDS.map(f => [f, list.filter(sw => sw[f]).length]));
-      const logged = {};
-      list.forEach(sw => { if (sw.addedBy) logged[sw.addedBy] = (logged[sw.addedBy] || 0) + 1; });
-      fields.push(
-        { name: '⚔️ Beaten the most', value: ranked(beaten), inline: true },
-        { name: '✍️ Logged the most', value: ranked(logged), inline: true }
-      );
-    }
-    // Full width, so the names and numbers fit on one line each.
-    fields.push({ name: '🏅 Top sweats', value: [
-      topStar && `**${stars(topStar.star)}** · ${playerLink(topStar)}`,
-      topFkdr && `**${topFkdr.fkdr.toFixed(2)}** FKDR · ${playerLink(topFkdr)}`,
-      topWlr && `**${topWlr.wlr.toFixed(2)}** WLR · ${playerLink(topWlr)}`
-    ].filter(Boolean).join('\n') || '—' });
-    const embed = {
-      author: { name: '📊 Sweat stats' },
-      title: person ? `Sweats ${ROSTER_LABELS[person]} has beaten` : 'The whole sweat list',
-      url: person ? `${SITE_URL}?view=leaderboard&lb=${person}` : SITE_URL,
-      color: COLORS.stats,
-      description,
-      fields,
-      footer: { text: 'Sweat Log' },
-      image: SPACER
-    };
-    if (topStar && topStar.uuid) embed.thumbnail = { url: headUrl(topStar.uuid) };
-    return res.json({ type: REPLY, data: { embeds: [embed], allowed_mentions: { parse: [] } } });
+      let people;
+      let third;
+      if (person) {
+        const counts = Object.fromEntries(ROSTER_FIELDS.map(f => [f, everything.filter(sw => sw[f]).length]));
+        const place = 1 + Object.values(counts).filter(c => c > n).length;
+        people = { title: 'Most often beaten with', rows: ranked(Object.fromEntries(ROSTER_FIELDS.filter(f => f !== person).map(f => [f, list.filter(sw => sw[f]).length]))) };
+        third = { title: ROSTER_LABELS[person], rows: [['Leaderboard', `#${place}`], ['Share of list', pct(n, everything.length)], ['Flagged', num(cheating + boosting)]] };
+      } else {
+        people = { title: 'Beaten the most', rows: ranked(Object.fromEntries(ROSTER_FIELDS.map(f => [f, list.filter(sw => sw[f]).length]))) };
+        third = { title: 'Flags', rows: [['Cheating', `${num(cheating)} · ${pct(cheating, n)}`], ['Boosting', `${num(boosting)} · ${pct(boosting, n)}`], ['Notes', num(notes)]] };
+      }
+      const topStar = top('star'), topFkdr = top('fkdr'), topWlr = top('wlr');
+      const png = await cards.render(cards.statsCard(theme, {
+        title: person ? 'Sweats beaten by' : 'Sweat stats', who: person || null, right: person ? null : 'Whole list',
+        summary: [[num(n), 'Sweats'], [num(players), 'Players'], [(n / weeks).toFixed(1), 'A week'], [`+${num(since(30))}`, '30 days']],
+        blocks: [
+          { title: 'Average', rows: [['Star', stars(mean(starV))], ['FKDR', mean(fkdrV).toFixed(2), fk(mean(fkdrV))], ['WLR', mean(wlrV).toFixed(2), wl(mean(wlrV))]] },
+          { title: 'Median', rows: [['Star', stars(median(starV))], ['FKDR', median(fkdrV).toFixed(2), fk(median(fkdrV))], ['WLR', median(wlrV).toFixed(2), wl(median(wlrV))]] },
+          third
+        ],
+        people,
+        top: [
+          topStar && { star: topStar.star, username: topStar.username, value: stars(topStar.star) },
+          topFkdr && { star: topFkdr.star, username: topFkdr.username, value: `${topFkdr.fkdr.toFixed(2)} FKDR`, color: fk(topFkdr.fkdr) },
+          topWlr && { star: topWlr.star, username: topWlr.username, value: `${topWlr.wlr.toFixed(2)} WLR`, color: wl(topWlr.wlr) }
+        ].filter(Boolean),
+        footer: [dates.length ? `First sweat ${day(new Date(dates[0]))} · latest ${ago(dates[dates.length - 1])}` : 'No sweats yet', 'Sweat Log']
+      }));
+      return { png, kind: 'stats', theme };
+    });
   }
 
   // --- /leaderboard ---
   async function onLeaderboard(interaction, res) {
     const board = LEADERBOARDS.find(b => b.id === optionOf(interaction, 'type')) || LEADERBOARDS[0];
     const period = PERIODS.find(p => p.id === optionOf(interaction, 'period')) || PERIODS[0];
-    const filter = period.days ? { ...LIVE, createdAt: { $gte: new Date(Date.now() - period.days * DAY_MS) } } : LIVE;
-    const keep = ['username', 'uuid', 'addedBy', 'createdAt', 'star', 'fkdr', 'wlr', ...ROSTER_FIELDS]
-      .reduce((o, f) => { o[f] = 1; return o; }, {});
-    const sweats = await Sweat.find(filter, keep).lean();
-
-    let lines;
-    let thumb = null;
-    if (board.kind === 'people') {
-      // Sweats added with the admin key count as "Admin" for who logged most.
-      const people = board.id === 'logged' ? [...ROSTER_FIELDS, 'admin'] : ROSTER_FIELDS;
-      const counts = {};
-      people.forEach(f => { counts[f] = 0; });
-      sweats.forEach(sw => {
-        if (board.id === 'logged') { if (counts[sw.addedBy] !== undefined) counts[sw.addedBy]++; }
-        else ROSTER_FIELDS.forEach(f => { if (sw[f]) counts[f]++; });
-      });
-      const order = people.filter(f => counts[f] > 0).sort((a, b) => counts[b] - counts[a]);
-      const most = Math.max(1, ...order.map(f => counts[f]));
-      // A ten-block bar scaled to the leader, so the gaps read at a glance.
-      const bar = c => { const full = Math.max(1, Math.round(c / most * 10)); return '▰'.repeat(full) + '▱'.repeat(10 - full); };
-      lines = order.map((f, i) => `${rank(i)} **${ROSTER_LABELS[f]}**\n${' '.repeat(2)}${bar(counts[f])} **${num(counts[f])}**`);
-    } else {
-      const k = board.stat;
-      // Each player once, by their best entry.
-      const seen = new Set();
-      const best = sweats.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])
-        .filter(sw => {
-          const who = (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
-          if (seen.has(who)) return false;
-          seen.add(who);
-          return true;
-        }).slice(0, 10);
-      if (best[0] && best[0].uuid) thumb = headUrl(best[0].uuid);
-      lines = best.map((sw, i) => {
-        const value = k === 'star' ? stars(sw.star) : `${sw[k].toFixed(2)} ${k.toUpperCase()}`;
-        const star = k !== 'star' && hasStar(sw) ? ` \`${starTag(sw.star)}\`` : '';
-        return `${rank(i)} ${playerLink(sw)}${star} · **${value}**`;
-      });
-    }
-
-    const embed = {
-      author: { name: '🏆 Leaderboard' },
-      title: `${board.title} · ${period.name.toLowerCase()}`,
-      url: `${SITE_URL}?view=leaderboard`,
-      color: COLORS.gold,
-      description: lines.length ? lines.join('\n') : '*Nothing here yet.*',
-      footer: { text: `${plural(sweats.length, 'sweat')} counted · Sweat Log` },
-      image: SPACER
-    };
-    if (thumb) embed.thumbnail = { url: thumb };
-    return res.json({ type: REPLY, data: { embeds: [embed], allowed_mentions: { parse: [] } } });
+    const theme = themeOf(userOf(interaction));
+    return withCard(interaction, res, async () => {
+      const filter = period.days ? { ...LIVE, createdAt: { $gte: new Date(Date.now() - period.days * DAY_MS) } } : LIVE;
+      const keep = ['username', 'uuid', 'addedBy', 'createdAt', 'star', 'fkdr', 'wlr', ...ROSTER_FIELDS]
+        .reduce((o, f) => { o[f] = 1; return o; }, {});
+      const sweats = await Sweat.find(filter, keep).lean();
+      const data = { title: board.title, right: period.name, footer: [`${plural(sweats.length, 'sweat')} counted`, 'Sweat Log'] };
+      if (board.kind === 'people') {
+        // Sweats added with the admin key count as "Admin" for who logged most.
+        const people = board.id === 'logged' ? [...ROSTER_FIELDS, 'admin'] : ROSTER_FIELDS;
+        const counts = Object.fromEntries(people.map(f => [f, 0]));
+        sweats.forEach(sw => {
+          if (board.id === 'logged') { if (counts[sw.addedBy] !== undefined) counts[sw.addedBy]++; }
+          else ROSTER_FIELDS.forEach(f => { if (sw[f]) counts[f]++; });
+        });
+        data.people = people.filter(f => counts[f] > 0).sort((a, b) => counts[b] - counts[a]).map(f => [f, counts[f]]);
+      } else {
+        const k = board.stat;
+        // Each player once, by their best entry.
+        const seen = new Set();
+        data.sweats = sweats.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])
+          .filter(sw => {
+            const who = (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
+            if (seen.has(who)) return false;
+            seen.add(who);
+            return true;
+          }).slice(0, 10)
+          .map(sw => ({
+            star: sw.star, username: sw.username,
+            value: k === 'star' ? stars(sw.star) : sw[k].toFixed(2),
+            color: k === 'star' ? null : cards.ratioColor(theme, sw[k], k)
+          }));
+      }
+      return { png: await cards.render(cards.leaderboardCard(theme, data)), kind: 'leaderboard', theme };
+    });
   }
 
   // --- /random ---
   // Read-only: anyone can use it, and it has no buttons.
   async function onRandom(interaction, res) {
     const person = optionOf(interaction, 'person');
-    const filter = person ? { ...LIVE, [person]: true } : LIVE;
-    const ids = await Sweat.find(filter, { _id: 1 }).lean();
-    if (!ids.length) return reply(res, person ? `${ROSTER_LABELS[person]} hasn't beaten anyone yet.` : 'The list is empty.');
-    const pick = ids[Math.floor(Math.random() * ids.length)];
-    const sweat = await Sweat.findOne({ _id: pick._id, ...LIVE }).lean();
-    if (!sweat) return reply(res, 'Try again - that one was just removed.');
-    return res.json({ type: REPLY, data: sweatCard(sweat, {
-      author: `🎲 Random sweat${person ? ` beaten by ${ROSTER_LABELS[person]}` : ''}`,
-      footer: `Added ${addedOn(sweat)} · Sweat Log`
-    }, 'readonly') });
+    const theme = themeOf(userOf(interaction));
+    return withCard(interaction, res, async () => {
+      const ids = await Sweat.find(person ? { ...LIVE, [person]: true } : LIVE, { _id: 1 }).lean();
+      if (!ids.length) return person ? `${ROSTER_LABELS[person]} hasn't beaten anyone yet.` : 'The list is empty.';
+      const pick = ids[Math.floor(Math.random() * ids.length)];
+      const sweat = await Sweat.findOne({ _id: pick._id, ...LIVE }).lean();
+      if (!sweat) return 'Try again - that one was just removed.';
+      return sweatMessage(sweat, theme, {
+        footer: [`Random sweat${person ? ` beaten by ${ROSTER_LABELS[person]}` : ''}`, `Added ${addedOn(sweat)}`]
+      }, 'readonly');
+    });
+  }
+
+  // --- /theme ---
+  // Saved per Discord account. Shows a preview: the newest sweat on the list
+  // drawn in that theme.
+  async function onTheme(interaction, res) {
+    const userId = userOf(interaction);
+    const pick = optionOf(interaction, 'theme');
+    return withCard(interaction, res, async () => {
+      let content;
+      if (pick && cards.THEMES[pick]) {
+        themes.set(userId, pick);
+        await DiscordPref.updateOne({ _id: userId }, { $set: { theme: pick } }, { upsert: true })
+          .catch(err => console.error('Discord: saving theme failed', err.message));
+        content = `Your cards are now **${cards.THEMES[pick].label}**. Everything you ask the bot for uses it, and so do sweats you log.`;
+      } else {
+        content = `Your cards are **${cards.THEMES[themeOf(userId)].label}**. Pick another with **/theme**: ${cards.THEME_IDS.map(id => cards.THEMES[id].label).join(', ')}.`;
+      }
+      const theme = themeOf(userId);
+      const sample = await Sweat.findOne(LIVE).sort({ createdAt: -1 }).lean();
+      if (!sample) return { content };
+      const msg = await sweatMessage(sample, theme, { footer: [`${cards.THEMES[theme].label} theme`, 'Preview'] }, 'readonly');
+      return { ...msg, content };
+    }, true);
   }
 
   // --- Clicks, picks and form submits on a sweat card ---
@@ -916,39 +900,49 @@ module.exports = function setupDiscord({
     if (!who) return reply(res, NOT_LINKED);
     const msg = interaction.message || {};
     const req = { keyOwner: who, discordMessageId: msg.id };
-
-    // Redraws the card the click came from, keeping its top line and footer,
-    // and its entry arrows if it had them.
-    const old = (msg.embeds && msg.embeds[0]) || {};
-    const header = { author: old.author && old.author.name, footer: old.footer && old.footer.text };
+    const theme = themeOfMessage(msg) || themeOf(userOf(interaction));
     const hadNav = JSON.stringify(msg.components || []).includes('sweat:entry:');
-    const redraw = async (sweat, mode) => res.json({
-      type: UPDATE,
-      data: sweatCard(sweat, header, mode, hadNav && !sweat.deletedAt ? await entriesOf(sweat) : null)
-    });
 
     // Arrows between a player's entries: show that entry instead.
     if (action === 'entry') {
       const target = await Sweat.findOne({ _id: id, ...LIVE }).lean();
       if (!target) return reply(res, GONE);
-      const nav = await entriesOf(target);
-      return res.json({ type: UPDATE, data: sweatCard(target, lookupHeader(target, nav), 'normal', nav) });
+      res.json({ type: DEFER_UPDATE });
+      return editOriginal(interaction, await sweatMessage(target, theme, lookupHeader(target), 'normal', await entriesOf(target)));
     }
 
     const sweat = await Sweat.findOne({ _id: id, ...LIVE }).lean();
     if (!sweat) return reply(res, GONE);
-    // Cards posted before the bot remembered its messages: the first click on
-    // one (in the Sweat Log channel, not a /sweat reply) records it.
-    if (!sweat.discordPost && msg.id && msg.channel_id === CHANNEL_ID && !msg.interaction_metadata && !msg.interaction) {
-      sweat.discordPost = { channelId: CHANNEL_ID, messageId: msg.id, ...header };
+    // Is this card the sweat's channel post? Cards posted before the bot
+    // remembered its messages get recorded on their first click.
+    const isPost = !!msg.id && msg.channel_id === CHANNEL_ID && !msg.interaction_metadata && !msg.interaction && !msg.webhook_id;
+    if (isPost && !sweat.discordPost) {
+      sweat.discordPost = { channelId: CHANNEL_ID, messageId: msg.id, theme, caption: postCaption(sweat, sweat.addedBy), footer: [`Logged by ${ROSTER_LABELS[sweat.addedBy] || 'someone'}`, addedOn(sweat)] };
       rememberPost(id, sweat.discordPost);
     }
+    const tracked = !!(sweat.discordPost && sweat.discordPost.messageId === msg.id);
+    // A channel post keeps its footer and caption; a lookup gets its own.
+    const headerFor = s => (tracked
+      ? { ...sweat.discordPost, footer: sweat.discordPost.footer || ['Sweat Log', addedOn(s)] }
+      : lookupHeader(s));
+
+    // Answers "updating..." first (drawing takes a moment), then the card.
+    let deferred = false;
+    const defer = () => { if (!deferred) { deferred = true; res.json({ type: DEFER_UPDATE }); } };
+    const say = content => (deferred ? followUp(interaction, content) : reply(res, content));
+    const redraw = async (s, mode) => {
+      defer();
+      const header = headerFor(s);
+      if (mode === 'removed' && tracked) header.caption = removedCaption(s, header.caption);
+      return editOriginal(interaction, await sweatMessage(s, theme, header, mode, hadNav && !s.deletedAt ? await entriesOf(s) : null));
+    };
     const canEdit = withinChangeWindow(req, sweat.createdAt, 'edit');
 
     // Saves `set` on the sweat, logs what changed and redraws the card.
     async function save(set) {
+      defer();
       const updated = await Sweat.findOneAndUpdate({ _id: id, ...LIVE }, { $set: set }, { new: true }).lean();
-      if (!updated) return reply(res, GONE);
+      if (!updated) return say(GONE);
       const changes = {};
       Object.keys(set).forEach(k => {
         const was = sweat[k] === undefined ? null : sweat[k];
@@ -975,11 +969,10 @@ module.exports = function setupDiscord({
         return redraw(sweat, 'normal');
       }
 
-      // The quick Beaten by button (and the old "I beat them" one).
+      // "I beat them" (and the older buttons on cards from before).
       case 'beat':
         if (!canEdit) return reply(res, EDIT_WINDOW);
         return save({ [who]: !sweat[who] });
-      // Buttons on cards posted before the edit menu existed.
       case 'cheating':
       case 'boosting':
         if (!canEdit) return reply(res, EDIT_WINDOW);
@@ -1005,9 +998,9 @@ module.exports = function setupDiscord({
         formValues(interaction).forEach(([key, raw]) => {
           const input = STAT_INPUTS.find(s => s.key === key);
           if (!input) return;
-          const text = String(raw || '').trim().replace(/,/g, '');
-          if (!text) return; // empty keeps the current value
-          const value = Number(text);
+          const txt = String(raw || '').trim().replace(/,/g, '');
+          if (!txt) return; // empty keeps the current value
+          const value = Number(txt);
           if (!Number.isFinite(value) || value < 0) bad.push(input.label);
           else set[key] = cleanStat(value);
         });
@@ -1018,31 +1011,33 @@ module.exports = function setupDiscord({
 
       case 'noteform': {
         const raw = (formValues(interaction).find(([key]) => key === 'text') || [])[1];
-        const text = cleanNoteText(raw);
-        if (text === null) return reply(res, `Notes can be at most ${NOTE_MAX_LENGTH} characters.`);
-        if (!text) return reply(res, 'The note was empty, so nothing was added.');
+        const txt = cleanNoteText(raw);
+        if (txt === null) return reply(res, `Notes can be at most ${NOTE_MAX_LENGTH} characters.`);
+        if (!txt) return reply(res, 'The note was empty, so nothing was added.');
+        defer();
         // Same cap as the website, checked in the filter so two notes added
         // at once can't go over it.
         const updated = await Sweat.findOneAndUpdate(
           { _id: id, ...LIVE, [`notes.${NOTES_PER_SWEAT_MAX - 1}`]: { $exists: false } },
-          { $push: { notes: { text, author: who, createdAt: new Date() } } },
+          { $push: { notes: { text: txt, author: who, createdAt: new Date() } } },
           { new: true }
         ).lean();
-        if (!updated) return reply(res, `A sweat can have at most ${NOTES_PER_SWEAT_MAX} notes.`);
+        if (!updated) return say(`A sweat can have at most ${NOTES_PER_SWEAT_MAX} notes.`);
         const saved = updated.notes[updated.notes.length - 1];
-        logActivity(req, 'note.add', updated, { noteId: saved._id, noteText: text });
+        logActivity(req, 'note.add', updated, { noteId: saved._id, noteText: txt });
         return redraw(updated, 'normal');
       }
 
       case 'confirmremove': {
         const why = canRemoveSweat(who, sweat);
         if (why) return reply(res, why);
+        defer();
         const removed = await Sweat.findOneAndUpdate(
           { _id: id, ...LIVE },
           { $set: { deletedAt: new Date(), deletedBy: who } },
           { new: true }
         ).lean();
-        if (!removed) return reply(res, GONE);
+        if (!removed) return say(GONE);
         logActivity(req, 'sweat.delete', removed);
         return redraw(removed, 'removed');
       }
@@ -1066,8 +1061,8 @@ module.exports = function setupDiscord({
 
   // --- The endpoint Discord calls ---
   const COMMAND_HANDLERS = {
-    sweat: onSweatCommand, add: onAdd, beaten: onBeaten,
-    stats: onStats, leaderboard: onLeaderboard, random: onRandom
+    sweat: onSweatCommand, add: onAdd, beaten: onBeaten, stats: onStats,
+    leaderboard: onLeaderboard, random: onRandom, theme: onTheme
   };
   app.post('/discord/interactions', async (req, res) => {
     if (!enabled) return res.status(503).json({ error: 'Discord bot not configured' });
@@ -1092,7 +1087,8 @@ module.exports = function setupDiscord({
       return reply(res, 'Unknown command.');
     } catch (err) {
       console.error('Discord interaction error', err);
-      if (!res.headersSent) return reply(res, 'Something went wrong on the server. Try again in a moment.');
+      if (!res.headersSent) return reply(res, OOPS);
+      if (interaction.token) followUp(interaction, OOPS);
     }
   });
 
