@@ -1,7 +1,7 @@
 // --- Discord bot: Sweat Log ---
 // Posts every newly added sweat to a channel as a card with an "Edit this
-// sweat" menu (stats, beaten by, flags, add note, remove) and a quick Beaten
-// by button, and answers slash commands:
+// sweat" menu (stats, beaten by, flags, add note, remove) and an "I beat them"
+// button (adds or removes you), and answers slash commands:
 //   /sweat <name>        a player's card (renamed players found by uuid; arrows
 //                        between their entries when they're on the list twice)
 //   /add <name> [note]   log a sweat: a private preview to pick who beat them
@@ -294,7 +294,7 @@ module.exports = function setupDiscord({
           { label: 'Remove from the list', value: 'remove', description: 'Only sweats you added', emoji: { name: '🗑️' } }
         ]
       }] },
-      { type: ROW, components: [button('Add/remove me from Beaten by', 'beat', STYLE.grey, '⚔️')] }
+      { type: ROW, components: [button('I beat them', 'beat', STYLE.grey, '⚔️')] }
     ];
   }
 
