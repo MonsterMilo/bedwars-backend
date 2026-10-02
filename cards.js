@@ -66,6 +66,8 @@ const tierCode = (v, steps) => '7fae6cd'[steps.filter(s => (v || 0) >= s).length
 const FKDR_STEPS = [1, 3, 5, 10, 20, 40];
 const WLR_STEPS = [0.5, 1, 2, 4, 8, 15];
 
+// Initials for the small roster icons, the same as the website's.
+const INITIALS = { milo: 'M', potat: 'P', aballs: 'A', zoiv: 'Z', max: 'Mx', sqoz: 'Sq', kermit: 'Kr', ssent: 'Sn', key: 'Ky' };
 const LABELS = { milo: 'Milo', potat: 'Potat', aballs: 'ABoi', zoiv: 'Zoiv', max: 'Max', sqoz: 'Sqoz', kermit: 'Kermit', ssent: 'Ssent', key: 'Key', admin: 'Admin' };
 const ROSTER = ['milo', 'potat', 'aballs', 'zoiv', 'max', 'sqoz', 'kermit', 'ssent', 'key'];
 
@@ -199,6 +201,19 @@ function chip(t, who, px = 22) {
     alignItems: 'center', padding: `${Math.round(px * 0.22)}px ${Math.round(px * 0.6)}px`, background: c,
     borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none',
   }, text(LABELS[who] || who, { fontFamily: t.font, fontSize: size(t, px), fontWeight: 800, color: t.chipText, lineHeight: 1, textShadow: t.chipShadow || 'none' }));
+}
+
+// A row of small roster icons (coloured initials), at most `max` and then "+N".
+function rosterIcons(t, people, px = 30, max = 5) {
+  const shown = people.slice(0, people.length > max ? max - 1 : max);
+  const more = people.length - shown.length;
+  const dot = (bg, label, color) => h('div', {
+    width: px, height: px, alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+    background: bg, borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none'
+  }, text(label, { fontFamily: t.font, fontSize: size(t, Math.round(px * (label.length > 1 ? 0.46 : 0.55))), fontWeight: 800, color, lineHeight: 1 }));
+  return h('div', { alignItems: 'center', gap: 4 },
+    shown.map(who => dot(t.roster[who] || t.dim, INITIALS[who] || who[0].toUpperCase(), t.chipText)),
+    more > 0 ? dot(t.track, `+${more}`, t.slotLabel || t.dim) : null);
 }
 
 // A flag badge: a rubber stamp in Case Files, a coloured pill elsewhere.
@@ -418,7 +433,9 @@ function leaderboardCard(themeId, data) {
         h('div', { alignItems: 'center', gap: 10 },
           s.star > 0 ? starTag(t, s.star, size(t, 24)) : null,
           text(s.username, { fontFamily: t.font, fontSize: size(t, 28), fontWeight: 800, color: t.slotText || t.text, lineHeight: 1.25, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1 })),
-        text(s.value, { fontFamily: t.font, fontSize: size(t, 30), fontWeight: 800, color: s.color || t.slotText || t.text, lineHeight: 1.1, textShadow: shadow(s.color || t.accent) }))));
+        h('div', { alignItems: 'center', justifyContent: 'space-between', gap: 10 },
+          text(s.value, { fontFamily: t.font, fontSize: size(t, 30), fontWeight: 800, color: s.color || t.slotText || t.text, lineHeight: 1.1, textShadow: shadow(s.color || t.accent) }),
+          s.beaten && s.beaten.length ? rosterIcons(t, s.beaten, 28) : null))));
   }
   if (!rows.length) return frame(t, data.footer, head, h('div', { justifyContent: 'center', padding: 30, marginTop: 10, ...t.slot }, text('Nothing here yet.', { fontFamily: t.body, fontSize: size(t, 26), color: t.slotLabel || t.dim })));
   const column = list => h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0 }, list);

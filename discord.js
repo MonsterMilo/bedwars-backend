@@ -77,6 +77,8 @@ const FLAG_FILTERS = [
   { id: 'clean', name: 'Not flagged', label: 'not flagged', test: s => !s.cheating && !s.boosting }
 ];
 const PAGE_SIZE = 10;
+// The /beaten card's min star dropdown.
+const MIN_STARS = ['500', '1000', '1500', '2000', '3000'];
 // The stats the website's edit form changes - five, which is also the most
 // boxes a Discord pop-up can hold.
 const STAT_INPUTS = [
@@ -727,7 +729,7 @@ module.exports = function setupDiscord({
   // --- /beaten ---
   // Everyone a person has beaten, ten a page, with the filters kept in the
   // page buttons. Anyone can use it and page through it.
-  const BEATEN_STATE = /^bt:([fpnl]):(-?\d+):(\w+):(\w*):(\w*):(\d*):([\d.]*):(\w*)$/;
+  const BEATEN_STATE = /^bt:([fpnlSFM]):(-?\d+):(\w+):(\w*):(\w*):(\d*):([\d.]*):(\w*)$/;
 
   async function onBeaten(interaction, res) {
     const person = optionOf(interaction, 'person') || roster.get(userOf(interaction));
@@ -750,6 +752,13 @@ module.exports = function setupDiscord({
     const m = BEATEN_STATE.exec(interaction.data.custom_id || '');
     if (!m || !ROSTER_FIELDS.includes(m[3])) return reply(res, 'That doesn\'t do anything any more.');
     const state = { page: Number(m[2]), person: m[3], sort: m[4], flag: m[5], minStar: m[6], minFkdr: m[7], name: m[8] };
+    // The dropdowns (S = sort, F = flags, M = min star) change one setting
+    // and go back to the first page.
+    const picked = ((interaction.data.values || [])[0] || '').replace(/[^\w]/g, '');
+    if (m[1] === 'S' && SORTS.some(x => x.id === picked)) state.sort = picked;
+    if (m[1] === 'F') state.flag = FLAG_FILTERS.some(x => x.id === picked) ? picked : '';
+    if (m[1] === 'M') state.minStar = /^\d+$/.test(picked) ? picked : '';
+    if (/[SFM]/.test(m[1])) state.page = 0;
     res.json({ type: DEFER_UPDATE });
     return editOriginal(interaction, await beatenPage(state, themeOfMessage(interaction.message) || themeOf(userOf(interaction))));
   }
@@ -784,12 +793,25 @@ module.exports = function setupDiscord({
     }), timing);
 
     const id = (k, p) => `bt:${k}:${p}:${state.person}:${sort.id}:${state.flag}:${state.minStar}:${state.minFkdr}:${state.name}`;
-    const components = pages > 1 ? [{ type: ROW, components: [
+    const select = (k, placeholder, options) => ({ type: ROW, components: [{
+      type: SELECT, custom_id: id(k, 0), placeholder, min_values: 1, max_values: 1, options
+    }] });
+    const components = [
+      select('S', 'Sort', SORTS.map(x => ({ label: `Sort: ${x.name}`, value: x.id, default: x.id === sort.id }))),
+      select('F', 'Flags', [{ id: 'any', label: 'any' }, ...FLAG_FILTERS].map(x => ({
+        label: `Flags: ${x.label}`, value: x.id, default: (state.flag || 'any') === x.id
+      }))),
+      select('M', 'Min star', ['any', ...MIN_STARS].map(v => ({
+        label: v === 'any' ? 'Stars: any' : `Stars: ${v}✫ or more`, value: v, default: (state.minStar || 'any') === v
+      })))
+    ];
+    // Page buttons on top, the dropdowns under them.
+    if (pages > 1) components.unshift({ type: ROW, components: [
       { type: BUTTON, style: STYLE.grey, label: '⏮', custom_id: id('f', 0), disabled: page === 0 },
       { type: BUTTON, style: STYLE.blurple, label: '◀ Prev', custom_id: id('p', page - 1), disabled: page === 0 },
       { type: BUTTON, style: STYLE.blurple, label: 'Next ▶', custom_id: id('n', page + 1), disabled: page >= pages - 1 },
       { type: BUTTON, style: STYLE.grey, label: '⏭', custom_id: id('l', pages - 1), disabled: page >= pages - 1 }
-    ] }] : [];
+    ] });
     return { png, kind: 'beaten', theme, components, timing };
   }
 
@@ -875,17 +897,25 @@ module.exports = function setupDiscord({
         data.people = people.filter(f => counts[f] > 0).sort((a, b) => counts[b] - counts[a]).map(f => [f, counts[f]]);
       } else {
         const k = board.stat;
-        // Each player once, by their best entry.
+        // Each player once, by their best entry - but showing everyone who
+        // has beaten them across all their entries.
+        const key = sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
+        const beatenBy = new Map();
+        sweats.forEach(sw => {
+          const set = beatenBy.get(key(sw)) || new Set();
+          ROSTER_FIELDS.forEach(f => { if (sw[f]) set.add(f); });
+          beatenBy.set(key(sw), set);
+        });
         const seen = new Set();
         data.sweats = sweats.filter(sw => Number.isFinite(sw[k]) && sw[k] > 0).sort((a, b) => b[k] - a[k])
           .filter(sw => {
-            const who = (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
+            const who = key(sw);
             if (seen.has(who)) return false;
             seen.add(who);
             return true;
           }).slice(0, 10)
           .map(sw => ({
-            star: sw.star, username: sw.username,
+            star: sw.star, username: sw.username, beaten: ROSTER_FIELDS.filter(f => beatenBy.get(key(sw)).has(f)),
             value: k === 'star' ? stars(sw.star) : sw[k].toFixed(2),
             color: k === 'star' ? null : cards.ratioColor(theme, sw[k], k)
           }));
