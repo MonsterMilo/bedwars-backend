@@ -10,10 +10,14 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const satori = require('satori').default;
 const { Resvg } = require('@resvg/resvg-js');
 
-const W = 1000; // card width in px; Discord shows it scaled to fit
+const W = 1000; // layout width in px (all sizes below are for this width)
+// The PNG is drawn at 800px wide: Discord shows cards at ~400-550px, so
+// it's still sharp, and it's about a third less work than 1000px.
+const OUT_W = 800;
 
 // --- Fonts (all from Google Fonts, SIL Open Font License; DejaVu for symbols) ---
 const FONT_DIR = path.join(__dirname, 'fonts');
@@ -78,8 +82,8 @@ const THEMES = {
     bar: { background: 'rgba(0,217,255,0.08)', border: '1px solid rgba(0,217,255,0.28)', borderRadius: 16 },
     slot: { background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(0,217,255,0.2)', borderRadius: 14 },
     skinBg: { background: 'radial-gradient(circle at 50% 40%, rgba(0,217,255,0.28), rgba(168,85,247,0.08) 70%)', border: '1px solid rgba(0,217,255,0.2)', borderRadius: 16 },
-    text: '#e8f6ff', dim: '#7f93a8', name: '#ffffff', nameShadow: '0 0 18px rgba(0,217,255,0.75)',
-    glow: c => `0 0 14px ${c}77`, chipText: '#05070d', chipRound: true,
+    text: '#e8f6ff', dim: '#7f93a8', name: '#ffffff', nameShadow: '0 0 10px rgba(0,217,255,0.8)',
+    glow: () => '0 2px 0 rgba(0,0,0,0.55)', chipText: '#05070d', chipRound: true,
     accent: '#00d9ff', track: 'rgba(255,255,255,0.07)',
     mc: { 0: '#6b7280', 1: '#5b6cff', 2: '#22e07a', 3: '#14d4d4', 4: '#ff3860', 5: '#c64bff', 6: '#ffb020', 7: '#b8c0cc', 8: '#7c8594', 9: '#6e8bff', a: '#5cff9d', b: '#3ff0ff', c: '#ff5c72', d: '#ff5cf0', e: '#ffe45c', f: '#ffffff' },
     roster: { milo: '#00d9ff', potat: '#a855f7', aballs: '#ffb84d', zoiv: '#ff5fa2', max: '#4ade80', sqoz: '#60a5fa', kermit: '#a3e635', ssent: '#fb923c', key: '#facc15' },
@@ -146,8 +150,8 @@ const THEMES = {
     bar: { background: 'rgba(53,230,196,0.07)', border: '1px solid rgba(53,230,196,0.3)', borderRadius: 14 },
     slot: { background: 'rgba(2,16,24,0.6)', border: '1px solid rgba(53,230,196,0.2)', borderRadius: 12 },
     skinBg: { background: 'radial-gradient(circle at 50% 35%, rgba(53,230,196,0.25), rgba(2,16,24,0.9) 70%)', border: '2px solid #c99a4a', borderRadius: 16 },
-    text: '#e6f6f4', dim: '#82a9ae', name: '#e6f6f4', nameShadow: '0 0 16px rgba(53,230,196,0.6)',
-    glow: c => `0 0 12px ${c}66`, chipText: '#031418', chipRound: true,
+    text: '#e6f6f4', dim: '#82a9ae', name: '#e6f6f4', nameShadow: '0 0 10px rgba(53,230,196,0.7)',
+    glow: () => '0 2px 0 rgba(0,0,0,0.55)', chipText: '#031418', chipRound: true,
     accent: '#35e6c4', track: 'rgba(255,255,255,0.06)',
     mc: { 0: '#4d6d78', 1: '#4a6cf0', 2: '#1fbf8f', 3: '#1aa3a3', 4: '#e0566b', 5: '#9b6bff', 6: '#f2b35a', 7: '#9fb8c0', 8: '#6f8c96', 9: '#5b8cff', a: '#5ef2b5', b: '#5ff0f0', c: '#ff7a8a', d: '#e28bff', e: '#f7e27a', f: '#e8fbff' },
     roster: { milo: '#35e6c4', potat: '#9b6bff', aballs: '#ffb454', zoiv: '#ff6bb8', max: '#4ade9f', sqoz: '#4fc3f7', kermit: '#9fe64f', ssent: '#ff8f5c', key: '#ffe066' },
@@ -194,7 +198,6 @@ function chip(t, who, px = 22) {
   return h('div', {
     alignItems: 'center', padding: `${Math.round(px * 0.22)}px ${Math.round(px * 0.6)}px`, background: c,
     borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none',
-    ...(t.chipRound ? { boxShadow: `0 0 12px ${c}88` } : {})
   }, text(LABELS[who] || who, { fontFamily: t.font, fontSize: size(t, px), fontWeight: 800, color: t.chipText, lineHeight: 1, textShadow: t.chipShadow || 'none' }));
 }
 
@@ -209,7 +212,7 @@ function flagBadge(t, kind) {
   }
   return h('div', {
     alignItems: 'center', padding: '6px 14px', background: c, borderRadius: t.chipRound ? 999 : 0,
-    border: t.chipBorder || 'none', ...(t.chipRound ? { boxShadow: `0 0 16px ${c}99` } : {})
+    border: t.chipBorder || 'none'
   },
     text(sym, { fontFamily: 'Symbols', fontSize: 18, color: '#fff', marginRight: 8 }),
     text(word.toUpperCase(), { fontFamily: t.label_, fontSize: size(t, 18), fontWeight: 700, color: '#fff', letterSpacing: 1 }));
@@ -245,7 +248,7 @@ function frame(t, footer, ...children) {
 function bar(t, n, most, color, height) {
   const r = t.chipRound ? Math.round(height / 2) : 0;
   return h('div', { flexGrow: 1, flexBasis: 0, height, background: t.track, borderRadius: r, overflow: 'hidden' },
-    h('div', { flexGrow: Math.max(n, most * 0.02), flexBasis: 0, height, background: color, borderRadius: r, ...(t.chipRound ? { boxShadow: `0 0 12px ${color}88` } : {}) }),
+    h('div', { flexGrow: Math.max(n, most * 0.02), flexBasis: 0, height, background: color, borderRadius: r }),
     n < most ? h('div', { flexGrow: most - n, flexBasis: 0, height }) : null);
 }
 
@@ -253,7 +256,7 @@ function bar(t, n, most, color, height) {
 function nameBar(t, star, name, flagColor, right) {
   return h('div', {
     alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar,
-    ...(flagColor ? (t.chipBorder ? { border: `3px solid ${flagColor}` } : { borderColor: flagColor, ...(t.chipRound ? { boxShadow: `0 0 22px ${flagColor}55` } : {}) }) : {})
+    ...(flagColor ? (t.chipBorder ? { border: `3px solid ${flagColor}` } : { borderColor: flagColor, borderWidth: 2 }) : {})
   },
     h('div', { alignItems: 'center' },
       star !== null && star !== undefined ? starTag(t, star, size(t, 46), true) : null,
@@ -415,9 +418,32 @@ function leaderboardCard(themeId, data) {
   return frame(t, data.footer, head, rows);
 }
 
-async function render(tree) {
+// Finished cards are kept for a while: the same card asked for again (a
+// lookup repeated, a page flipped back, a redraw with nothing changed) is
+// sent straight away instead of drawn again. Keyed on everything that goes
+// into the card, so any change gives a new one.
+const CACHE_MS = 15 * 60 * 1000;
+const CACHE_MAX = 60;
+const cache = new Map(); // key -> { png, at }
+
+// timing (optional): gets { drawMs, cached } filled in.
+async function render(tree, timing = {}) {
+  const key = crypto.createHash('sha1').update(JSON.stringify(tree)).digest('base64');
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at < CACHE_MS) {
+    cache.delete(key); cache.set(key, hit); // most recently used last
+    timing.cached = true;
+    timing.drawMs = 0;
+    return hit.png;
+  }
+  const t0 = Date.now();
   const svg = await satori(tree, { width: W, fonts: FONTS });
-  return new Resvg(svg, { fitTo: { mode: 'width', value: W } }).render().asPng();
+  const png = new Resvg(svg, { fitTo: { mode: 'width', value: OUT_W } }).render().asPng();
+  timing.cached = false;
+  timing.drawMs = Date.now() - t0;
+  cache.set(key, { png, at: Date.now() });
+  while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+  return png;
 }
 
 module.exports = {
