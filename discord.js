@@ -908,7 +908,7 @@ module.exports = function setupDiscord({
   }
 
   // --- /theme ---
-  // Saved per Discord account. Shows a preview: the newest sweat on the list
+  // Saved per Discord account. Shows a preview: the same example player
   // drawn in that theme.
   async function onTheme(interaction, res) {
     const userId = userOf(interaction);
@@ -919,13 +919,17 @@ module.exports = function setupDiscord({
         themes.set(userId, pick);
         await DiscordPref.updateOne({ _id: userId }, { $set: { theme: pick } }, { upsert: true })
           .catch(err => console.error('Discord: saving theme failed', err.message));
-        content = `Your cards are now **${cards.THEMES[pick].label}**. Everything you ask the bot for uses it. (New sweats in the Sweat Log channel stay ${cards.THEMES[DEFAULT_THEME].label} so they all match.)`;
+        content = `Your cards are now **${cards.THEMES[pick].label}**. Everything you ask the bot for uses it.`;
       } else {
         content = `Your cards are **${cards.THEMES[themeOf(userId)].label}**. Pick another with **/theme**: ${cards.THEME_IDS.map(id => cards.THEMES[id].label).join(', ')}.`;
       }
       const theme = themeOf(userId);
-      const sample = await Sweat.findOne(LIVE).sort({ createdAt: -1 }).lean();
-      if (!sample) return { content };
+      // The same made-up player every time, so themes are easy to compare.
+      const sample = {
+        _id: 'preview', username: 'Steve', uuid: 'c06f89064c8a49119c29ea1dbd1aab82', star: 1000,
+        fkdr: 8.5, wlr: 3.2, bblr: 4.1, finals: 12345, beds: 6789, kills: 9876,
+        [roster.get(userId) || 'milo']: true
+      };
       const msg = await sweatMessage(sample, theme, { footer: [`${cards.THEMES[theme].label} theme`, 'Preview'] }, 'readonly');
       return { ...msg, content };
     }, true);
