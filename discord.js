@@ -197,24 +197,31 @@ module.exports = function setupDiscord({
   // --- Skins ---
   // Full-body renders from Visage (the website uses it too), kept for an
   // hour so redraws don't fetch them again. A failed fetch draws a "?".
+  // Started as early as possible (alongside the database work) and shared,
+  // so a skin is only downloaded once however many cards ask for it.
   const skins = new Map(); // uuid -> { data, at }
-  async function skinFor(uuid) {
+  const skinsLoading = new Map(); // uuid -> promise
+  function skinFor(uuid) {
     const id = uuidForms(uuid)[0];
-    if (!id) return null;
+    if (!id) return Promise.resolve(null);
     const hit = skins.get(id);
-    if (hit && Date.now() - hit.at < 60 * 60 * 1000) return hit.data;
-    try {
-      const r = await axios.get(`https://visage.surgeplay.com/full/320/${id}`, {
-        responseType: 'arraybuffer', timeout: 5000, headers: { 'User-Agent': 'SweatLog/1.0' }
-      });
+    if (hit && Date.now() - hit.at < 60 * 60 * 1000) return Promise.resolve(hit.data);
+    if (skinsLoading.has(id)) return skinsLoading.get(id);
+    const t0 = Date.now();
+    const loading = axios.get(`https://visage.surgeplay.com/full/320/${id}`, {
+      responseType: 'arraybuffer', timeout: 5000, headers: { 'User-Agent': 'SweatLog/1.0' }
+    }).then(r => {
       const data = `data:image/png;base64,${Buffer.from(r.data).toString('base64')}`;
       if (skins.size > 300) skins.delete(skins.keys().next().value);
       skins.set(id, { data, at: Date.now() });
+      console.log(`Skin fetched ${id} in ${Date.now() - t0} ms`);
       return data;
-    } catch (err) {
+    }).catch(err => {
       console.warn('Skin fetch failed', id, describeAxiosError(err));
       return null;
-    }
+    }).finally(() => skinsLoading.delete(id));
+    skinsLoading.set(id, loading);
+    return loading;
   }
 
   // --- Sending cards ---
@@ -234,8 +241,23 @@ module.exports = function setupDiscord({
     body.append('payload_json', JSON.stringify(payload));
     return body;
   }
+  // One log line per card sent, so Render's logs show where the time goes:
+  // "Discord card sweat/neon: skin 0 ms, drawn 840 ms, upload 310 ms, 1.4 s in all".
+  function logCard(msg, uploadMs, startedAt) {
+    if (!msg || !msg.png) return;
+    const t = msg.timing || {};
+    const draw = t.cached ? 'from cache' : `drawn ${t.drawMs ?? '?'} ms`;
+    const total = startedAt ? `, ${((Date.now() - startedAt) / 1000).toFixed(1)} s in all` : '';
+    console.log(`Discord card ${msg.kind}/${msg.theme}: skin ${t.skinMs ?? 0} ms, ${draw}, upload ${uploadMs} ms${total}`);
+  }
+  async function send(method, url, msg, startedAt) {
+    const t0 = Date.now();
+    const r = await bot[method](url, form(msg));
+    logCard(msg, Date.now() - t0, startedAt);
+    return r;
+  }
   const original = interaction => `/webhooks/${APP_ID}/${interaction.token}/messages/@original`;
-  const editOriginal = (interaction, msg) => bot.patch(original(interaction), form(msg))
+  const editOriginal = (interaction, msg) => send('patch', original(interaction), msg, interaction._receivedAt)
     .catch(err => console.error('Discord reply failed', describeAxiosError(err)));
   const followUp = (interaction, content) => bot.post(`/webhooks/${APP_ID}/${interaction.token}`, { content, flags: EPHEMERAL, allowed_mentions: { parse: [] } })
     .catch(err => console.error('Discord reply failed', describeAxiosError(err)));
@@ -262,16 +284,20 @@ module.exports = function setupDiscord({
   async function sweatMessage(sweat, themeId, header = {}, mode = 'normal', nav = null) {
     const notes = sweat.notes || [];
     const last = notes[notes.length - 1];
+    const timing = {};
+    const t0 = Date.now();
+    const skin = await skinFor(sweat.uuid);
+    timing.skinMs = Date.now() - t0;
     const png = await cards.render(cards.sweatCard(sweat, themeId, {
-      skin: await skinFor(sweat.uuid),
+      skin,
       footer: header.footer,
       line: header.line,
       note: last && last.text ? { text: last.text, by: ROSTER_LABELS[last.author] || last.author, count: notes.length } : null,
       removedBy: mode === 'removed' ? (ROSTER_LABELS[sweat.deletedBy] || sweat.deletedBy || 'someone') : null
-    }));
+    }), timing);
     const components = mode === 'readonly' ? [] : controls(sweat, mode);
     if (nav && nav.total > 1 && mode !== 'removed') components.push(navRow(nav));
-    return { png, kind: 'sweat', theme: themeId, components, content: header.caption || '' };
+    return { png, kind: 'sweat', theme: themeId, components, content: header.caption || '', timing };
   }
 
   function controls(sweat, mode) {
@@ -395,6 +421,8 @@ module.exports = function setupDiscord({
     if (!enabled || !sweat) return;
     const theme = DEFAULT_THEME;
     const post = { channelId: CHANNEL_ID, theme, caption: postCaption(sweat, who) };
+    const startedAt = Date.now();
+    skinFor(sweat.uuid); // fetched while the count runs
     // Footer number = how many sweats are on the list now, this one included.
     Sweat.countDocuments(LIVE)
       .then(n => `Sweat #${num(n)} · ${addedOn(sweat)}`)
@@ -402,7 +430,7 @@ module.exports = function setupDiscord({
       .then(async right => {
         post.footer = [`Logged by ${ROSTER_LABELS[who] || who || 'someone'}`, right];
         const msg = await sweatMessage(sweat, theme, post);
-        const r = await bot.post(`/channels/${CHANNEL_ID}/messages`, form(msg));
+        const r = await send('post', `/channels/${CHANNEL_ID}/messages`, msg, startedAt);
         return rememberPost(sweat._id, { ...post, messageId: r.data.id });
       })
       .catch(err => console.error('Discord post failed', describeAxiosError(err)));
@@ -427,7 +455,7 @@ module.exports = function setupDiscord({
       const msg = await sweatMessage(sweat, DEFAULT_THEME, {
         ...post, caption: removed ? removedCaption(sweat, post.caption) : post.caption
       }, removed ? 'removed' : 'normal');
-      await bot.patch(`/channels/${post.channelId}/messages/${post.messageId}`, form(msg));
+      await send('patch', `/channels/${post.channelId}/messages/${post.messageId}`, msg);
     } catch (err) {
       // Someone deleted the message in Discord: stop trying to edit it.
       if (err.response && err.response.status === 404) rememberPost(sweat._id, null);
@@ -494,6 +522,17 @@ module.exports = function setupDiscord({
     options: [{ type: 3, name: 'theme', description: 'Leave empty to see yours', required: false,
       choices: cards.THEME_IDS.map(id => ({ name: cards.THEMES[id].label, value: id })) }]
   }];
+  // The first card after a start is slower (fonts and the drawing library
+  // load), so one throwaway card per theme is drawn at start instead.
+  if (enabled) {
+    setTimeout(async () => {
+      const t0 = Date.now();
+      for (const theme of cards.THEME_IDS) {
+        await cards.render(cards.sweatCard({ username: 'Warmup', star: 100, fkdr: 1, wlr: 1 }, theme, { footer: ['', ''] })).catch(() => {});
+      }
+      console.log(`Discord cards ready (warm-up took ${Date.now() - t0} ms)`);
+    }, 3000);
+  }
   if (enabled) {
     bot.put(`/applications/${APP_ID}/commands`, COMMANDS)
       .then(() => console.log('Discord commands registered'))
@@ -542,7 +581,7 @@ module.exports = function setupDiscord({
         const now = player.name || name;
         if (now.toLowerCase() !== sweat.username.toLowerCase()) line = `Now known as ${now}`;
       }
-      const nav = await entriesOf(sweat);
+      const [nav] = await Promise.all([entriesOf(sweat), skinFor(sweat.uuid)]);
       return sweatMessage(sweat, theme, lookupHeader(sweat, { line }), 'normal', nav);
     });
   }
@@ -591,6 +630,7 @@ module.exports = function setupDiscord({
         const notFound = err.status === 404 || (err.response && [204, 404].includes(err.response.status));
         return notFound ? `Couldn't find a player called **${name}**.` : `Couldn't reach the stats service right now, so **${name}** wasn't added. Try again in a minute.`;
       }
+      skinFor(player.uuid); // fetched while the list is checked
       const earlier = await Sweat.find({ ...LIVE, uuid: { $in: uuidForms(player.uuid) } }, { createdAt: 1, addedBy: 1 }).lean();
       const recent = dupWindow(earlier);
       if (recent) {
@@ -615,14 +655,18 @@ module.exports = function setupDiscord({
     const notes = [];
     if (p.player.cheaterTagged) notes.push('Urchin tags them as a cheater, so Cheating is ticked.');
     if (p.earlier) notes.push(`Already on the list ${p.earlier === 1 ? 'once' : `${p.earlier} times`} - this adds another entry.`);
+    const timing = {};
+    const t0 = Date.now();
+    const skin = await skinFor(p.player.uuid);
+    timing.skinMs = Date.now() - t0;
     const png = await cards.render(cards.sweatCard(sweat, p.theme, {
-      skin: await skinFor(p.player.uuid),
+      skin,
       preview: true,
       footer: ['Preview · not saved yet', 'Sweat Log'],
       note: p.noteText ? { text: p.noteText, by: ROSTER_LABELS[p.who], count: 1 } : null
-    }));
+    }), timing);
     return {
-      png, kind: 'add', theme: p.theme,
+      png, kind: 'add', theme: p.theme, timing,
       content: ['Check it, pick who beat them, then add it.', ...notes.map(n => `-# ${n}`)].join('\n'),
       components: [
         { type: ROW, components: [rosterSelect(`add:beaten:${key}`, f => p.beaten.has(f), 'Who beat them?')] },
@@ -724,11 +768,12 @@ module.exports = function setupDiscord({
     const lines = [`${plural(all.length, 'sweat')} beaten · #${place} on the leaderboard`];
     if (filters.length) lines.push(`Only ${filters.join(', ')}: ${num(list.length)} match`);
     lines.push(`Sorted by ${sort.label}`);
+    const timing = {};
     const png = await cards.render(cards.listCard(theme, {
       title: 'Beaten by', who: state.person, lines, rows,
       empty: filters.length ? 'Nobody matches those filters.' : 'Nobody yet.',
       footer: [`Page ${page + 1} of ${pages}`, 'Sweat Log']
-    }));
+    }), timing);
 
     const id = (k, p) => `bt:${k}:${p}:${state.person}:${sort.id}:${state.flag}:${state.minStar}:${state.minFkdr}:${state.name}`;
     const components = pages > 1 ? [{ type: ROW, components: [
@@ -737,7 +782,7 @@ module.exports = function setupDiscord({
       { type: BUTTON, style: STYLE.blurple, label: 'Next ▶', custom_id: id('n', page + 1), disabled: page >= pages - 1 },
       { type: BUTTON, style: STYLE.grey, label: '⏭', custom_id: id('l', pages - 1), disabled: page >= pages - 1 }
     ] }] : [];
-    return { png, kind: 'beaten', theme, components };
+    return { png, kind: 'beaten', theme, components, timing };
   }
 
   // --- /stats ---
@@ -779,6 +824,7 @@ module.exports = function setupDiscord({
         third = { title: 'Flags', rows: [['Cheating', `${num(cheating)} · ${pct(cheating, n)}`], ['Boosting', `${num(boosting)} · ${pct(boosting, n)}`], ['Notes', num(notes)]] };
       }
       const topStar = top('star'), topFkdr = top('fkdr'), topWlr = top('wlr');
+      const timing = {};
       const png = await cards.render(cards.statsCard(theme, {
         title: person ? 'Sweats beaten by' : 'Sweat stats', who: person || null, right: person ? null : 'Whole list',
         summary: [[num(n), 'Sweats'], [num(players), 'Players'], [(n / weeks).toFixed(1), 'A week'], [`+${num(since(30))}`, '30 days']],
@@ -794,8 +840,8 @@ module.exports = function setupDiscord({
           topWlr && { star: topWlr.star, username: topWlr.username, value: `${topWlr.wlr.toFixed(2)} WLR`, color: wl(topWlr.wlr) }
         ].filter(Boolean),
         footer: [dates.length ? `First sweat ${day(new Date(dates[0]))} · latest ${ago(dates[dates.length - 1])}` : 'No sweats yet', 'Sweat Log']
-      }));
-      return { png, kind: 'stats', theme };
+      }), timing);
+      return { png, kind: 'stats', theme, timing };
     });
   }
 
@@ -836,7 +882,8 @@ module.exports = function setupDiscord({
             color: k === 'star' ? null : cards.ratioColor(theme, sw[k], k)
           }));
       }
-      return { png: await cards.render(cards.leaderboardCard(theme, data)), kind: 'leaderboard', theme };
+      const timing = {};
+      return { png: await cards.render(cards.leaderboardCard(theme, data), timing), kind: 'leaderboard', theme, timing };
     });
   }
 
@@ -909,11 +956,13 @@ module.exports = function setupDiscord({
       const target = await Sweat.findOne({ _id: id, ...LIVE }).lean();
       if (!target) return reply(res, GONE);
       res.json({ type: DEFER_UPDATE });
-      return editOriginal(interaction, await sweatMessage(target, theme, lookupHeader(target), 'normal', await entriesOf(target)));
+      const [nav] = await Promise.all([entriesOf(target), skinFor(target.uuid)]);
+      return editOriginal(interaction, await sweatMessage(target, theme, lookupHeader(target), 'normal', nav));
     }
 
     const sweat = await Sweat.findOne({ _id: id, ...LIVE }).lean();
     if (!sweat) return reply(res, GONE);
+    skinFor(sweat.uuid); // fetched while the change is saved
     // Cards posted before the bot remembered its messages get recorded on
     // their first click.
     if (isPost && !sweat.discordPost) {
@@ -1080,6 +1129,7 @@ module.exports = function setupDiscord({
     if (!valid) return res.status(401).send('Bad signature');
 
     const interaction = req.body || {};
+    interaction._receivedAt = Date.now();
     try {
       if (interaction.type === PING) return res.json({ type: PONG });
       const handler = interaction.type === COMMAND && interaction.data && COMMAND_HANDLERS[interaction.data.name];
