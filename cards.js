@@ -396,28 +396,34 @@ function leaderboardCard(themeId, data) {
     label(t, data.right || '', { color: t.barDim || t.dim }));
   const MEDAL = ['#f5c542', '#c9d1d9', '#d4884a'];
   const place = (i) => h('div', {
-    width: 54, height: 54, alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+    width: 50, height: 50, alignItems: 'center', justifyContent: 'center', flexShrink: 0,
     background: MEDAL[i] || t.track, borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none'
   }, text(String(i + 1), { fontFamily: t.font, fontSize: size(t, 28), fontWeight: 800, color: i < 3 ? '#1e1e1e' : (t.slotText || t.text) }));
 
+  // Two columns of five (1-5 left, 6-10 right), like /beaten: a short,
+  // wide card shows bigger in Discord.
+  const shadow = c => (t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : t.glow(c));
   let rows;
   if (data.people) {
     const most = Math.max(1, ...data.people.map(r => r[1]));
-    rows = data.people.map(([who, n], i) => h('div', { alignItems: 'center', gap: 16, padding: '10px 16px', marginTop: 10, ...t.slot },
+    rows = data.people.map(([who, n], i) => h('div', { alignItems: 'center', gap: 14, padding: '12px 16px', marginTop: 10, ...t.slot },
       place(i),
-      h('div', { width: 130 }, chip(t, who, 24)),
-      bar(t, n, most, t.roster[who] || t.accent, 22),
-      text(n.toLocaleString('en-US'), { fontFamily: t.font, fontSize: size(t, 34), fontWeight: 800, color: t.slotText || t.text, width: 80, justifyContent: 'flex-end', textShadow: t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : 'none' })));
+      h('div', { width: 124 }, chip(t, who, 24)),
+      bar(t, n, most, t.roster[who] || t.accent, 20),
+      text(n.toLocaleString('en-US'), { fontFamily: t.font, fontSize: size(t, 34), fontWeight: 800, color: t.slotText || t.text, minWidth: 64, justifyContent: 'flex-end', textShadow: shadow(t.accent) })));
   } else {
-    rows = data.sweats.map((s, i) => h('div', { alignItems: 'center', gap: 16, padding: '10px 16px', marginTop: 10, ...t.slot },
+    rows = data.sweats.map((s, i) => h('div', { alignItems: 'center', gap: 14, padding: '10px 16px', marginTop: 10, ...t.slot, overflow: 'hidden' },
       place(i),
-      h('div', { alignItems: 'center', gap: 12, flexGrow: 1 },
-        s.star > 0 ? starTag(t, s.star, size(t, 28)) : null,
-        text(s.username, { fontFamily: t.font, fontSize: size(t, 30), fontWeight: 800, color: t.slotText || t.text })),
-      text(s.value, { fontFamily: t.font, fontSize: size(t, 34), fontWeight: 800, color: s.color || t.slotText || t.text, textShadow: t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : t.glow(s.color || t.accent) })));
+      h('div', { flexDirection: 'column', flexGrow: 1, flexShrink: 1, minWidth: 0, gap: 4 },
+        h('div', { alignItems: 'center', gap: 10 },
+          s.star > 0 ? starTag(t, s.star, size(t, 24)) : null,
+          text(s.username, { fontFamily: t.font, fontSize: size(t, 28), fontWeight: 800, color: t.slotText || t.text, lineHeight: 1.25, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1 })),
+        text(s.value, { fontFamily: t.font, fontSize: size(t, 30), fontWeight: 800, color: s.color || t.slotText || t.text, lineHeight: 1.1, textShadow: shadow(s.color || t.accent) }))));
   }
-  if (!rows.length) rows = [h('div', { justifyContent: 'center', padding: 30, marginTop: 10, ...t.slot }, text('Nothing here yet.', { fontFamily: t.body, fontSize: size(t, 26), color: t.slotLabel || t.dim }))];
-  return frame(t, data.footer, head, rows);
+  if (!rows.length) return frame(t, data.footer, head, h('div', { justifyContent: 'center', padding: 30, marginTop: 10, ...t.slot }, text('Nothing here yet.', { fontFamily: t.body, fontSize: size(t, 26), color: t.slotLabel || t.dim })));
+  const column = list => h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0 }, list);
+  return frame(t, data.footer, head,
+    h('div', { gap: 16, marginTop: 6 }, column(rows.slice(0, 5)), rows.length > 5 ? column(rows.slice(5)) : null));
 }
 
 // Finished cards are kept for a while: the same card asked for again (a
