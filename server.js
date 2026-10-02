@@ -672,7 +672,7 @@ async function lookupPlayerStats(name) {
 const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer
 });
 
 // --- Sweats API: shared DB ---
