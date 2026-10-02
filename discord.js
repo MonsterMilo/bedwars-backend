@@ -257,7 +257,7 @@ module.exports = function setupDiscord({
   //   remove    "Yes, remove" / "Cancel"
   //   removed   no controls; the card is stamped REMOVED
   //   readonly  no controls (/random, /theme)
-  // nav: { index, total, prevId, nextId } adds arrows between a player's
+  // nav: { index, total, newerId, olderId } adds arrows between a player's
   // entries when they're on the list more than once.
   async function sweatMessage(sweat, themeId, header = {}, mode = 'normal', nav = null) {
     const notes = sweat.notes || [];
@@ -321,7 +321,8 @@ module.exports = function setupDiscord({
     ]
   });
 
-  // [◀ Older] [Entry 2 of 3] [Newer ▶] - entries counted oldest first.
+  // [◀ Newer] [Entry 1 of 3] [Older ▶] - entries counted newest first, so
+  // the card /sweat opens on (the newest) is entry 1.
   function navRow(nav) {
     const arrow = (label, targetId, side) => ({
       type: BUTTON, style: STYLE.blurple, label,
@@ -329,13 +330,13 @@ module.exports = function setupDiscord({
       disabled: !targetId
     });
     return { type: ROW, components: [
-      arrow('◀ Older', nav.prevId, 'p'),
-      { type: BUTTON, style: STYLE.grey, label: `Entry ${nav.index + 1} of ${nav.total}`, custom_id: `sweat:entrypos:${nav.prevId || nav.nextId}`, disabled: true },
-      arrow('Newer ▶', nav.nextId, 'n')
+      arrow('◀ Newer', nav.newerId, 'p'),
+      { type: BUTTON, style: STYLE.grey, label: `Entry ${nav.index + 1} of ${nav.total}`, custom_id: `sweat:entrypos:${nav.newerId || nav.olderId}`, disabled: true },
+      arrow('Older ▶', nav.olderId, 'n')
     ] };
   }
 
-  // Every live entry for the same player (by uuid, else by name), oldest
+  // Every live entry for the same player (by uuid, else by name), newest
   // first, and where `sweat` sits among them.
   async function entriesOf(sweat) {
     const forms = uuidForms(sweat.uuid);
@@ -343,13 +344,13 @@ module.exports = function setupDiscord({
       ? { ...LIVE, uuid: { $in: forms } }
       : { ...LIVE, username: new RegExp(`^${sweat.username}$`, 'i') };
     const all = (await Sweat.find(filter, { _id: 1, createdAt: 1 }).lean())
-      .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
     const index = Math.max(0, all.findIndex(d => String(d._id) === String(sweat._id)));
     return {
       index,
       total: all.length,
-      prevId: index > 0 ? String(all[index - 1]._id) : null,
-      nextId: index < all.length - 1 ? String(all[index + 1]._id) : null
+      newerId: index > 0 ? String(all[index - 1]._id) : null,
+      olderId: index < all.length - 1 ? String(all[index + 1]._id) : null
     };
   }
 
