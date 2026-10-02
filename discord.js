@@ -103,6 +103,12 @@ function ago(date) {
   const n = Math.floor(s / unit[0]);
   return `${n} ${unit[1]}${n === 1 ? '' : 's'} ago`;
 }
+// The short form for tight spaces: "3d", "2w", "5mo", "1y".
+function agoShort(date) {
+  const s = Math.max(0, (Date.now() - new Date(date).getTime()) / 1000);
+  const unit = [[31536000, 'y'], [2592000, 'mo'], [604800, 'w'], [86400, 'd'], [3600, 'h'], [60, 'm']].find(([u]) => s >= u);
+  return unit ? `${Math.floor(s / unit[0])}${unit[1]}` : 'now';
+}
 
 // Old embed cards used this invisible 1000x1 image to stay full width.
 // Cards are images now, but messages posted before still point at it.
@@ -761,13 +767,10 @@ module.exports = function setupDiscord({
     const page = Math.min(Math.max(0, state.page), pages - 1);
     const rows = list.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((s, i) => ({
       n: page * PAGE_SIZE + i + 1, star: s.star, username: s.username, fkdr: s.fkdr, wlr: s.wlr,
-      cheating: s.cheating, boosting: s.boosting, ago: s.createdAt ? ago(s.createdAt) : ''
+      cheating: s.cheating, boosting: s.boosting, ago: s.createdAt ? agoShort(s.createdAt) : ''
     }));
-    const counts = await Promise.all(ROSTER_FIELDS.map(f => Sweat.countDocuments({ ...LIVE, [f]: true })));
-    const place = 1 + counts.filter(c => c > all.length).length;
-    const lines = [`${plural(all.length, 'sweat')} beaten · #${place} on the leaderboard`];
-    if (filters.length) lines.push(`Only ${filters.join(', ')}: ${num(list.length)} match`);
-    lines.push(`Sorted by ${sort.label}`);
+    // One short line: the filters, how many match, and the order.
+    const lines = [[filters.length ? `${filters.join(', ')}: ${plural(list.length, 'sweat')}` : plural(list.length, 'sweat'), sort.label].join(' · ')];
     const timing = {};
     const png = await cards.render(cards.listCard(theme, {
       title: 'Beaten by', who: state.person, lines, rows,
