@@ -34,10 +34,23 @@ const ROSTER_LABELS = {
 // website's cyan accent.
 const COLORS = { cheating: 0xed4245, boosting: 0xf0b232, normal: 0x00d9ff, removed: 0x4e5058 };
 // Discord's numbers for the bits of the interactions API used here.
-const PING = 1, COMMAND = 2, COMPONENT = 3, MODAL_SUBMIT = 5;
-const REPLY = 4, UPDATE = 7, MODAL = 9, PONG = 1, EPHEMERAL = 64;
+const PING = 1, COMMAND = 2, COMPONENT = 3, AUTOCOMPLETE = 4, MODAL_SUBMIT = 5;
+const REPLY = 4, UPDATE = 7, CHOICES = 8, MODAL = 9, PONG = 1, EPHEMERAL = 64;
 const ROW = 1, BUTTON = 2, SELECT = 3, TEXT = 4;
 const STYLE = { blurple: 1, grey: 2, red: 4 };
+// /leaderboard: what it can rank, and over which sweats.
+const LEADERBOARDS = [
+  { id: 'beaten', name: 'Most sweats beaten', title: 'Most sweats beaten', kind: 'people' },
+  { id: 'logged', name: 'Most sweats logged', title: 'Most sweats logged', kind: 'people' },
+  { id: 'fkdr', name: 'Highest FKDR sweats', title: 'Highest FKDR', kind: 'sweats', stat: 'fkdr', format: s => `**${s.fkdr.toFixed(2)}** FKDR` },
+  { id: 'star', name: 'Highest star sweats', title: 'Highest star', kind: 'sweats', stat: 'star', format: s => `**${Math.floor(s.star).toLocaleString('en-US')}✫**` },
+  { id: 'wlr', name: 'Highest WLR sweats', title: 'Highest WLR', kind: 'sweats', stat: 'wlr', format: s => `**${s.wlr.toFixed(2)}** WLR` }
+];
+const PERIODS = [
+  { id: 'all', name: 'All time', days: 0 },
+  { id: 'month', name: 'Last 30 days', days: 30 },
+  { id: 'week', name: 'Last 7 days', days: 7 }
+];
 // The stats the website's edit form changes - five, which is also the most
 // boxes a Discord pop-up can hold.
 const STAT_INPUTS = [
@@ -305,7 +318,18 @@ module.exports = function setupDiscord({
     name: 'sweat',
     description: 'Look a player up on the sweat list',
     type: 1,
-    options: [{ type: 3, name: 'name', description: 'Minecraft username', required: true, min_length: 1, max_length: 16 }]
+    options: [{ type: 3, name: 'name', description: 'Minecraft username', required: true, min_length: 1, max_length: 16, autocomplete: true }]
+  }, {
+    name: 'leaderboard',
+    description: 'Who has beaten the most sweats, and more',
+    type: 1,
+    options: [{
+      type: 3, name: 'type', description: 'What to rank (default: most sweats beaten)', required: false,
+      choices: LEADERBOARDS.map(b => ({ name: b.name, value: b.id }))
+    }, {
+      type: 3, name: 'period', description: 'Which sweats count (default: all time)', required: false,
+      choices: PERIODS.map(p => ({ name: p.name, value: p.id }))
+    }]
   }];
   if (enabled) {
     bot.put(`/applications/${APP_ID}/commands`, COMMANDS)
@@ -324,6 +348,70 @@ module.exports = function setupDiscord({
       .sort({ createdAt: -1 }).lean();
     if (!sweat) return reply(res, `**${name}** isn't on the sweat list.`);
     return res.json({ type: REPLY, data: sweatCard(sweat, { author: `Added ${sweat.dateAdded || 'a while ago'}` }) });
+  }
+
+  // --- /sweat autocomplete ---
+  // Names on the list starting with what's typed so far, newest first.
+  async function onAutocomplete(interaction, res) {
+    const focused = (interaction.data.options || []).find(o => o.focused);
+    const typed = String((focused && focused.value) || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16);
+    const filter = typed ? { ...LIVE, username: new RegExp(`^${typed}`, 'i') } : LIVE;
+    const docs = await Sweat.find(filter, { username: 1 }).sort({ createdAt: -1 }).limit(50).lean();
+    const seen = new Set();
+    const choices = [];
+    for (const d of docs) {
+      const key = d.username.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      choices.push({ name: d.username, value: d.username });
+      if (choices.length === 25) break; // Discord's limit
+    }
+    return res.json({ type: CHOICES, data: { choices } });
+  }
+
+  // --- /leaderboard ---
+  async function onLeaderboard(interaction, res) {
+    const opt = name => ((interaction.data.options || []).find(o => o.name === name) || {}).value;
+    const board = LEADERBOARDS.find(b => b.id === opt('type')) || LEADERBOARDS[0];
+    const period = PERIODS.find(p => p.id === opt('period')) || PERIODS[0];
+    const filter = period.days ? { ...LIVE, createdAt: { $gte: new Date(Date.now() - period.days * 24 * 3600 * 1000) } } : LIVE;
+    const fields = ['username', 'addedBy', 'createdAt', 'star', 'fkdr', 'wlr', ...ROSTER_FIELDS]
+      .reduce((o, f) => { o[f] = 1; return o; }, {});
+    const sweats = await Sweat.find(filter, fields).lean();
+
+    const medal = i => ['🥇', '🥈', '🥉'][i] || `\`#${i + 1}\``;
+    let lines;
+    if (board.kind === 'people') {
+      // Sweats added with the admin key count as "Admin" for who logged most.
+      const people = board.id === 'logged' ? [...ROSTER_FIELDS, 'admin'] : ROSTER_FIELDS;
+      const counts = {};
+      people.forEach(f => { counts[f] = 0; });
+      sweats.forEach(sw => {
+        if (board.id === 'logged') { if (counts[sw.addedBy] !== undefined) counts[sw.addedBy]++; }
+        else ROSTER_FIELDS.forEach(f => { if (sw[f]) counts[f]++; });
+      });
+      const ranked = people.filter(f => counts[f] > 0).sort((a, b) => counts[b] - counts[a]);
+      const top = Math.max(1, ...ranked.map(f => counts[f]));
+      // A ten-block bar scaled to the leader, so the gaps read at a glance.
+      const bar = n => '▰'.repeat(Math.max(1, Math.round(n / top * 10))) + '▱'.repeat(10 - Math.max(1, Math.round(n / top * 10)));
+      lines = ranked.map((f, i) => `${medal(i)} **${ROSTER_LABELS[f]}** ${bar(counts[f])} ${counts[f]}`);
+    } else {
+      const key = board.stat;
+      lines = sweats.filter(sw => Number.isFinite(sw[key]) && sw[key] > 0)
+        .sort((a, b) => b[key] - a[key]).slice(0, 10)
+        .map((sw, i) => `${medal(i)} [**${sw.username}**](${SITE_URL}?player=${encodeURIComponent(sw.username)}) · ${board.format(sw)}`);
+    }
+
+    const embed = {
+      author: { name: '🏆 Leaderboard' },
+      title: `${board.title} · ${period.name.toLowerCase()}`,
+      url: `${SITE_URL}?view=leaderboard`,
+      color: 0xf1c40f,
+      description: lines.length ? lines.join('\n') : '*Nothing here yet.*',
+      footer: { text: `${sweats.length.toLocaleString('en-US')} sweat${sweats.length === 1 ? '' : 's'} counted · Sweat Log` },
+      image: { url: `${BACKEND_URL}/discord/spacer.png` }
+    };
+    return res.json({ type: REPLY, data: { embeds: [embed], allowed_mentions: { parse: [] } } });
   }
 
   // --- Clicks, picks and form submits ---
@@ -497,6 +585,8 @@ module.exports = function setupDiscord({
     try {
       if (interaction.type === PING) return res.json({ type: PONG });
       if (interaction.type === COMMAND && interaction.data && interaction.data.name === 'sweat') return await onSweatCommand(interaction, res);
+      if (interaction.type === COMMAND && interaction.data && interaction.data.name === 'leaderboard') return await onLeaderboard(interaction, res);
+      if (interaction.type === AUTOCOMPLETE) return await onAutocomplete(interaction, res);
       if (interaction.type === COMPONENT || interaction.type === MODAL_SUBMIT) return await onInteraction(interaction, res);
       return reply(res, 'Unknown command.');
     } catch (err) {
