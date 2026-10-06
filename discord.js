@@ -12,7 +12,7 @@
 //   /stats [person]      numbers on the list, or on one person's beats
 //   /leaderboard         who has beaten / logged the most, or the top sweats
 //   /random [person]     a random sweat (read-only)
-//   /theme [theme]       pick your card theme (the website's five); the
+//   /theme [theme]       pick your card theme (the website's six); the
 //                        Sweat Log channel always uses the default (Neon)
 //
 // No always-on gateway connection: Discord sends button clicks and slash

@@ -1,5 +1,5 @@
 // --- Sweat Log image cards ---
-// Every bot reply is drawn as a PNG in one of the website's five themes.
+// Every bot reply is drawn as a PNG in one of the website's six themes.
 // satori lays a card out from a tree of divs with CSS-like styles (see h()
 // below) and gives an SVG; resvg turns that into a PNG. The layouts are
 // shared; each theme only supplies colours, fonts and a few details, the
@@ -33,6 +33,9 @@ const FONTS = [
   font('Garamond', 'EBGaramond-500.ttf', 500), font('Garamond', 'EBGaramond-700.ttf', 700),
   font('Chakra', 'ChakraPetch-600.ttf', 600), font('Chakra', 'ChakraPetch-700.ttf', 700),
   font('Sora', 'Sora-500.ttf', 500), font('Sora', 'Sora-700.ttf', 700),
+  font('Grenze Gotisch', 'GrenzeGotisch-700.ttf', 700),
+  font('Grenze', 'Grenze-600.ttf', 600), font('Grenze', 'Grenze-700.ttf', 700),
+  font('Crimson Pro', 'CrimsonPro-600.ttf', 600),
   // ✫ ✪ ⚑ ⚠ and other symbols the theme fonts don't have.
   font('Symbols', 'DejaVuSans-Bold.ttf', 700)
 ];
@@ -73,7 +76,7 @@ const ROSTER = ['milo', 'potat', 'aballs', 'zoiv', 'max', 'sqoz', 'kermit', 'sse
 
 // --- Themes ---
 // font: names and big numbers · label: small headings · body: plain text ·
-// note: quoted notes. mc: chat colours (star tags, ratio colours) inked for
+// note: quoted notes · title: card headings (defaults to font). mc: chat colours (star tags, ratio colours) inked for
 // the theme's background, the same as the website's star tags.
 const THEMES = {
   neon: {
@@ -158,6 +161,23 @@ const THEMES = {
     mc: { 0: '#4d6d78', 1: '#4a6cf0', 2: '#1fbf8f', 3: '#1aa3a3', 4: '#e0566b', 5: '#9b6bff', 6: '#f2b35a', 7: '#9fb8c0', 8: '#6f8c96', 9: '#5b8cff', a: '#5ef2b5', b: '#5ff0f0', c: '#ff7a8a', d: '#e28bff', e: '#f7e27a', f: '#e8fbff' },
     roster: { milo: '#35e6c4', potat: '#9b6bff', aballs: '#ffb454', zoiv: '#ff6bb8', max: '#4ade9f', sqoz: '#4fc3f7', kermit: '#9fe64f', ssent: '#ff8f5c', key: '#ffe066' },
     cheating: '#ff5a5a', boosting: '#f2b35a', removed: '#4d6d78'
+  },
+  hollowgrave: {
+    label: 'Hollow Grave', font: 'Grenze', label_: 'Grenze', body: 'Crimson Pro', note: 'Crimson Pro', title: 'Grenze Gotisch',
+    labelCase: 'uppercase', labelSpacing: 2, chipRadius: 6,
+    // A moonlit graveyard: night sky, carved stone panels, a headstone
+    // behind the skin, candle-orange glow on names.
+    page: { background: 'radial-gradient(circle at 82% 0%, #3b2f4f 0%, #120d1c 38%, #07060a 100%)' },
+    panel: { background: '#18141f', border: '2px solid #3a3544', borderRadius: 14 },
+    bar: { background: 'linear-gradient(180deg, #3a3544 0%, #2a2632 100%)', borderTop: '2px solid #575066', borderBottom: '2px solid #1c1924', borderLeft: '2px solid #2a2632', borderRight: '2px solid #2a2632', borderRadius: 10 },
+    slot: { background: '#1f1a28', border: '1px solid rgba(232,224,240,0.09)', borderTop: '3px solid #3a3544', borderRadius: 8 },
+    skinBg: { background: 'radial-gradient(circle at 50% 24%, rgba(241,216,138,0.2) 0%, #2a2632 58%)', border: '2px solid #4a4456', borderTopLeftRadius: 115, borderTopRightRadius: 115, borderBottomLeftRadius: 8, borderBottomRightRadius: 8 },
+    text: '#ece4f2', dim: '#aa9fb9', name: '#ece4f2', nameShadow: '0 0 12px rgba(242,140,40,0.8)',
+    glow: () => '0 2px 0 rgba(0,0,0,0.6)', chipText: '#07060a',
+    accent: '#f28c28', track: 'rgba(232,224,240,0.06)',
+    mc: { 0: '#716780', 1: '#7a7cff', 2: '#5ccf6a', 3: '#3fc8c8', 4: '#ff5468', 5: '#b47cff', 6: '#f28c28', 7: '#c9c0d8', 8: '#8a8098', 9: '#7fa0ff', a: '#b8ff5c', b: '#7fe8ff', c: '#ff6f6f', d: '#ff7fd8', e: '#ffe066', f: '#f6f0fb' },
+    roster: { milo: '#f28c28', potat: '#b47cff', aballs: '#ffcf5a', zoiv: '#ff6f9e', max: '#b8ff5c', sqoz: '#7fb4ff', kermit: '#5ee0a8', ssent: '#e2533a', key: '#f1d88a' },
+    cheating: '#ff5468', boosting: '#f28c28', removed: '#716780'
   }
 };
 const THEME_IDS = Object.keys(THEMES);
@@ -199,7 +219,7 @@ function chip(t, who, px = 22) {
   const c = t.roster[who] || t.dim;
   return h('div', {
     alignItems: 'center', padding: `${Math.round(px * 0.22)}px ${Math.round(px * 0.6)}px`, background: c,
-    borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none',
+    borderRadius: t.chipRound ? 999 : (t.chipRadius || 0), border: t.chipBorder || 'none',
   }, text(LABELS[who] || who, { fontFamily: t.font, fontSize: size(t, px), fontWeight: 800, color: t.chipText, lineHeight: 1, textShadow: t.chipShadow || 'none' }));
 }
 
@@ -209,7 +229,7 @@ function rosterIcons(t, people, px = 30, max = 5, gap = 4) {
   const more = people.length - shown.length;
   const dot = (bg, label, color) => h('div', {
     width: px, height: px, alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-    background: bg, borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none'
+    background: bg, borderRadius: t.chipRound ? 999 : (t.chipRadius || 0), border: t.chipBorder || 'none'
   }, text(label, { fontFamily: t.font, fontSize: size(t, Math.round(px * (label.length > 1 ? 0.46 : 0.55))), fontWeight: 800, color, lineHeight: 1 }));
   return h('div', { alignItems: 'center', gap, flexShrink: 0 },
     shown.map(who => dot(t.roster[who] || t.dim, INITIALS[who] || who[0].toUpperCase(), t.chipText)),
@@ -226,7 +246,7 @@ function flagBadge(t, kind) {
       text(word.toUpperCase(), { fontFamily: 'Courier Prime', fontSize: 22, fontWeight: 700, color: c, letterSpacing: 3 }));
   }
   return h('div', {
-    alignItems: 'center', padding: '6px 14px', background: c, borderRadius: t.chipRound ? 999 : 0,
+    alignItems: 'center', padding: '6px 14px', background: c, borderRadius: t.chipRound ? 999 : (t.chipRadius || 0),
     border: t.chipBorder || 'none'
   },
     text(sym, { fontFamily: 'Symbols', fontSize: 18, color: '#fff', marginRight: 8 }),
@@ -364,7 +384,7 @@ function listCard(themeId, { title, who, lines, rows, footer, empty }) {
   const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
   const head = h('div', { alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar },
     h('div', { alignItems: 'center', gap: 16 },
-      text(title, { fontFamily: t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }),
+      text(title, { fontFamily: t.title || t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }),
       who ? chip(t, who, 26) : null),
     lines && lines[0] ? text(lines[0], { fontFamily: t.body, fontSize: size(t, 21), fontWeight: 700, color: t.barDim || t.dim }) : null);
   const ratio = (v, steps, name) => h('div', { alignItems: 'baseline', gap: 6 },
@@ -396,7 +416,7 @@ function statsCard(themeId, data) {
   const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
   const head = h('div', { alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar },
     h('div', { alignItems: 'center', gap: 16 },
-      text(data.title, { fontFamily: t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }),
+      text(data.title, { fontFamily: t.title || t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }),
       data.who ? chip(t, data.who, 26) : null),
     data.right ? label(t, data.right, { color: t.barDim || t.dim }) : null);
   const summary = h('div', { gap: 14, marginTop: 16 },
@@ -430,13 +450,13 @@ function statsCard(themeId, data) {
 function leaderboardCard(themeId, data) {
   const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
   const head = h('div', { alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar },
-    text(data.title, { fontFamily: t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }),
+    text(data.title, { fontFamily: t.title || t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }),
     label(t, data.right || '', { color: t.barDim || t.dim }));
   const MEDAL = ['#f5c542', '#c9d1d9', '#d4884a'];
   const offset = data.offset || 0; // later pages carry on numbering from 11
   const place = (i) => h('div', {
     width: 50, height: 50, alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-    background: MEDAL[offset + i] || t.track, borderRadius: t.chipRound ? 999 : 0, border: t.chipBorder || 'none'
+    background: MEDAL[offset + i] || t.track, borderRadius: t.chipRound ? 999 : (t.chipRadius || 0), border: t.chipBorder || 'none'
   }, text(String(offset + i + 1), { fontFamily: t.font, fontSize: size(t, offset + i >= 99 ? 22 : 28), fontWeight: 800, color: offset + i < 3 ? '#1e1e1e' : (t.slotText || t.text) }));
 
   // Two columns of five (1-5 left, 6-10 right), like /beaten: a short,
