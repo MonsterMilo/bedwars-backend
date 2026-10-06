@@ -474,7 +474,7 @@ module.exports = function setupDiscord({
   // Each sweat remembers its Sweat Log message, so a change made on the
   // website (or from a /sweat lookup) redraws that message to match.
   function rememberPost(id, post) {
-    return Sweat.updateOne({ _id: id }, { $set: { discordPost: post } })
+    return Sweat.updateOne({ _id: id }, { $set: { discordPost: post } }, { timestamps: false })
       .catch(err => console.error('Discord: saving the message id failed', err.message));
   }
   const removedCaption = (s, caption) => `${caption || postCaption(s, s.addedBy)} · removed by ${ROSTER_LABELS[s.deletedBy] || s.deletedBy || 'someone'}`;

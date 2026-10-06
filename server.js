@@ -423,7 +423,11 @@ const sweatSchemaFields = {
 NUMERIC_FIELDS.forEach(f => { sweatSchemaFields[f] = Number; });
 BOOLEAN_FIELDS.forEach(f => { sweatSchemaFields[f] = { type: Boolean, default: false }; });
 
-const sweatSchema = new mongoose.Schema(sweatSchemaFields);
+// updatedAt is set by Mongoose on every save/update (edits, notes, flags,
+// delete, restore - from the site or the bot), so open pages can ask for just
+// what changed since their last check. createdAt stays our own field above.
+const sweatSchema = new mongoose.Schema(sweatSchemaFields, { timestamps: { createdAt: false, updatedAt: true } });
+sweatSchema.index({ updatedAt: 1 });
 
 const Sweat = mongoose.model('Sweat', sweatSchema);
 
@@ -465,7 +469,7 @@ mongoose.connection.once('open', async () => {
     ).lean();
     if (!adds.length) return;
     await Sweat.bulkWrite(adds.map(a => ({
-      updateOne: { filter: { _id: a.sweatId, addedBy: null }, update: { $set: { addedBy: a.who } } }
+      updateOne: { filter: { _id: a.sweatId, addedBy: null }, update: { $set: { addedBy: a.who } }, timestamps: false }
     })));
     console.log(`Filled in who added ${adds.length} older sweat(s) from the activity log`);
   } catch (err) {
@@ -707,7 +711,22 @@ const discord = require('./discord')({
 //   null on the last page. Keyset paging on (createdAt, _id) rather than
 //   skip, so a sweat added or deleted between page loads can't shift the
 //   pages and make an entry show up twice or go missing.
+//   Add `changedSince` (ms or ISO time) and the response also carries
+//   `changed` (live sweats updated since then), `removed` (ids deleted since
+//   then) and `changedAt` to pass as changedSince next time. If more than
+//   SWEATS_CHANGED_MAX changed, `changedTruncated` is true and the caller
+//   should reload the whole list instead.
 const SWEATS_PAGE_MAX = 1000;
+const SWEATS_CHANGED_MAX = 100;
+// changedAt is set this far back so a write that lands while the query runs
+// is picked up again next time instead of slipping between two checks.
+const CHANGED_OVERLAP_MS = 5000;
+
+function parseChangedSince(v) {
+  if (v === undefined || v === '') return null;
+  const d = /^\d+$/.test(String(v)) ? new Date(Number(v)) : new Date(String(v));
+  return isNaN(d.getTime()) ? undefined : d;
+}
 
 // Cursor is "<createdAt ms or empty>_<_id>". Empty createdAt covers legacy
 // docs saved before the field existed, which sort after everything else.
@@ -747,18 +766,30 @@ app.get('/sweats', proxyLimiter, async (req, res) => {
       if (!cursorFilter) return res.status(400).json({ error: 'Invalid cursor' });
       filter = { $and: [LIVE, cursorFilter] };
     }
+    const since = parseChangedSince(req.query.changedSince);
+    if (since === undefined) return res.status(400).json({ error: 'Invalid changedSince' });
+    const checkedAt = Date.now();
     // Fetch one extra to know whether another page exists without a second query.
-    const [docs, total] = await Promise.all([
+    const [docs, total, changedDocs] = await Promise.all([
       Sweat.find(filter).sort(sort).limit(limit + 1).lean(),
-      Sweat.countDocuments(LIVE)
+      Sweat.countDocuments(LIVE),
+      since ? Sweat.find({ updatedAt: { $gt: since } }).sort({ updatedAt: 1 }).limit(SWEATS_CHANGED_MAX + 1).lean() : null
     ]);
     const hasMore = docs.length > limit;
     if (hasMore) docs.pop();
-    return res.json({
+    const body = {
       sweats: docs,
       nextCursor: hasMore ? encodeSweatCursor(docs[docs.length - 1]) : null,
       total
-    });
+    };
+    if (changedDocs) {
+      body.changedTruncated = changedDocs.length > SWEATS_CHANGED_MAX;
+      if (body.changedTruncated) changedDocs.pop();
+      body.changed = changedDocs.filter(d => !d.deletedAt);
+      body.removed = changedDocs.filter(d => d.deletedAt).map(d => String(d._id));
+      body.changedAt = new Date(checkedAt - CHANGED_OVERLAP_MS).toISOString();
+    }
+    return res.json(body);
   } catch (err) {
     console.error('/sweats GET error', err);
     return res.status(500).json({ error: 'DB read error' });
