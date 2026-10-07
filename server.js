@@ -15,7 +15,7 @@ app.set('trust proxy', 1); // Render sits behind a proxy; needed for correct cli
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
-const URCHIN_KEY = process.env.URCHIN_KEY; // legacy urchin.ws cheater-tag lookup only
+const URCHIN_KEY = process.env.URCHIN_KEY; // Coral (api.urchin.gg) key, for Urchin cheater tags
 // Write access (added 2026-09-26, replacing the old TIER_ONE/TWO/THREE keys):
 // one personal key per roster member, so the backend knows who is writing and
 // signs their notes automatically, plus one KEY_ADMIN.
