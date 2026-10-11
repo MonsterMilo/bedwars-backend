@@ -43,6 +43,7 @@ Object.entries(PERSONAL_KEY_ENV).forEach(([envName, who]) => {
 });
 const KEY_ADMIN = process.env.KEY_ADMIN;
 const DENICKER_API_KEY = process.env.DENICKER_API_KEY; // proxies the Denicker nick-lookup DB (see /denicker routes below)
+const BEDLIFY_API_KEY = process.env.BEDLIFY_API_KEY; // proxies Bedlify's nick sightings (see /bedlify routes below)
 const PORT = process.env.PORT || 3000;
 
 // Comma-separated list of allowed origins, e.g. "https://monstermilo.github.io"
@@ -90,6 +91,9 @@ if (!KEY_ADMIN && PERSONAL_KEYS.size === 0) {
 }
 if (!DENICKER_API_KEY) {
   console.warn('Warning: DENICKER_API_KEY not set. /denicker routes will report { noKey: true } until set - the frontend falls back to Diamond Dome-only results.');
+}
+if (!BEDLIFY_API_KEY) {
+  console.warn('Warning: BEDLIFY_API_KEY not set. /bedlify routes will report { noKey: true } until set - the website just leaves Bedlify out.');
 }
 
 // Single source of truth for the sweat roster/flag fields, reused by the
@@ -243,6 +247,20 @@ const denickerLimiter = rateLimit({
   message: { error: 'Denicker rate limit exceeded. Try again shortly.' }
 });
 
+// Bedlify gets a tighter cap than Denicker: its own limit (120/min) is
+// shared with Milo's proxy plugins, and a website search only ever needs
+// one call. 6/min for a personal key, 20/min for full-access keys. Cached
+// answers (see bedlifySightings) still count here, so the cap is simple to
+// reason about.
+const bedlifyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: (req) => (hasFullAccess(req.keyOwner) ? 20 : 6),
+  keyGenerator: (req) => `key:${req.keyOwner}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Bedlify rate limit exceeded. Try again shortly.', rateLimited: true }
+});
+
 // Turns away anyone with no key at all before denickerLimiter even runs.
 // Responds with the same { noKey: true } shape used when DENICKER_API_KEY
 // itself isn't configured server-side, so the frontend's existing
@@ -307,6 +325,86 @@ async function denickerGet(params) {
     timeout: 8_000
   });
   return res.data;
+}
+
+// --- Bedlify API ---
+// Nick sightings from Bedlify's game tracker (api.bedlify.xyz), asked the
+// same way the denicker plugin's Bedlify class does. Proxied so
+// BEDLIFY_API_KEY never reaches the browser. Answers are boiled down here to
+// one sighting per nick + real name pair (newest first), the same shape as
+// the scraped sources' rows, and cached for 10 minutes.
+const BEDLIFY_BASE = 'https://api.bedlify.xyz';
+const BEDLIFY_CACHE_MS = 10 * 60 * 1000;
+const BEDLIFY_CACHE_MAX = 500;
+const BEDLIFY_MODES = {
+  BEDWARS_EIGHT_ONE: 'Solos',
+  BEDWARS_EIGHT_TWO: 'Doubles',
+  BEDWARS_FOUR_THREE: '3v3v3v3',
+  BEDWARS_FOUR_FOUR: '4v4v4v4',
+  BEDWARS_TWO_FOUR: '4v4'
+};
+const bedlifyCache = new Map(); // "nick|x" / "player|x" -> { at, sightings }
+let bedlifyBlockedUntil = 0; // Bedlify said our limit is used up until then
+
+function describeBedlifyGame(r) {
+  const mode = r.mode ? (BEDLIFY_MODES[r.mode] || String(r.mode).replace(/^BEDWARS_/, '').replace(/_/g, ' ').toLowerCase()) : null;
+  if (r.map && mode) return `${r.map} (${mode})`;
+  return r.map || mode || 'Unknown';
+}
+
+// param: 'nick' (who used it) or 'player' (a player's nicks).
+async function bedlifySightings(param, value) {
+  if (!BEDLIFY_API_KEY) {
+    const err = new Error('BEDLIFY_API_KEY not configured');
+    err.noKey = true;
+    throw err;
+  }
+  const cacheKey = `${param}|${value.toLowerCase()}`;
+  const cached = bedlifyCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < BEDLIFY_CACHE_MS) return cached.sightings;
+  if (Date.now() < bedlifyBlockedUntil) {
+    const err = new Error('Bedlify request limit reached');
+    err.rateLimited = true;
+    throw err;
+  }
+
+  const res = await axios.get(`${BEDLIFY_BASE}/nick`, {
+    params: { [param]: value, limit: 200 },
+    headers: { 'X-API-Key': BEDLIFY_API_KEY, Accept: 'application/json' },
+    timeout: 8_000,
+    validateStatus: (status) => status === 200 || status === 404 || status === 429
+  });
+  const retryAfter = parseInt(res.headers['retry-after'], 10) || parseInt(res.headers['x-ratelimit-reset'], 10) || 60;
+  if (res.status === 429) {
+    bedlifyBlockedUntil = Date.now() + retryAfter * 1000;
+    const err = new Error('Bedlify request limit reached');
+    err.rateLimited = true;
+    throw err;
+  }
+  if (res.headers['x-ratelimit-remaining'] === '0') bedlifyBlockedUntil = Date.now() + retryAfter * 1000;
+
+  const pairs = new Map();
+  const results = res.status === 200 && Array.isArray(res.data?.results) ? res.data.results : [];
+  for (const r of results) {
+    if (typeof r?.name !== 'string' || typeof r.nick !== 'string' || !r.name || !r.nick) continue;
+    const at = (Number(r.timestamp) || 0) * 1000;
+    const key = `${r.nick.toLowerCase()}|${r.name.toLowerCase()}`;
+    const s = pairs.get(key);
+    if (!s) {
+      pairs.set(key, { nick: r.nick, player: r.name, count: 1, first: at, last: at, game: describeBedlifyGame(r) });
+      continue;
+    }
+    s.count++;
+    if (at < s.first) s.first = at;
+    if (at > s.last) {
+      s.last = at;
+      s.game = describeBedlifyGame(r);
+    }
+  }
+  const sightings = [...pairs.values()].sort((a, b) => b.last - a.last);
+  if (bedlifyCache.size >= BEDLIFY_CACHE_MAX) bedlifyCache.delete(bedlifyCache.keys().next().value);
+  bedlifyCache.set(cacheKey, { at: Date.now(), sightings });
+  return sightings;
 }
 
 function describeAxiosError(err) {
@@ -623,6 +721,28 @@ app.get('/denicker/history/:uuid', validUuid('uuid'), requireKeyForDenicker, den
     return res.status(500).json({ error: 'Denicker proxy error' });
   }
 });
+
+// Bedlify sightings of a nick (who used it) or a player (their nicks), most
+// recent first. Same key gate as Denicker, with its own tighter cap.
+function bedlifyRoute(param) {
+  return async (req, res) => {
+    try {
+      const sightings = await bedlifySightings(param, req.params[param]);
+      return res.json({ success: true, sightings });
+    } catch (err) {
+      if (err.noKey) return res.json({ success: false, noKey: true, sightings: [] });
+      if (err.rateLimited) return res.status(429).json({ error: 'Bedlify request limit reached. Try again shortly.', rateLimited: true });
+      if (err.response && (err.response.status === 401 || err.response.status === 403)) {
+        console.error(`/bedlify/${param} error: Bedlify rejected BEDLIFY_API_KEY`);
+      } else {
+        console.error(`/bedlify/${param} error`, describeAxiosError(err));
+      }
+      return res.status(500).json({ error: 'Bedlify proxy error' });
+    }
+  };
+}
+app.get('/bedlify/nick/:nick', validName('nick'), requireKeyForDenicker, bedlifyLimiter, bedlifyRoute('nick'));
+app.get('/bedlify/player/:player', validName('player'), requireKeyForDenicker, bedlifyLimiter, bedlifyRoute('player'));
 
 // Saves a new sweat with its optional first note, logs it and posts it to
 // the Sweat Log channel. Shared by POST /sweats and the bot's /add.
