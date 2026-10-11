@@ -14,6 +14,9 @@
 //   /random [person]     a random sweat (read-only)
 //   /theme [theme]       pick your card theme (the website's six); the
 //                        Sweat Log channel always uses the default (Neon)
+//   /denick <name>       who is behind a nick (or a player's nicks) across
+//                        every denick source, like the website's Denicking
+//                        section; roster members only, same limits
 //
 // No always-on gateway connection: Discord sends button clicks and slash
 // commands to POST /discord/interactions as plain HTTP requests, signed with
@@ -77,6 +80,11 @@ const FLAG_FILTERS = [
   { id: 'clean', name: 'Not flagged', label: 'not flagged', test: s => !s.cheating && !s.boosting }
 ];
 const PAGE_SIZE = 10;
+// /denick: who used a nick, or the nicks a player used.
+const DENICK_MODES = [
+  { id: 'nick', name: 'Who used this nick' },
+  { id: 'player', name: 'A player\'s nicks' }
+];
 // The stats the website's edit form changes - five, which is also the most
 // boxes a Discord pop-up can hold.
 const STAT_INPUTS = [
@@ -169,7 +177,7 @@ const DiscordPref = mongoose.models.DiscordPref || mongoose.model('DiscordPref',
 module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -550,6 +558,15 @@ module.exports = function setupDiscord({
     type: 1,
     options: [personOption('Only sweats this person has beaten')]
   }, {
+    name: 'denick',
+    description: 'Who is behind a nick, or a player\'s nicks, from every denick source',
+    type: 1,
+    options: [
+      { type: 3, name: 'name', description: 'The nick (or the player, with search: A player\'s nicks)', required: true, min_length: 1, max_length: 16 },
+      { type: 3, name: 'search', description: 'What to look up (default: who used this nick)', required: false,
+        choices: DENICK_MODES.map(m => ({ name: m.name, value: m.id })) }
+    ]
+  }, {
     name: 'theme',
     description: 'Pick the look of the cards you get (the website\'s themes)',
     type: 1,
@@ -843,6 +860,115 @@ module.exports = function setupDiscord({
     return { png, kind: 'beaten', theme, components, timing };
   }
 
+  // --- /denick ---
+  // The website's Denicking search (see denick.js): every source, newest
+  // sighting first. Roster members only, and each search counts against
+  // that person's Denicker and Bedlify limits, the same budget as their
+  // website searches. Results are kept for 10 minutes so the page buttons
+  // don't search again; after that a click searches afresh (as the clicker).
+  const DENICK_STATE = /^dn:([pnfl]):(nick|player):(\d+):([A-Za-z0-9_]{1,16})$/;
+  const DENICK_KEEP_MS = 10 * 60 * 1000;
+  const denickKept = new Map(); // "mode|name" -> { at, found }
+  if (enabled && denick) setTimeout(() => denick.warmUp(), 5000);
+
+  // Small face renders by name (a nick's owner, or the searched player),
+  // kept for an hour. A failed fetch draws the name's first letter.
+  const faces = new Map(); // lowercased name -> { data, at }
+  function faceFor(name) {
+    const key = String(name).toLowerCase();
+    const hit = faces.get(key);
+    if (hit && Date.now() - hit.at < 60 * 60 * 1000) return Promise.resolve(hit.data);
+    return axios.get(`https://mc-heads.net/avatar/${encodeURIComponent(name)}/64`, {
+      responseType: 'arraybuffer', timeout: 3000, headers: { 'User-Agent': 'SweatLog/1.0' }
+    }).then(r => {
+      const data = `data:image/png;base64,${Buffer.from(r.data).toString('base64')}`;
+      if (faces.size > 500) faces.delete(faces.keys().next().value);
+      faces.set(key, { data, at: Date.now() });
+      return data;
+    }).catch(() => null);
+  }
+
+  async function denickSearch(who, mode, name) {
+    const found = await denick.search(who, mode, name);
+    denickKept.set(`${mode}|${name.toLowerCase()}`, { at: Date.now(), found });
+    if (denickKept.size > 200) denickKept.delete(denickKept.keys().next().value);
+    return found;
+  }
+
+  // What's said above the card: anything missing from the results.
+  function denickNote(found) {
+    if (found.limitedUntil) {
+      return `-# You've hit your denick limit for part of the database, so some results may be missing. It resets <t:${Math.ceil(found.limitedUntil / 1000)}:R>.`;
+    }
+    return found.partial ? '-# Part of the database didn\'t respond, so some results may be missing.' : '';
+  }
+
+  async function onDenick(interaction, res) {
+    const who = roster.get(userOf(interaction));
+    if (!who) return reply(res, NOT_LINKED);
+    if (!denick) return reply(res, 'Denicking isn\'t set up on the server.');
+    const name = String(optionOf(interaction, 'name') || '').trim();
+    if (!NAME_RE.test(name)) return reply(res, 'That isn\'t a valid nick or username (letters, numbers and _ only, up to 16).');
+    const mode = optionOf(interaction, 'search') === 'player' ? 'player' : 'nick';
+    const theme = themeOf(userOf(interaction));
+    return withCard(interaction, res, async () => {
+      const found = await denickSearch(who, mode, name);
+      return denickPage(found, 0, theme);
+    });
+  }
+
+  async function onDenickPage(interaction, res) {
+    const m = DENICK_STATE.exec(interaction.data.custom_id || '');
+    if (!m || !denick) return reply(res, 'That doesn\'t do anything any more.');
+    const [, , mode, page, name] = m;
+    const kept = denickKept.get(`${mode}|${name.toLowerCase()}`);
+    const fresh = kept && Date.now() - kept.at < DENICK_KEEP_MS;
+    const who = roster.get(userOf(interaction));
+    if (!fresh && !who) return reply(res, NOT_LINKED);
+    res.json({ type: DEFER_UPDATE });
+    const found = fresh ? kept.found : await denickSearch(who, mode, name);
+    return editOriginal(interaction, await denickPage(found, Number(page), themeOfMessage(interaction.message) || themeOf(userOf(interaction))));
+  }
+
+  async function denickPage(found, pageWanted, theme) {
+    const { mode, query, results } = found;
+    const pages = Math.max(1, Math.ceil(results.length / PAGE_SIZE));
+    const page = Math.min(Math.max(0, pageWanted), pages - 1);
+    const shown = results.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+    // Nick mode: each row is a different player, so each gets a face. Player
+    // mode: the rows are nicks, and the player's own face goes in the header.
+    const [heads, playerHead] = await Promise.all([
+      mode === 'nick' ? Promise.all(shown.map(e => faceFor(e.username))) : [],
+      mode === 'player' ? faceFor(query) : null
+    ]);
+    const rows = shown.map((e, i) => ({
+      name: mode === 'nick' ? e.username : e.nick,
+      head: heads[i] || null,
+      source: e.source,
+      also: e.alsoIn,
+      seen: e.sighting ? `Seen ${e.sighting.count > 1 ? `${num(e.sighting.count)}x` : 'once'}${e.sighting.game && e.sighting.game !== 'Unknown' ? ` in ${e.sighting.game}` : ''}` : '',
+      when: e.updated ? ago(e.updated) : '',
+      current: page === 0 && i === 0 && results.length > 1
+    }));
+    // The name as the sources spell it, when they know it.
+    const shownQuery = (mode === 'nick' ? results[0] && results[0].nick : results[0] && results[0].username) || query;
+    const timing = {};
+    const png = await cards.render(cards.denickCard(theme, {
+      query: shownQuery, mode, head: playerHead, rows,
+      right: results.length ? plural(results.length, mode === 'nick' ? 'player' : 'nick') : '',
+      empty: mode === 'nick' ? 'Nobody in the database has used this nick.' : 'No nicks for this player in the database.',
+      footer: [results.length ? 'Newest first' : '', pages > 1 ? `Page ${page + 1} of ${pages}` : 'Denick']
+    }), timing);
+    const id = (k, p) => `dn:${k}:${mode}:${p}:${query}`;
+    const components = pages > 1 ? [{ type: ROW, components: [
+      { type: BUTTON, style: STYLE.grey, label: '⏮', custom_id: id('f', 0), disabled: page === 0 },
+      { type: BUTTON, style: STYLE.blurple, label: '◀ Prev', custom_id: id('p', Math.max(0, page - 1)), disabled: page === 0 },
+      { type: BUTTON, style: STYLE.blurple, label: 'Next ▶', custom_id: id('n', Math.min(pages - 1, page + 1)), disabled: page >= pages - 1 },
+      { type: BUTTON, style: STYLE.grey, label: '⏭', custom_id: id('l', pages - 1), disabled: page >= pages - 1 }
+    ] }] : [];
+    return { content: denickNote(found), png, kind: 'denick', theme, components, timing };
+  }
+
   // --- /stats ---
   // A Person dropdown on the card switches between the whole list and each
   // person (custom_id "st:W", the value is "all" or a roster field).
@@ -1062,6 +1188,7 @@ module.exports = function setupDiscord({
     const customId = (interaction.data && interaction.data.custom_id) || '';
     if (customId.startsWith('bt:')) return onBeatenPage(interaction, res);
     if (customId.startsWith('lb:')) return onLeaderboardPage(interaction, res);
+    if (customId.startsWith('dn:')) return onDenickPage(interaction, res);
     if (customId === 'st:W') return onStatsPick(interaction, res);
     const addMatch = /^add:(beaten|flags|confirm|cancel):([0-9a-f]{12})$/.exec(customId);
     if (addMatch) return onAddInteraction(interaction, res, addMatch[1], addMatch[2]);
@@ -1241,7 +1368,7 @@ module.exports = function setupDiscord({
   // --- The endpoint Discord calls ---
   const COMMAND_HANDLERS = {
     sweat: onSweatCommand, add: onAdd, beaten: onBeaten, stats: onStats,
-    leaderboard: onLeaderboard, random: onRandom, theme: onTheme
+    leaderboard: onLeaderboard, random: onRandom, theme: onTheme, denick: onDenick
   };
   app.post('/discord/interactions', async (req, res) => {
     if (!enabled) return res.status(503).json({ error: 'Discord bot not configured' });

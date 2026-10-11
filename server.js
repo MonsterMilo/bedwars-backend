@@ -6,6 +6,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const { MemoryStore } = rateLimit;
 const axios = require('axios');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
@@ -237,10 +238,14 @@ const writeLimiter = rateLimit({
 // them it isn't public at all - requireKeyForDenicker below turns away
 // anyone with no key before this ever runs. Counted per key rather than
 // sharing the general proxy pool, so browsing player cards can't eat into
-// it: 15/min for a personal key, 60/min for full-access keys.
+// it: 15/min for a personal key, 60/min for full-access keys. The Discord
+// bot's /denick counts against the same budget (see spendLimit below).
+const DENICKER_LIMIT = owner => (hasFullAccess(owner) ? 60 : 15);
+const denickerStore = new MemoryStore();
 const denickerLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: (req) => (hasFullAccess(req.keyOwner) ? 60 : 15),
+  limit: (req) => DENICKER_LIMIT(req.keyOwner),
+  store: denickerStore,
   keyGenerator: (req) => `key:${req.keyOwner}`,
   standardHeaders: true,
   legacyHeaders: false,
@@ -252,14 +257,27 @@ const denickerLimiter = rateLimit({
 // one call. 6/min for a personal key, 20/min for full-access keys. Cached
 // answers (see bedlifySightings) still count here, so the cap is simple to
 // reason about.
+const BEDLIFY_LIMIT = owner => (hasFullAccess(owner) ? 20 : 6);
+const bedlifyStore = new MemoryStore();
 const bedlifyLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: (req) => (hasFullAccess(req.keyOwner) ? 20 : 6),
+  limit: (req) => BEDLIFY_LIMIT(req.keyOwner),
+  store: bedlifyStore,
   keyGenerator: (req) => `key:${req.keyOwner}`,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Bedlify rate limit exceeded. Try again shortly.', rateLimited: true }
 });
+
+// One search's worth of a limiter's budget, outside a web request (the
+// Discord bot's /denick, where the person is known from their Discord
+// account rather than a key). Counted in the limiter's own store under the
+// same "key:<owner>" name, so it's one budget with that person's website
+// searches. Resolves to 0 when allowed, or the time (ms) the limit resets.
+async function spendLimit(store, limitFor, owner) {
+  const { totalHits, resetTime } = await store.increment(`key:${owner}`);
+  return totalHits > limitFor(owner) ? (resetTime ? resetTime.getTime() : Date.now() + 60 * 1000) : 0;
+}
 
 // Turns away anyone with no key at all before denickerLimiter even runs.
 // Responds with the same { noKey: true } shape used when DENICKER_API_KEY
@@ -806,10 +824,18 @@ async function currentStats(uuid) {
 }
 
 // --- Discord bot (see discord.js) ---
+// /denick runs the website's Denicking search server-side (see denick.js).
+const denick = require('./denick')({
+  denickerGet, bedlifySightings, resolvePlayer, describeAxiosError,
+  denickerOn: () => !!DENICKER_API_KEY,
+  bedlifyOn: () => !!BEDLIFY_API_KEY,
+  spendDenicker: owner => spendLimit(denickerStore, DENICKER_LIMIT, owner),
+  spendBedlify: owner => spendLimit(bedlifyStore, BEDLIFY_LIMIT, owner)
+});
 const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick
 });
 
 // --- Sweats API: shared DB ---
