@@ -487,6 +487,63 @@ function leaderboardCard(themeId, data) {
     h('div', { gap: 16, marginTop: 6 }, column(rows.slice(0, 5)), rows.length > 5 ? column(rows.slice(5)) : null));
 }
 
+// --- /denick ---
+// data: { query, mode ('nick' | 'player'), head (data URI, player mode),
+//         right, rows: [{ name, head, source, also: [..], seen, when, current }],
+//         footer, empty }
+// Two columns of five like /beaten, each row edged in its source's colour
+// (the website's Denicking rail: accent for Denicker, gold for Diamond
+// Dome, purple for Tricktracker, red for Bedlify).
+function denickCard(themeId, data) {
+  const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
+  // Where the accent is itself gold (Private Bank, Hollow Grave), Denicker
+  // takes the theme's blue so it can't be mistaken for Diamond Dome.
+  const denickerColor = t.id === 'ledger' || t.id === 'hollowgrave' ? t.mc['9'] : t.accent;
+  const SOURCE_COLORS = { 'Denicker API': denickerColor, 'Diamond Dome': t.mc['6'], Tricktracker: t.mc['5'], Bedlify: t.mc.c };
+  const sourceColor = s => SOURCE_COLORS[s] || t.dim;
+  const plain = t.slotText || t.text;
+  const faint = t.slotLabel || t.dim;
+  const shadow = t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : 'none';
+  const face = (src, px, letter) => h('div', {
+    width: px, height: px, flexShrink: 0, alignItems: 'center', justifyContent: 'center',
+    background: t.track, borderRadius: t.chipRound ? Math.round(px / 4) : (t.chipRadius || 0), overflow: 'hidden'
+  }, src ? img(src, px, px) : text(letter || '?', { fontFamily: t.font, fontSize: Math.round(px * 0.5), fontWeight: 800, color: faint }));
+
+  const head = h('div', { alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar },
+    h('div', { alignItems: 'center', gap: 16, minWidth: 0, flexShrink: 1 },
+      data.mode === 'player' ? face(data.head, 52, data.query[0].toUpperCase()) : null,
+      h('div', { flexDirection: 'column', gap: 6, minWidth: 0 },
+        label(t, data.mode === 'player' ? 'Nicks used by' : 'Who is behind', { color: t.barDim || t.dim, fontSize: size(t, 16) }),
+        text(data.query, { fontFamily: t.title || t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }))),
+    data.right ? text(data.right, { fontFamily: t.body, fontSize: size(t, 21), fontWeight: 700, color: t.barDim || t.dim, flexShrink: 0 }) : null);
+
+  const row = r => {
+    const c = sourceColor(r.source);
+    return h('div', {
+      alignItems: 'center', gap: 12, padding: '10px 14px', marginTop: 10, ...t.slot,
+      borderLeft: `6px solid ${c}`, overflow: 'hidden',
+      ...(r.current ? { background: t.track } : {})
+    },
+      data.mode === 'nick' ? face(r.head, 46, r.name[0].toUpperCase()) : null,
+      h('div', { flexDirection: 'column', flexGrow: 1, flexShrink: 1, minWidth: 0, gap: 5 },
+        h('div', { alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+          text(r.name, { fontFamily: t.font, fontSize: size(t, 27), fontWeight: 800, color: plain, lineHeight: 1.2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1, textShadow: shadow }),
+          r.current
+            ? h('div', { alignItems: 'center', padding: '4px 10px', background: t.accent, borderRadius: t.chipRound ? 999 : (t.chipRadius || 0), border: t.chipBorder || 'none', flexShrink: 0 },
+              text('Current', { fontFamily: t.label_, fontSize: size(t, 15), fontWeight: 700, color: t.chipText, letterSpacing: 1, textTransform: 'uppercase', lineHeight: 1 }))
+            : text(r.when || '', { fontFamily: t.body, fontSize: size(t, 18), fontWeight: 700, color: faint, flexShrink: 0 })),
+        h('div', { alignItems: 'center', gap: 6, minWidth: 0 },
+          text(r.source, { fontFamily: t.label_, fontSize: size(t, 15), fontWeight: 700, color: c, letterSpacing: t.labelSpacing, textTransform: t.labelCase, flexShrink: 0, whiteSpace: 'nowrap', textShadow: t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.75)' : 'none' }),
+          r.also && r.also.length ? text(`+ ${r.also.join(', ')}`, { fontFamily: t.body, fontSize: size(t, 16), fontWeight: 700, color: faint, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1 }) : null),
+        r.seen ? text(r.seen, { fontFamily: t.body, fontSize: size(t, 17), color: faint, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }) : null));
+  };
+  const column = list => h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0 }, list.map(row));
+  const body = data.rows.length
+    ? h('div', { gap: 16, marginTop: 6 }, column(data.rows.slice(0, 5)), data.rows.length > 5 ? column(data.rows.slice(5)) : null)
+    : h('div', { justifyContent: 'center', padding: 30, marginTop: 16, ...t.slot }, text(data.empty || 'No results.', { fontFamily: t.body, fontSize: size(t, 26), color: faint }));
+  return frame(t, data.footer, head, body);
+}
+
 // Finished cards are kept for a while: the same card asked for again (a
 // lookup repeated, a page flipped back, a redraw with nothing changed) is
 // sent straight away instead of drawn again. Keyed on everything that goes
@@ -516,6 +573,6 @@ async function render(tree, timing = {}) {
 }
 
 module.exports = {
-  THEMES, THEME_IDS, render, sweatCard, listCard, statsCard, leaderboardCard,
+  THEMES, THEME_IDS, render, sweatCard, listCard, statsCard, leaderboardCard, denickCard,
   ratioColor: (themeId, v, kind) => ratioColor(theme(themeId), v, kind === 'wlr' ? WLR_STEPS : FKDR_STEPS)
 };
