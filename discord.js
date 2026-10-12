@@ -17,6 +17,9 @@
 //   /denick <name>       who is behind a nick (or a player's nicks) across
 //                        every denick source, like the website's Denicking
 //                        section; roster members only, same limits
+//   /recap [week]        the weekly recap card (this week so far, or last
+//                        week). The bot also posts it to the Sweat Log
+//                        channel every Sunday at 8pm New York time.
 //
 // No always-on gateway connection: Discord sends button clicks and slash
 // commands to POST /discord/interactions as plain HTTP requests, signed with
@@ -175,6 +178,36 @@ function uuidForms(uuid) {
 // Each person's card theme, by Discord user id.
 const DiscordPref = mongoose.models.DiscordPref || mongoose.model('DiscordPref',
   new mongoose.Schema({ _id: String, theme: String }, { versionKey: false }));
+// Small bits the bot has to remember across restarts, e.g. which Sunday's
+// recap it last posted ({ _id: 'weeklyRecap', at: <that Sunday's slot> }).
+const DiscordState = mongoose.models.DiscordState || mongoose.model('DiscordState',
+  new mongoose.Schema({ _id: String, at: Date }, { versionKey: false }));
+
+// --- Weekly recap timing ---
+// Posted Sundays at 8pm New York time (EST/EDT handled by Intl), covering
+// the 7 days up to then, so every sweat lands in exactly one recap.
+const RECAP_TZ = 'America/New_York';
+const RECAP_HOUR = 20;
+const RECAP_GRACE_MS = 12 * 60 * 60 * 1000; // after a long outage, skip rather than post on Monday afternoon
+const tzParts = date => Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+  timeZone: RECAP_TZ, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric'
+}).formatToParts(date).filter(p => p.type !== 'literal').map(p => [p.type, Number(p.value)]));
+// How far New York's wall clock is ahead of UTC at that moment (negative).
+function tzOffset(ms) {
+  const p = tzParts(new Date(ms));
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(ms / 1000) * 1000;
+}
+// The latest Sunday 8pm (New York) at or before `now`, as a Date.
+function recapSlot(now = new Date()) {
+  const p = tzParts(now);
+  const today = Date.UTC(p.year, p.month - 1, p.day);
+  let wall = today - new Date(today).getUTCDay() * DAY_MS + RECAP_HOUR * 3600 * 1000;
+  const toInstant = w => w - tzOffset(w - tzOffset(w));
+  if (toInstant(wall) > now.getTime()) wall -= 7 * DAY_MS;
+  return new Date(toInstant(wall));
+}
+// "Oct 5" in New York time.
+const nyDay = d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: RECAP_TZ });
 
 module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
@@ -568,6 +601,12 @@ module.exports = function setupDiscord({
       { type: 3, name: 'search', description: 'What to look up (default: who used this nick)', required: false,
         choices: DENICK_MODES.map(m => ({ name: m.name, value: m.id })) }
     ]
+  }, {
+    name: 'recap',
+    description: 'The weekly recap: sweats beaten, who beat the most, the scariest new one',
+    type: 1,
+    options: [{ type: 3, name: 'week', description: 'Which week (default: this week so far)', required: false,
+      choices: [{ name: 'This week so far', value: 'this' }, { name: 'Last week', value: 'last' }] }]
   }, {
     name: 'theme',
     description: 'Pick the look of the cards you get (the website\'s themes)',
@@ -1156,6 +1195,111 @@ module.exports = function setupDiscord({
     });
   }
 
+  // --- Weekly recap ---
+  // One card for a window of time: how many sweats were logged, who beat
+  // the most of them, and the scariest new one (highest FKDR, each player
+  // counted once). full: a finished week, so it's compared with the one
+  // before.
+  async function recapMessage(from, to, theme, full) {
+    const keep = ['username', 'uuid', 'addedBy', 'createdAt', 'star', 'fkdr', 'wlr', 'bblr', 'cheating', 'boosting', ...ROSTER_FIELDS]
+      .reduce((o, f) => { o[f] = 1; return o; }, {});
+    const [sweats, before] = await Promise.all([
+      Sweat.find({ ...LIVE, createdAt: { $gte: from, $lt: to } }, keep).lean(),
+      full ? Sweat.countDocuments({ ...LIVE, createdAt: { $gte: new Date(from.getTime() - 7 * DAY_MS), $lt: from } }) : null
+    ]);
+    const key = sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
+    const seen = new Set();
+    const ranked = sweats
+      .sort((a, b) => (b.fkdr || 0) - (a.fkdr || 0) || (b.star || 0) - (a.star || 0))
+      .filter(sw => (seen.has(key(sw)) ? false : seen.add(key(sw))));
+    const beatenCounts = Object.fromEntries(ROSTER_FIELDS.map(f => [f, sweats.filter(sw => sw[f]).length]));
+    const people = ROSTER_FIELDS.filter(f => beatenCounts[f] > 0).sort((a, b) => beatenCounts[b] - beatenCounts[a]).slice(0, 5).map(f => [f, beatenCounts[f]]);
+    const loggedCounts = {};
+    sweats.forEach(sw => { if (sw.addedBy) loggedCounts[sw.addedBy] = (loggedCounts[sw.addedBy] || 0) + 1; });
+    const topLogger = Object.entries(loggedCounts).sort((a, b) => b[1] - a[1])[0];
+    const fkdrs = sweats.map(sw => sw.fkdr).filter(v => Number.isFinite(v) && v > 0);
+    const avgFkdr = fkdrs.length ? fkdrs.reduce((x, y) => x + y, 0) / fkdrs.length : 0;
+    const flagged = sweats.filter(sw => sw.cheating || sw.boosting).length;
+    const diff = full ? sweats.length - before : 0;
+
+    const top = ranked[0];
+    const t0 = Date.now();
+    const skin = top ? await skinFor(top.uuid) : null;
+    const timing = { skinMs: Date.now() - t0 };
+    const range = full ? `${nyDay(new Date(to.getTime() - 6 * DAY_MS))} – ${nyDay(new Date(to.getTime() - 60000))}` : `${nyDay(from)} – now`;
+    const png = await cards.render(cards.recapCard(theme, {
+      range,
+      summary: [
+        [num(sweats.length), 'Sweats', diff ? { up: diff > 0, text: `${Math.abs(diff)} vs last week` } : null],
+        [num(ranked.length), 'Players'],
+        [avgFkdr ? avgFkdr.toFixed(2) : '—', 'Avg FKDR'],
+        [num(flagged), 'Flagged']
+      ],
+      scariest: top ? {
+        star: top.star, username: top.username, fkdr: top.fkdr, wlr: top.wlr, bblr: top.bblr,
+        cheating: top.cheating, boosting: top.boosting, skin,
+        beaten: ROSTER_FIELDS.filter(f => sweats.some(sw => key(sw) === key(top) && sw[f]))
+      } : null,
+      people,
+      also: ranked.slice(1, 5).map(sw => ({
+        star: sw.star, username: sw.username,
+        value: Number.isFinite(sw.fkdr) && sw.fkdr > 0 ? `${sw.fkdr.toFixed(2)} FKDR` : '—',
+        color: cards.ratioColor(theme, sw.fkdr, 'fkdr')
+      })),
+      empty: full ? 'Quiet week. Nobody new on the list.' : 'Nobody new on the list yet this week.',
+      footer: [topLogger ? `Logged the most: ${ROSTER_LABELS[topLogger[0]] || topLogger[0]} (${topLogger[1]})` : 'Nothing logged', full ? 'Every Sunday · Sweat Log' : 'So far · full recap Sunday 8pm ET']
+    }), timing);
+
+    // The text above the card says the headline in words too.
+    const best = people.length ? people.filter(([, n]) => n === people[0][1]).map(([f]) => ROSTER_LABELS[f]) : [];
+    const who = best.length > 1 ? `${best.slice(0, -1).join(', ')} and ${best[best.length - 1]} beat the most (${people[0][1]} each)` : best.length ? `${best[0]} beat the most (${people[0][1]})` : null;
+    const content = [`📅 **Weekly recap** · ${range}`, sweats.length ? plural(sweats.length, 'sweat') + ' beaten' : (full ? 'a quiet week' : 'nobody new yet'), who, top ? `scariest: **${top.username}**` : null]
+      .filter(Boolean).join(' · ');
+    return { content, png, kind: 'recap', theme, components: [], timing };
+  }
+
+  async function onRecap(interaction, res) {
+    const last = optionOf(interaction, 'week') === 'last';
+    const theme = themeOf(userOf(interaction));
+    const slot = recapSlot();
+    return withCard(interaction, res, () => (last
+      ? recapMessage(new Date(slot.getTime() - 7 * DAY_MS), slot, theme, true)
+      : recapMessage(slot, new Date(), theme, false)));
+  }
+
+  // Every Sunday at 8pm (New York) the finished week goes to the Sweat Log
+  // channel. Checked every 5 minutes (the keep-alive pinger keeps the
+  // server up); the last posted Sunday is saved in the database and claimed
+  // before posting, so a restart or a second copy of the server can't post
+  // it twice. A failed post hands the claim back to be retried next check.
+  async function weeklyRecapTick() {
+    const slot = recapSlot();
+    if (Date.now() - slot.getTime() > RECAP_GRACE_MS) return;
+    let previous;
+    try {
+      previous = await DiscordState.findOneAndUpdate(
+        { _id: 'weeklyRecap', $or: [{ at: { $lt: slot } }, { at: null }] },
+        { $set: { at: slot } }, { upsert: true, new: false }).lean();
+    } catch (err) {
+      if (err.code !== 11000) console.error('Weekly recap: claim failed', err.message);
+      return; // 11000: this week's is already claimed
+    }
+    const startedAt = Date.now();
+    try {
+      const msg = await recapMessage(new Date(slot.getTime() - 7 * DAY_MS), slot, DEFAULT_THEME, true);
+      await send('post', `/channels/${CHANNEL_ID}/messages`, msg, startedAt);
+      console.log(`Weekly recap posted for ${slot.toISOString()}`);
+    } catch (err) {
+      console.error('Weekly recap post failed', describeAxiosError(err));
+      await DiscordState.updateOne({ _id: 'weeklyRecap', at: slot }, { $set: { at: previous ? previous.at : null } })
+        .catch(e => console.error('Weekly recap: handing the claim back failed', e.message));
+    }
+  }
+  if (enabled) {
+    setTimeout(weeklyRecapTick, 60 * 1000);
+    setInterval(weeklyRecapTick, 5 * 60 * 1000);
+  }
+
   // --- /theme ---
   // Saved per Discord account. Shows a preview: the same example player
   // drawn in that theme.
@@ -1373,7 +1517,7 @@ module.exports = function setupDiscord({
   // --- The endpoint Discord calls ---
   const COMMAND_HANDLERS = {
     sweat: onSweatCommand, add: onAdd, beaten: onBeaten, stats: onStats,
-    leaderboard: onLeaderboard, random: onRandom, theme: onTheme, denick: onDenick
+    leaderboard: onLeaderboard, random: onRandom, theme: onTheme, denick: onDenick, recap: onRecap
   };
   app.post('/discord/interactions', async (req, res) => {
     if (!enabled) return res.status(503).json({ error: 'Discord bot not configured' });

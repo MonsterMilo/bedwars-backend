@@ -6,7 +6,8 @@
 // same way the website's themes work.
 //
 // Cards: sweatCard (a player), listCard (/beaten), statsCard (/stats),
-// leaderboardCard (/leaderboard). render(tree) gives the PNG.
+// leaderboardCard (/leaderboard), denickCard (/denick), recapCard (the
+// Sunday recap and /recap). render(tree) gives the PNG.
 
 const fs = require('fs');
 const path = require('path');
@@ -544,6 +545,74 @@ function denickCard(themeId, data) {
   return frame(t, data.footer, head, body);
 }
 
+// --- Weekly recap (posted to the Sweat Log every Sunday, and /recap) ---
+// data: { range, summary: [[value, label, delta?]...], scariest: { star, username, fkdr, wlr, bblr, beaten, skin, cheating, boosting },
+//         people: [[who, count]], also: [{ star, username, value, color, beaten }], footer, empty }
+// The scariest new sweat gets the big slot with their skin; who beat the
+// most and the rest of the week's sweats share the right side.
+function recapCard(themeId, data) {
+  const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
+  const plain = t.slotText || t.text;
+  const faint = t.slotLabel || t.dim;
+  const shadow = c => (t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : t.glow(c));
+  const head = h('div', { alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar },
+    h('div', { flexDirection: 'column', gap: 6 },
+      label(t, 'Sweat Log', { color: t.barDim || t.dim, fontSize: size(t, 16) }),
+      text('Weekly recap', { fontFamily: t.title || t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 })),
+    text(data.range, { fontFamily: t.body, fontSize: size(t, 24), fontWeight: 700, color: t.barDim || t.dim }));
+  const summary = h('div', { gap: 14, marginTop: 16 },
+    data.summary.map(([value, what, delta]) => statBox(t, what, value, plain, { px: 44, height: data.summary.some(x => x[2]) ? 122 : 100, delta })));
+
+  if (!data.scariest) {
+    return frame(t, data.footer, head, summary,
+      h('div', { justifyContent: 'center', padding: 34, marginTop: 14, ...t.slot },
+        text(data.empty || 'Quiet week. Nobody new on the list.', { fontFamily: t.body, fontSize: size(t, 28), color: faint })));
+  }
+
+  const s = data.scariest;
+  const flagColor = s.cheating ? t.cheating : s.boosting ? t.boosting : null;
+  const mini = (heading, v, steps) => h('div', { flexDirection: 'column', alignItems: 'center', flexGrow: 1, flexBasis: 0, padding: '8px 4px', background: t.track, borderRadius: t.chipRound ? 12 : (t.chipRadius || 0) },
+    label(t, heading, { fontSize: size(t, 14), color: faint }),
+    text(fmt(v, 2), { fontFamily: t.font, fontSize: size(t, 30), fontWeight: 800, color: ratioColor(t, v, steps), lineHeight: 1, marginTop: 4, textShadow: shadow(ratioColor(t, v, steps)) }));
+  const scariest = h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0, padding: '14px 18px', ...t.slot,
+    ...(flagColor ? (t.chipBorder ? { border: `3px solid ${flagColor}` } : { borderColor: flagColor, borderWidth: 2 }) : {}) },
+    label(t, 'Scariest new sweat', { color: faint }),
+    h('div', { gap: 16, marginTop: 12 },
+      h('div', { width: 140, height: 286, flexShrink: 0, alignItems: 'center', justifyContent: 'center', ...t.skinBg },
+        s.skin ? img(s.skin, 128, 268, { objectFit: 'contain' }) : text('?', { fontFamily: t.font, fontSize: 70, color: t.dim })),
+      h('div', { flexDirection: 'column', flexGrow: 1, minWidth: 0 },
+        h('div', { alignItems: 'center', gap: 10 },
+          s.star > 0 ? starTag(t, s.star, size(t, 28)) : null,
+          s.cheating ? text('⚑', { fontFamily: 'Symbols', fontSize: 24, color: t.cheating }) : null,
+          s.boosting ? text('⚠', { fontFamily: 'Symbols', fontSize: 24, color: t.boosting }) : null),
+        text(s.username, { fontFamily: t.font, fontSize: size(t, 36), fontWeight: 800, color: plain, lineHeight: 1.2, marginTop: 6, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', textShadow: shadow(t.accent) }),
+        h('div', { gap: 8, marginTop: 12 }, mini('FKDR', s.fkdr, FKDR_STEPS), mini('WLR', s.wlr, WLR_STEPS), mini('BBLR', s.bblr, WLR_STEPS)),
+        h('div', { flexWrap: 'wrap', gap: 8, marginTop: 12, alignItems: 'center' },
+          s.beaten && s.beaten.length ? s.beaten.map(f => chip(t, f, 18)) : text('Nobody yet', { fontFamily: t.body, fontSize: size(t, 20), color: faint })))));
+
+  const most = Math.max(1, ...data.people.map(r => r[1]));
+  const people = h('div', { flexDirection: 'column', padding: '14px 18px', ...t.slot },
+    label(t, 'Beaten the most', { color: faint }),
+    data.people.length ? data.people.map(([who, n], i) => h('div', { alignItems: 'center', marginTop: 9, gap: 10 },
+      text(i === 0 ? '★' : ' ', { fontFamily: 'Symbols', fontSize: 20, color: '#f5c542', width: 20 }),
+      h('div', { width: 100 }, chip(t, who, 18)),
+      bar(t, n, most, t.roster[who] || t.accent, 14),
+      text(String(n), { fontFamily: t.font, fontSize: size(t, 24), fontWeight: 800, color: plain, width: 40, justifyContent: 'flex-end' })))
+      : text('Nobody ticked as beating them yet', { fontFamily: t.body, fontSize: size(t, 20), color: faint, marginTop: 8 }));
+  const also = data.also && data.also.length ? h('div', { flexDirection: 'column', padding: '12px 18px', marginTop: 14, ...t.slot },
+    label(t, 'Also new this week', { color: faint }),
+    data.also.map(a => h('div', { alignItems: 'center', justifyContent: 'space-between', marginTop: 8, gap: 10 },
+      h('div', { alignItems: 'center', gap: 8, minWidth: 0, flexShrink: 1 },
+        a.star > 0 ? starTag(t, a.star, size(t, 20)) : null,
+        text(a.username, { fontFamily: t.font, fontSize: size(t, 22), fontWeight: 800, color: plain, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1 })),
+      text(a.value, { fontFamily: t.font, fontSize: size(t, 22), fontWeight: 800, color: a.color || plain, flexShrink: 0 })))) : null;
+
+  return frame(t, data.footer, head, summary,
+    h('div', { gap: 14, marginTop: 14 },
+      scariest,
+      h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0 }, people, also)));
+}
+
 // Finished cards are kept for a while: the same card asked for again (a
 // lookup repeated, a page flipped back, a redraw with nothing changed) is
 // sent straight away instead of drawn again. Keyed on everything that goes
@@ -573,6 +642,6 @@ async function render(tree, timing = {}) {
 }
 
 module.exports = {
-  THEMES, THEME_IDS, render, sweatCard, listCard, statsCard, leaderboardCard, denickCard,
+  THEMES, THEME_IDS, render, sweatCard, listCard, statsCard, leaderboardCard, denickCard, recapCard,
   ratioColor: (themeId, v, kind) => ratioColor(theme(themeId), v, kind === 'wlr' ? WLR_STEPS : FKDR_STEPS)
 };
