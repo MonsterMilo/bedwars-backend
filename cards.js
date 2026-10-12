@@ -69,6 +69,13 @@ function prestigeChars(starRaw) {
 const tierCode = (v, steps) => '7fae6cd'[steps.filter(s => (v || 0) >= s).length];
 const FKDR_STEPS = [1, 3, 5, 10, 20, 40];
 const WLR_STEPS = [0.5, 1, 2, 4, 8, 15];
+// The website's index (FKDR squared times stars) and its threat tiers:
+// Casual, Tryhard, Sweat, Demon, Final Boss.
+const INDEX_STEPS = [5e3, 5e4, 5e5, 5e6];
+const INDEX_COLORS = '7aec5';
+const indexColor = (t, v) => t.mc[INDEX_COLORS[INDEX_STEPS.filter(s => (v || 0) >= s).length]];
+// 1.2M, 340K, 8,512 - the website's short form.
+const fmtIndex = v => (v >= 1e6 ? `${(v / 1e6).toFixed(v >= 1e7 ? 0 : 1)}M` : v >= 1e4 ? `${Math.round(v / 1e3)}K` : Math.round(v || 0).toLocaleString('en-US'));
 
 // Initials for the small roster icons, the same as the website's.
 const INITIALS = { milo: 'M', potat: 'P', aballs: 'A', zoiv: 'Z', max: 'Mx', sqoz: 'Sq', kermit: 'Kr', ssent: 'Sn', key: 'Ky' };
@@ -546,9 +553,9 @@ function denickCard(themeId, data) {
 }
 
 // --- Weekly recap (posted to the Sweat Log every Sunday, and /recap) ---
-// data: { range, summary: [[value, label, delta?]...], scariest: { star, username, fkdr, wlr, bblr, beaten, skin, cheating, boosting },
+// data: { range, summary: [[value, label, delta?]...], scariest: { star, username, fkdr, wlr, index, beaten, skin, cheating, boosting },
 //         people: [[who, count]], also: [{ star, username, value, color, beaten }], footer, empty }
-// The scariest new sweat gets the big slot with their skin; who beat the
+// The scariest new sweat (highest index) gets the big slot with their skin; who beat the
 // most and the rest of the week's sweats share the right side.
 function recapCard(themeId, data) {
   const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
@@ -571,9 +578,9 @@ function recapCard(themeId, data) {
 
   const s = data.scariest;
   const flagColor = s.cheating ? t.cheating : s.boosting ? t.boosting : null;
-  const mini = (heading, v, steps) => h('div', { flexDirection: 'column', alignItems: 'center', flexGrow: 1, flexBasis: 0, padding: '8px 4px', background: t.track, borderRadius: t.chipRound ? 12 : (t.chipRadius || 0) },
+  const mini = (heading, shown, color) => h('div', { flexDirection: 'column', alignItems: 'center', flexGrow: 1, flexBasis: 0, padding: '8px 4px', background: t.track, borderRadius: t.chipRound ? 12 : (t.chipRadius || 0) },
     label(t, heading, { fontSize: size(t, 14), color: faint }),
-    text(fmt(v, 2), { fontFamily: t.font, fontSize: size(t, 30), fontWeight: 800, color: ratioColor(t, v, steps), lineHeight: 1, marginTop: 4, textShadow: shadow(ratioColor(t, v, steps)) }));
+    text(shown, { fontFamily: t.font, fontSize: size(t, 30), fontWeight: 800, color, lineHeight: 1, marginTop: 4, textShadow: shadow(color) }));
   const scariest = h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0, padding: '14px 18px', ...t.slot,
     ...(flagColor ? (t.chipBorder ? { border: `3px solid ${flagColor}` } : { borderColor: flagColor, borderWidth: 2 }) : {}) },
     label(t, 'Scariest new sweat', { color: faint }),
@@ -586,7 +593,7 @@ function recapCard(themeId, data) {
           s.cheating ? text('⚑', { fontFamily: 'Symbols', fontSize: 24, color: t.cheating }) : null,
           s.boosting ? text('⚠', { fontFamily: 'Symbols', fontSize: 24, color: t.boosting }) : null),
         text(s.username, { fontFamily: t.font, fontSize: size(t, 36), fontWeight: 800, color: plain, lineHeight: 1.2, marginTop: 6, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', textShadow: shadow(t.accent) }),
-        h('div', { gap: 8, marginTop: 12 }, mini('FKDR', s.fkdr, FKDR_STEPS), mini('WLR', s.wlr, WLR_STEPS), mini('BBLR', s.bblr, WLR_STEPS)),
+        h('div', { gap: 8, marginTop: 12 }, mini('Index', fmtIndex(s.index), indexColor(t, s.index)), mini('FKDR', fmt(s.fkdr, 2), ratioColor(t, s.fkdr, FKDR_STEPS)), mini('WLR', fmt(s.wlr, 2), ratioColor(t, s.wlr, WLR_STEPS))),
         h('div', { flexWrap: 'wrap', gap: 8, marginTop: 12, alignItems: 'center' },
           s.beaten && s.beaten.length ? s.beaten.map(f => chip(t, f, 18)) : text('Nobody yet', { fontFamily: t.body, fontSize: size(t, 20), color: faint })))));
 
@@ -680,5 +687,7 @@ async function render(tree, timing = {}) {
 
 module.exports = {
   THEMES, THEME_IDS, render, sweatCard, listCard, statsCard, leaderboardCard, denickCard, recapCard, statusCard,
+  fmtIndex,
+  indexColor: (themeId, v) => indexColor(theme(themeId), v),
   ratioColor: (themeId, v, kind) => ratioColor(theme(themeId), v, kind === 'wlr' ? WLR_STEPS : FKDR_STEPS)
 };
