@@ -57,7 +57,8 @@ module.exports = function setupStatus({
         const t0 = Date.now();
         try {
           const data = await bordicGet('/v2/convert/mojang', { player: PROBE_NAME }, TIMEOUT_MS);
-          if (!data || !data.id) return { state: 'down', detail: 'Answered, but with nothing' };
+          // Bordic answers { uuid, ign } (see resolvePlayer in server.js), not Mojang's { id }.
+          if (!data || !(data.uuid || data.id)) return { state: 'down', detail: 'Answered, but with nothing' };
           return timed(Date.now() - t0, 'Working');
         } catch (err) {
           return { state: 'down', detail: statusOf(err) ? `Error ${statusOf(err)}` : 'Not answering', log: describeAxiosError(err) };
