@@ -321,10 +321,45 @@ function nameBar(t, star, name, flagColor, right) {
 const fmt = (n, d = 0) => (Number.isFinite(n) && n !== 0 ? n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—');
 const ratioColor = (t, v, steps) => t.mc[tierCode(v, steps)];
 
+// --- Rivals (tryout) ---
+// Someone the roster has beaten in 2+ logged games. Each theme names and
+// dresses them its own way, the same as the website: a neon tag, a rubber
+// stamp, a claret bookmark, a hostile sonar contact, a Minecraft item
+// tooltip, and a restless grave. rival: { games, who: [{ key, n }] }
+const RIVAL_LOOK = {
+  neon: { word: 'Rival', font: 'Manrope', color: '#ff4fd8', box: { background: '#0a0d18', border: '2px solid #ff4fd8', borderRadius: 999 }, glow: '0 0 10px rgba(255,79,216,0.9)', icon: '⚔' },
+  casefiles: { word: 'Repeat offender', font: 'Anton', color: '#a32f1d', box: { border: '4px solid #a32f1d', transform: 'rotate(-3deg)', background: 'rgba(163,47,29,0.06)' }, size: 24 },
+  ledger: { word: 'Rival', font: 'Playfair', color: '#f0d28a', box: { background: 'linear-gradient(90deg, #5a121c, #9a2535 45%, #6a1622)', border: '2px solid #c9a24a' }, icon: '⚔', labelCase: 'none' },
+  deepcurrent: { word: 'Hostile', font: 'Chakra', color: '#ff5a5a', box: { background: 'rgba(30,6,12,0.92)', border: '2px solid rgba(255,90,90,0.7)', borderRadius: 6 }, glow: '0 0 8px rgba(255,90,90,0.7)', diamond: true },
+  skyisles: { word: 'Nemesis', font: 'Jersey', color: '#ff55ff', box: { background: '#100010', border: '3px solid #2a0960' }, glow: '2px 2px 0 #3f003f', icon: '⚔', size: 30, labelCase: 'none' },
+  hollowgrave: { word: 'Restless', font: 'Grenze', color: '#b8ff5c', box: { background: 'linear-gradient(180deg, #3a3544, #2a2632)', border: '2px solid #575066', borderRadius: 6 }, glow: '0 0 10px rgba(184,255,92,0.6)', icon: '✝' }
+};
+function rivalRow(t, rival) {
+  const look = RIVAL_LOOK[t.id] || RIVAL_LOOK.neon;
+  const px = size(t, look.size ? Math.round(look.size / (t.bigger || 1)) : 22);
+  const badge = h('div', { alignItems: 'center', gap: 9, padding: '6px 14px', flexShrink: 0, ...look.box },
+    look.icon ? text(look.icon, { fontFamily: 'Symbols', fontSize: Math.round(px * 0.8), color: look.color, textShadow: look.glow || 'none' }) : null,
+    look.diamond ? h('div', { width: 11, height: 11, border: `2px solid ${look.color}`, transform: 'rotate(45deg)', marginRight: 2 }) : null,
+    text(look.labelCase === 'none' ? look.word : look.word.toUpperCase(), {
+      fontFamily: look.font, fontSize: px, fontWeight: 700, color: look.color, lineHeight: 1,
+      letterSpacing: look.labelCase === 'none' ? 0.5 : 2, textShadow: look.glow || 'none'
+    }),
+    text(`×${rival.games}`, { fontFamily: look.font, fontSize: px, fontWeight: 700, color: look.color, lineHeight: 1, opacity: 0.85, marginLeft: 2, textShadow: look.glow || 'none' }));
+  const person = w => h('div', { alignItems: 'center', gap: 7 },
+    rosterIcons(t, [w.key], 26),
+    text(LABELS[w.key] || w.key, { fontFamily: t.body, fontSize: size(t, 21), fontWeight: 700, color: t.text, lineHeight: 1 }),
+    w.n > 1 ? text(`×${w.n}`, { fontFamily: t.font, fontSize: size(t, 21), fontWeight: 800, color: t.id === 'skyisles' ? '#aa00aa' : t.id === 'ledger' ? '#8a1f2b' : look.color, lineHeight: 1 }) : null);
+  return h('div', { alignItems: 'center', flexWrap: 'wrap', gap: 16, marginTop: 16 },
+    badge,
+    text(`Beaten in ${rival.games} games`, { fontFamily: t.body, fontSize: size(t, 22), fontWeight: 700, color: t.dim, lineHeight: 1 }),
+    h('div', { alignItems: 'center', flexWrap: 'wrap', gap: 14 }, rival.who.map(person)));
+}
+
 // --- The sweat card ---
 // opts: { skin (data URI), footer: [left, right], note: { text, by, count },
 //         line (extra line under the name, e.g. "Now known as …"),
-//         removedBy, preview (the /add preview) }
+//         removedBy, preview (the /add preview),
+//         rival: { games, who: [{ key, n }] } (see rivalRow) }
 function sweatCard(sweat, themeId, opts = {}) {
   const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
   const flagColor = opts.removedBy ? t.removed : sweat.cheating ? t.cheating : sweat.boosting ? t.boosting : null;
@@ -373,6 +408,7 @@ function sweatCard(sweat, themeId, opts = {}) {
     nameBar(t, sweat.star > 0 ? sweat.star : null, sweat.username, flagColor,
       opts.preview ? 'Preview' : (delta('star', 0) ? change(t, { ...delta('star', 0), text: String(Math.round(Math.abs(live.star - sweat.star))), star: true }, 28) : null)),
     opts.line ? text(opts.line, { fontFamily: t.body, fontSize: size(t, 22), fontWeight: 700, color: t.dim, marginTop: 12 }) : null,
+    opts.rival && !opts.removedBy ? rivalRow(t, opts.rival) : null,
     h('div', { marginTop: 18, gap: 22 }, skin, stats),
     note);
 
