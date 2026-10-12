@@ -628,6 +628,21 @@ function requireAdminKey(req, res, next) {
 const NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
 const UUID_RE = /^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Today's calendar date (YYYY-MM-DD) in US Eastern time, where the roster
+// plays. Used when a sweat arrives without its own date, so one added after
+// 8pm Eastern isn't stamped with tomorrow's UTC date.
+const todayUS = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+// A sweat for the same player added in the last 24 hours, if any - the same
+// window the bot's /add uses for "already added today".
+async function recentDuplicate(uuid, username) {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const plain = uuid ? uuid.replace(/-/g, '').toLowerCase() : null;
+  const who = plain
+    ? { uuid: { $in: [plain, plain.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5'), uuid] } }
+    : { username: new RegExp(`^${username}$`, 'i') };
+  return Sweat.findOne({ ...LIVE, ...who, createdAt: { $gte: since } }, { addedBy: 1, username: 1, createdAt: 1 })
+    .sort({ createdAt: -1 }).lean();
+}
 const STAT_MAX = 1e9;
 function checkParam(name, re, label) {
   return (req, res, next) => (re.test(String(req.params[name] || ''))
@@ -835,7 +850,7 @@ const denick = require('./denick')({
 const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS
 });
 
 // --- Sweats API: shared DB ---
@@ -953,7 +968,19 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
 
     const dateAdded = typeof body.dateAdded === 'string' && DATE_RE.test(body.dateAdded)
       ? body.dateAdded
-      : new Date().toISOString().slice(0, 10);
+      : todayUS();
+    // The website asks to be warned about a same-day duplicate; it then
+    // resends with confirmDuplicate once the person clicks "Add anyway".
+    // Other callers (the tracker plugin) are unaffected.
+    if (body.warnDuplicate === true && body.confirmDuplicate !== true) {
+      const dup = await recentDuplicate(uuid, username);
+      if (dup) {
+        return res.status(409).json({
+          error: `${dup.username} was already added today`,
+          duplicate: { username: dup.username, addedBy: dup.addedBy || null, createdAt: dup.createdAt }
+        });
+      }
+    }
     const fields = { username, uuid, dateAdded, addedBy: req.keyOwner };
     NUMERIC_FIELDS.forEach(f => { fields[f] = cleanStat(body[f]) ?? 0; });
     BOOLEAN_FIELDS.forEach(f => { fields[f] = !!body[f]; });

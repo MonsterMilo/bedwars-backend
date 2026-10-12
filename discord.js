@@ -101,7 +101,8 @@ const pct = (a, b) => (b ? `${Math.round(a / b * 100)}%` : '0%');
 // Stars the way Hypixel writes them: no thousands comma (1234✫).
 const stars = n => `${Math.floor(Number(n) || 0)}✫`;
 // "Sep 1, 2026" from the saved YYYY-MM-DD, or from when it was created.
-const day = d => (d && !isNaN(d) ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }) : 'a while ago');
+// Shown in US Eastern time (noon UTC on a saved date is still that day there).
+const day = d => (d && !isNaN(d) ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/New_York' }) : 'a while ago');
 const addedOn = s => day(s.dateAdded ? new Date(`${s.dateAdded}T12:00:00Z`) : (s.createdAt ? new Date(s.createdAt) : null));
 // "3 days ago" (cards are images, so Discord's own timestamps can't be used).
 function ago(date) {
@@ -177,7 +178,7 @@ const DiscordPref = mongoose.models.DiscordPref || mongoose.model('DiscordPref',
 module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -765,7 +766,7 @@ module.exports = function setupDiscord({
     const recent = dupWindow(earlier);
     if (recent) return done(`**${p.player.username}** was just added${recent.addedBy ? ` by ${ROSTER_LABELS[recent.addedBy] || recent.addedBy}` : ''}, so they weren't added again.`);
 
-    const fields = { username: p.player.username, uuid: uuidForms(p.player.uuid)[0], dateAdded: new Date().toISOString().slice(0, 10) };
+    const fields = { username: p.player.username, uuid: uuidForms(p.player.uuid)[0], dateAdded: todayUS() };
     NUMERIC_FIELDS.forEach(f => { fields[f] = cleanStat(p.player.stats[f]) ?? 0; });
     BOOLEAN_FIELDS.forEach(f => { fields[f] = false; });
     p.beaten.forEach(f => { if (ROSTER_FIELDS.includes(f)) fields[f] = true; });
