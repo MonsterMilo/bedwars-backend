@@ -13,8 +13,10 @@
 
 const axios = require('axios');
 
+// Diamond Dome's denicking method died in Oct 2026, so its data is frozen
+// (/status shows its age as expected rather than stale).
 const SCRAPED_SOURCES = [
-  { name: 'Diamond Dome', url: 'https://gist.githubusercontent.com/MonsterMilo/169045d75d17d68a41d051bae056106d/raw/diamond-dome-nicks.json' },
+  { name: 'Diamond Dome', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/169045d75d17d68a41d051bae056106d/raw/diamond-dome-nicks.json' },
   { name: 'Tricktracker', url: 'https://gist.githubusercontent.com/MonsterMilo/f599b8b81224056ea42a436ece0be5ed/raw/tricktracker-nicks.json' }
 ];
 const SCRAPED_REFRESH_MS = 30 * 60 * 1000;
@@ -25,6 +27,7 @@ const SCRAPED_RETRY_MS = 60 * 1000; // after a failed load, before trying again
 function parseScraped(data) {
   const byNick = new Map();
   const byPlayer = new Map();
+  let newest = 0;
   for (const item of (Array.isArray(data && data.nicks) ? data.nicks : [])) {
     if (!Array.isArray(item)) continue;
     const [nick, rawOwners] = item;
@@ -36,6 +39,7 @@ function parseScraped(data) {
       }))
       .sort((a, b) => b.last - a.last);
     if (owners.length === 0) continue;
+    if (owners[0].last > newest) newest = owners[0].last;
     byNick.set(nick.toLowerCase(), { nick, owners });
     for (const o of owners) {
       const key = o.player.toLowerCase();
@@ -44,7 +48,7 @@ function parseScraped(data) {
     }
   }
   for (const list of byPlayer.values()) list.sort((a, b) => b.last - a.last);
-  return { byNick, byPlayer };
+  return { byNick, byPlayer, newest };
 }
 
 // One row per distinct keyField value; the newest wins, the others are
@@ -167,7 +171,18 @@ module.exports = function setupDenick({
     return Promise.all(scraped.map(loadScraped));
   }
 
-  return { search, warmUp };
+  // For /status: how much each gist holds and how new its newest sighting is.
+  const scrapedNames = () => scraped.map(s => s.name);
+  async function scrapedStatus(name) {
+    const source = scraped.find(s => s.name === name);
+    const data = await loadScraped(source);
+    return {
+      loaded: !!data, frozen: !!source.frozen, loadedAt: source.at || null,
+      nicks: data ? data.byNick.size : 0, newest: data ? data.newest : 0
+    };
+  }
+
+  return { search, warmUp, scrapedNames, scrapedStatus };
 };
 
 module.exports.parseScraped = parseScraped;

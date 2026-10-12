@@ -14,6 +14,9 @@
 //   /random [person]     a random sweat (read-only)
 //   /theme [theme]       pick your card theme (the website's six); the
 //                        Sweat Log channel always uses the default (Neon)
+//   /status              which sources work right now (Bordic, Hypixel key,
+//                        Urchin, Denicker, Bedlify, the denick gists,
+//                        MongoDB), with a [Check again] button
 //   /denick <name>       who is behind a nick (or a player's nicks) across
 //                        every denick source, like the website's Denicking
 //                        section; roster members only, same limits
@@ -211,7 +214,7 @@ const nyDay = d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric
 module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -606,6 +609,10 @@ module.exports = function setupDiscord({
     type: 1,
     options: [{ type: 3, name: 'week', description: 'Which week (default: this week so far)', required: false,
       choices: [{ name: 'This week so far', value: 'this' }, { name: 'Last week', value: 'last' }] }]
+  }, {
+    name: 'status',
+    description: 'Which sources work right now (Bordic, Urchin, Denicker, Bedlify, ...)',
+    type: 1
   }, {
     name: 'theme',
     description: 'Pick the look of the cards you get (the website\'s themes)',
@@ -1296,6 +1303,36 @@ module.exports = function setupDiscord({
     setInterval(weeklyRecapTick, 5 * 60 * 1000);
   }
 
+  // --- /status ---
+  // Read-only, anyone can use it. [Check again] (custom_id "ss:R") re-runs
+  // the checks if the last ones are over 30 seconds old (see status.js).
+  async function onStatus(interaction, res) {
+    const theme = themeOf(userOf(interaction));
+    return withCard(interaction, res, async () => statusMessage(await status.get(), theme));
+  }
+
+  async function onStatusRefresh(interaction, res) {
+    res.json({ type: DEFER_UPDATE });
+    const theme = themeOfMessage(interaction.message) || themeOf(userOf(interaction));
+    return editOriginal(interaction, await statusMessage(await status.get({ fresh: true }), theme))
+      .catch(() => {});
+  }
+
+  async function statusMessage(result, theme) {
+    const timing = {};
+    const png = await cards.render(cards.statusCard(theme, {
+      title: result.summary, overall: result.overall, sources: result.sources,
+      right: `Checked ${ago(result.checkedAt)}`,
+      footer: ['Bedwars Tracker', 'Rechecked every few minutes']
+    }), timing);
+    return {
+      png, kind: 'status', theme, timing,
+      components: [{ type: ROW, components: [
+        { type: BUTTON, style: STYLE.grey, label: 'Check again', emoji: { name: '🔄' }, custom_id: 'ss:R' }
+      ] }]
+    };
+  }
+
   // --- /theme ---
   // Saved per Discord account. Shows a preview: the same example player
   // drawn in that theme.
@@ -1335,6 +1372,7 @@ module.exports = function setupDiscord({
     if (customId.startsWith('lb:')) return onLeaderboardPage(interaction, res);
     if (customId.startsWith('dn:')) return onDenickPage(interaction, res);
     if (customId === 'st:W') return onStatsPick(interaction, res);
+    if (customId === 'ss:R') return onStatusRefresh(interaction, res);
     const addMatch = /^add:(beaten|flags|confirm|cancel):([0-9a-f]{12})$/.exec(customId);
     if (addMatch) return onAddInteraction(interaction, res, addMatch[1], addMatch[2]);
 
@@ -1513,7 +1551,7 @@ module.exports = function setupDiscord({
   // --- The endpoint Discord calls ---
   const COMMAND_HANDLERS = {
     sweat: onSweatCommand, add: onAdd, beaten: onBeaten, stats: onStats,
-    leaderboard: onLeaderboard, random: onRandom, theme: onTheme, denick: onDenick, recap: onRecap
+    leaderboard: onLeaderboard, random: onRandom, theme: onTheme, denick: onDenick, recap: onRecap, status: onStatus
   };
   app.post('/discord/interactions', async (req, res) => {
     if (!enabled) return res.status(503).json({ error: 'Discord bot not configured' });

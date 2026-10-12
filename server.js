@@ -425,6 +425,26 @@ async function bedlifySightings(param, value) {
   return sightings;
 }
 
+// For /status: one uncached Bedlify request, answered as { status } (or
+// { blockedFor } while its limit is used up, { error } if it didn't answer).
+// Respects and updates the same back-off as real searches.
+async function bedlifyPing() {
+  if (Date.now() < bedlifyBlockedUntil) return { blockedFor: bedlifyBlockedUntil - Date.now() };
+  try {
+    const res = await axios.get(`${BEDLIFY_BASE}/nick`, {
+      params: { nick: 'Technoblade', limit: 1 },
+      headers: { 'X-API-Key': BEDLIFY_API_KEY, Accept: 'application/json' },
+      timeout: 8_000,
+      validateStatus: () => true
+    });
+    const retryAfter = parseInt(res.headers['retry-after'], 10) || parseInt(res.headers['x-ratelimit-reset'], 10) || 60;
+    if (res.status === 429 || res.headers['x-ratelimit-remaining'] === '0') bedlifyBlockedUntil = Date.now() + retryAfter * 1000;
+    return { status: res.status };
+  } catch (err) {
+    return { status: 0, error: describeAxiosError(err) };
+  }
+}
+
 function describeAxiosError(err) {
   return err.response
     ? `${err.response.status} ${JSON.stringify(err.response.data)}`
@@ -847,10 +867,30 @@ const denick = require('./denick')({
   spendDenicker: owner => spendLimit(denickerStore, DENICKER_LIMIT, owner),
   spendBedlify: owner => spendLimit(bedlifyStore, BEDLIFY_LIMIT, owner)
 });
+// Which sources work right now: GET /status below and the bot's /status.
+const status = require('./status')({
+  mongoose, Sweat, LIVE, bordicGet, coralGet, denickerGet, bedlifyPing, denick, describeAxiosError,
+  hypixelKey: () => HYPIXEL_API_KEY,
+  urchinOn: () => !!URCHIN_KEY,
+  denickerOn: () => !!DENICKER_API_KEY,
+  bedlifyOn: () => !!BEDLIFY_API_KEY
+});
+// Public, like the site's other read routes: it only says what works, never
+// any keys. Answers are shared and kept for a few minutes (see status.js);
+// ?fresh=1 re-checks sooner.
+app.get('/status', proxyLimiter, async (req, res) => {
+  try {
+    return res.json(await status.get({ fresh: req.query.fresh === '1' }));
+  } catch (err) {
+    console.error('/status error', err);
+    return res.status(500).json({ error: 'Status check failed' });
+  }
+});
+
 const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status
 });
 
 // --- Sweats API: shared DB ---
