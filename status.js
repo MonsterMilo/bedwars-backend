@@ -136,8 +136,9 @@ module.exports = function setupStatus({
         if (!s.loaded) return { state: 'down', detail: 'Couldn\'t load the gist' };
         const newest = s.newest ? `newest sighting ${shortDate(s.newest)}` : 'no sightings';
         const nicks = `${s.nicks.toLocaleString('en-US')} nicks`;
-        // Diamond Dome stopped collecting in Oct 2026, so its age is expected.
-        if (s.frozen) return { state: 'ok', detail: `Frozen, ${nicks}, ${newest}` };
+        // A frozen dataset never gets newer, so its age isn't a problem:
+        // all that matters is that the nicks can still be fetched.
+        if (s.frozen) return s.nicks ? { state: 'ok', detail: `Frozen, ${nicks}` } : { state: 'down', detail: 'Loaded, but no nicks in it' };
         const age = s.newest ? Date.now() - s.newest : Infinity;
         if (age > 7 * DAY_MS) return { state: 'warn', detail: `Getting old: ${newest} (${ago(s.newest)})` };
         return { state: 'ok', detail: `${nicks}, ${newest} (${ago(s.newest)})` };
