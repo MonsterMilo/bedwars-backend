@@ -13,11 +13,12 @@
 
 const axios = require('axios');
 
-// Diamond Dome's denicking method died in Oct 2026, so its data is frozen
-// (/status shows its age as expected rather than stale).
+// Both scraped datasets are frozen for good (Milo, Oct 2026): Diamond
+// Dome's denicking method died and Tricktracker won't be updated again.
+// /status only checks that each still loads and has nicks, never its age.
 const SCRAPED_SOURCES = [
   { name: 'Diamond Dome', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/169045d75d17d68a41d051bae056106d/raw/diamond-dome-nicks.json' },
-  { name: 'Tricktracker', url: 'https://gist.githubusercontent.com/MonsterMilo/f599b8b81224056ea42a436ece0be5ed/raw/tricktracker-nicks.json' }
+  { name: 'Tricktracker', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/f599b8b81224056ea42a436ece0be5ed/raw/tricktracker-nicks.json' }
 ];
 const SCRAPED_REFRESH_MS = 30 * 60 * 1000;
 const SCRAPED_RETRY_MS = 60 * 1000; // after a failed load, before trying again
