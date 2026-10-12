@@ -613,6 +613,43 @@ function recapCard(themeId, data) {
       h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0 }, people, also)));
 }
 
+// --- The status card (/status) ---
+// data: { title, right, sources: [{ name, state, detail }], footer }
+// state: ok | warn | down | off (see status.js).
+const STATE_WORDS = { ok: 'Working', warn: 'Check', down: 'Down', off: 'Off' };
+function statusCard(themeId, data) {
+  const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
+  const colorOf = state => ({ ok: t.mc.a, warn: t.mc['6'], down: t.mc.c }[state] || t.mc['7']);
+  const plain = t.slotText || t.text;
+  const faint = t.slotLabel || t.dim;
+  const shadow = t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : 'none';
+  const overall = colorOf(data.overall);
+
+  const head = h('div', { alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar },
+    h('div', { alignItems: 'center', gap: 16, minWidth: 0, flexShrink: 1 },
+      h('div', { width: 22, height: 22, flexShrink: 0, background: overall, borderRadius: t.chipRound ? 999 : (t.chipRadius || 0), border: t.chipBorder || 'none' }),
+      h('div', { flexDirection: 'column', gap: 6, minWidth: 0 },
+        label(t, 'Status', { color: t.barDim || t.dim, fontSize: size(t, 16) }),
+        text(data.title, { fontFamily: t.title || t.font, fontSize: size(t, 38), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 }))),
+    data.right ? text(data.right, { fontFamily: t.body, fontSize: size(t, 20), fontWeight: 700, color: t.barDim || t.dim, flexShrink: 0 }) : null);
+
+  const row = r => {
+    const c = colorOf(r.state);
+    return h('div', {
+      alignItems: 'center', gap: 14, padding: '11px 16px', marginTop: 10, ...t.slot,
+      borderLeft: `6px solid ${c}`, overflow: 'hidden'
+    },
+      h('div', { flexDirection: 'column', flexGrow: 1, flexShrink: 1, minWidth: 0, gap: 5 },
+        text(r.name, { fontFamily: t.font, fontSize: size(t, 26), fontWeight: 800, color: plain, lineHeight: 1.15, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', textShadow: shadow }),
+        r.detail ? text(r.detail, { fontFamily: t.body, fontSize: size(t, 18), color: faint, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }) : null),
+      h('div', {
+        alignItems: 'center', padding: '5px 12px', flexShrink: 0, background: c,
+        borderRadius: t.chipRound ? 999 : (t.chipRadius || 0), border: t.chipBorder || 'none'
+      }, text(STATE_WORDS[r.state] || r.state, { fontFamily: t.label_, fontSize: size(t, 15), fontWeight: 700, color: t.chipText, letterSpacing: 1, textTransform: 'uppercase', lineHeight: 1, textShadow: t.chipShadow || 'none' })));
+  };
+  return frame(t, data.footer, head, h('div', { flexDirection: 'column', marginTop: 6 }, data.sources.map(row)));
+}
+
 // Finished cards are kept for a while: the same card asked for again (a
 // lookup repeated, a page flipped back, a redraw with nothing changed) is
 // sent straight away instead of drawn again. Keyed on everything that goes
@@ -642,6 +679,6 @@ async function render(tree, timing = {}) {
 }
 
 module.exports = {
-  THEMES, THEME_IDS, render, sweatCard, listCard, statsCard, leaderboardCard, denickCard, recapCard,
+  THEMES, THEME_IDS, render, sweatCard, listCard, statsCard, leaderboardCard, denickCard, recapCard, statusCard,
   ratioColor: (themeId, v, kind) => ratioColor(theme(themeId), v, kind === 'wlr' ? WLR_STEPS : FKDR_STEPS)
 };
