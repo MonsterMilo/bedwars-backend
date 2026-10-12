@@ -1200,8 +1200,8 @@ module.exports = function setupDiscord({
 
   // --- Weekly recap ---
   // One card for a window of time: how many sweats were logged, who beat
-  // the most of them, and the scariest new one (highest FKDR, each player
-  // counted once). full: a finished week, so it's compared with the one
+  // the most of them, and the scariest new one (highest index, the
+  // website's FKDR squared times stars; each player counted once). full: a finished week, so it's compared with the one
   // before.
   async function recapMessage(from, to, theme, full) {
     const keep = ['username', 'uuid', 'addedBy', 'createdAt', 'star', 'fkdr', 'wlr', 'bblr', 'cheating', 'boosting', ...ROSTER_FIELDS]
@@ -1212,8 +1212,9 @@ module.exports = function setupDiscord({
     ]);
     const key = sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
     const seen = new Set();
+    const index = sw => (Number(sw.fkdr) || 0) ** 2 * (Number(sw.star) || 0);
     const ranked = sweats
-      .sort((a, b) => (b.fkdr || 0) - (a.fkdr || 0) || (b.star || 0) - (a.star || 0))
+      .sort((a, b) => index(b) - index(a) || (b.fkdr || 0) - (a.fkdr || 0))
       .filter(sw => (seen.has(key(sw)) ? false : seen.add(key(sw))));
     const beatenCounts = Object.fromEntries(ROSTER_FIELDS.map(f => [f, sweats.filter(sw => sw[f]).length]));
     const people = ROSTER_FIELDS.filter(f => beatenCounts[f] > 0).sort((a, b) => beatenCounts[b] - beatenCounts[a]).slice(0, 5).map(f => [f, beatenCounts[f]]);
@@ -1239,15 +1240,15 @@ module.exports = function setupDiscord({
         [num(flagged), 'Flagged']
       ],
       scariest: top ? {
-        star: top.star, username: top.username, fkdr: top.fkdr, wlr: top.wlr, bblr: top.bblr,
+        star: top.star, username: top.username, fkdr: top.fkdr, wlr: top.wlr, index: index(top),
         cheating: top.cheating, boosting: top.boosting, skin,
         beaten: ROSTER_FIELDS.filter(f => sweats.some(sw => key(sw) === key(top) && sw[f]))
       } : null,
       people,
       also: ranked.slice(1, 5).map(sw => ({
         star: sw.star, username: sw.username,
-        value: Number.isFinite(sw.fkdr) && sw.fkdr > 0 ? `${sw.fkdr.toFixed(2)} FKDR` : '—',
-        color: cards.ratioColor(theme, sw.fkdr, 'fkdr')
+        value: index(sw) > 0 ? `${cards.fmtIndex(index(sw))} index` : '—',
+        color: cards.indexColor(theme, index(sw))
       })),
       empty: full ? 'Quiet week. Nobody new on the list.' : 'Nobody new on the list yet this week.',
       footer: [topLogger ? `Logged the most: ${ROSTER_LABELS[topLogger[0]] || topLogger[0]} (${topLogger[1]})` : 'Nothing logged', full ? 'Every Sunday · Sweat Log' : 'So far · full recap Sunday 8pm ET']
