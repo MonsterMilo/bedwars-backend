@@ -50,7 +50,9 @@ const ROSTER_LABELS = {
 const PING = 1, COMMAND = 2, COMPONENT = 3, AUTOCOMPLETE = 4, MODAL_SUBMIT = 5;
 const REPLY = 4, DEFER = 5, DEFER_UPDATE = 6, UPDATE = 7, CHOICES = 8, MODAL = 9, PONG = 1, EPHEMERAL = 64;
 const ROW = 1, BUTTON = 2, SELECT = 3, TEXT = 4;
-const STYLE = { blurple: 1, grey: 2, green: 3, red: 4 };
+const STYLE = { blurple: 1, grey: 2, green: 3, red: 4, link: 5 };
+// The website, for buttons that open a search there (its ?denick= link runs it on load).
+const WEBSITE_URL = (process.env.WEBSITE_URL || 'https://monstermilo.github.io/bedwars-frontend/').replace(/\/?$/, '/');
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // /leaderboard: what it can rank, and over which sweats.
@@ -960,12 +962,15 @@ module.exports = function setupDiscord({
       footer: [results.length ? 'Newest first' : '', pages > 1 ? `Page ${page + 1} of ${pages}` : 'Denick']
     }), timing);
     const id = (k, p) => `dn:${k}:${mode}:${p}:${query}`;
+    const site = { type: BUTTON, style: STYLE.link, label: 'Open on website',
+      url: `${WEBSITE_URL}?denick=${encodeURIComponent(query)}${mode === 'player' ? '&denickMode=player' : ''}` };
     const components = pages > 1 ? [{ type: ROW, components: [
       { type: BUTTON, style: STYLE.grey, label: '⏮', custom_id: id('f', 0), disabled: page === 0 },
       { type: BUTTON, style: STYLE.blurple, label: '◀ Prev', custom_id: id('p', Math.max(0, page - 1)), disabled: page === 0 },
       { type: BUTTON, style: STYLE.blurple, label: 'Next ▶', custom_id: id('n', Math.min(pages - 1, page + 1)), disabled: page >= pages - 1 },
-      { type: BUTTON, style: STYLE.grey, label: '⏭', custom_id: id('l', pages - 1), disabled: page >= pages - 1 }
-    ] }] : [];
+      { type: BUTTON, style: STYLE.grey, label: '⏭', custom_id: id('l', pages - 1), disabled: page >= pages - 1 },
+      site
+    ] }] : [{ type: ROW, components: [site] }];
     return { content: denickNote(found), png, kind: 'denick', theme, components, timing };
   }
 
