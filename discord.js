@@ -363,12 +363,17 @@ module.exports = function setupDiscord({
     const last = notes[notes.length - 1];
     const timing = {};
     const t0 = Date.now();
-    const [skin, live] = await Promise.all([skinFor(sweat.uuid), header.live && mode !== 'removed' ? liveStatsWithin(sweat.uuid) : null]);
+    const [skin, live, rival] = await Promise.all([
+      skinFor(sweat.uuid),
+      header.live && mode !== 'removed' ? liveStatsWithin(sweat.uuid) : null,
+      mode !== 'removed' ? rivalOf(sweat) : null
+    ]);
     timing.skinMs = Date.now() - t0;
     const png = await cards.render(cards.sweatCard(sweat, themeId, {
       skin, live,
       footer: live && header.footer ? [header.footer[0], '▲▼ since logged'] : header.footer,
       line: header.line,
+      rival,
       note: last && last.text ? { text: last.text, by: ROSTER_LABELS[last.author] || last.author, count: notes.length } : null,
       removedBy: mode === 'removed' ? (ROSTER_LABELS[sweat.deletedBy] || sweat.deletedBy || 'someone') : null
     }), timing);
@@ -437,6 +442,30 @@ module.exports = function setupDiscord({
       { type: BUTTON, style: STYLE.grey, label: `Entry ${nav.index + 1} of ${nav.total}`, custom_id: `sweat:entrypos:${nav.newerId || nav.olderId}`, disabled: true },
       arrow('Older ▶', nav.olderId, 'n')
     ] };
+  }
+
+  // Rivals (tryout): a player on the list from 2+ games, with how many times
+  // each person beat them, for the mark on their card. null otherwise, or
+  // if the lookup fails (the card just goes without it).
+  async function rivalOf(sweat) {
+    if (!sweat || !sweat._id) return null;
+    try {
+      const forms = uuidForms(sweat.uuid);
+      const filter = forms.length
+        ? { ...LIVE, uuid: { $in: forms } }
+        : { ...LIVE, username: new RegExp(`^${sweat.username}$`, 'i') };
+      const projection = Object.fromEntries(ROSTER_FIELDS.map(f => [f, 1]));
+      const all = await Sweat.find(filter, projection).lean();
+      if (all.length < 2) return null;
+      const who = ROSTER_FIELDS
+        .map(key => ({ key, n: all.filter(d => d[key]).length }))
+        .filter(w => w.n > 0)
+        .sort((a, b) => b.n - a.n);
+      return { games: all.length, who };
+    } catch (err) {
+      console.error('Rival lookup failed', err.message);
+      return null;
+    }
   }
 
   // Every live entry for the same player (by uuid, else by name), newest
