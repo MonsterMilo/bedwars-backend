@@ -589,13 +589,14 @@ function leaderboardCard(themeId, data) {
 //         footer, empty }
 // Two columns of five like /beaten, each row edged in its source's colour
 // (the website's Denicking rail: accent for Denicker, gold for Diamond
-// Dome, purple for Tricktracker, red for Bedlify).
+// Dome, purple for Tricktracker, red for Bedlify, Milo's own colour for
+// his answers to denick requests).
 function denickCard(themeId, data) {
   const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
   // Where the accent is itself gold (Private Bank, Hollow Grave), Denicker
   // takes the theme's blue so it can't be mistaken for Diamond Dome.
   const denickerColor = t.id === 'ledger' || t.id === 'hollowgrave' ? t.mc['9'] : t.accent;
-  const SOURCE_COLORS = { 'Denicker API': denickerColor, 'Diamond Dome': t.mc['6'], Tricktracker: t.mc['5'], Bedlify: t.mc.c };
+  const SOURCE_COLORS = { 'Denicker API': denickerColor, 'Diamond Dome': t.mc['6'], Tricktracker: t.mc['5'], Bedlify: t.mc.c, Milo: t.roster.milo };
   const sourceColor = s => SOURCE_COLORS[s] || t.dim;
   const plain = t.slotText || t.text;
   const faint = t.slotLabel || t.dim;
