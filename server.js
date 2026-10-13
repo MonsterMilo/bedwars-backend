@@ -931,7 +931,7 @@ const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
   NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status,
-  DenickRequest
+  DenickRequest, createDenickRequest
 });
 
 // What the site sees of a request (never Milo's DM ids).
@@ -940,40 +940,47 @@ const publicRequest = r => ({
   reply: r.reply, createdAt: r.createdAt, answeredAt: r.answeredAt
 });
 
+// Files a denick request for `by` (roster id or 'admin') and DMs Milo.
+// Shared by the website (POST below) and the bot's [Ask Milo] button on an
+// empty /denick. -> { status, error } or { status: 201, request }
+async function createDenickRequest(by, body) {
+  const nick = String((body && body.nick) || '').trim();
+  if (!NAME_RE.test(nick)) return { status: 400, error: 'Enter the nick (letters, numbers and _ only, up to 16).' };
+  const replay = String((body && body.replay) || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (replay.length > REPLAY_MAX_LENGTH) return { status: 400, error: `The replay can be at most ${REPLAY_MAX_LENGTH} characters.` };
+  const note = cleanNoteText(body && body.note);
+  if (note === null) return { status: 400, error: `The note can be at most ${NOTE_MAX_LENGTH} characters.` };
+  if (!discord.requestsOn()) return { status: 503, error: 'The bot can\'t reach Milo right now, so requests are off.' };
+
+  const nickLower = nick.toLowerCase();
+  if (await DenickRequest.exists({ by, nickLower, status: 'open' })) {
+    return { status: 409, error: `You already asked about ${nick}. Milo usually answers within a day.` };
+  }
+  if (!hasFullAccess(by)) {
+    const [open, today] = await Promise.all([
+      DenickRequest.countDocuments({ by, status: 'open' }),
+      DenickRequest.countDocuments({ by, createdAt: { $gt: new Date(Date.now() - DAY_MS) } })
+    ]);
+    if (open >= DENICK_REQUESTS_OPEN_MAX) return { status: 429, error: `You have ${open} requests waiting. Wait for Milo to answer one first.` };
+    if (today >= DENICK_REQUESTS_DAY_MAX) return { status: 429, error: `That's ${today} requests today, the most in a day. Try again tomorrow.` };
+  }
+
+  const doc = await DenickRequest.create({ nick, nickLower, replay, note: note || '', by });
+  try {
+    await discord.sendDenickRequest(doc.toObject());
+  } catch (err) {
+    console.error('Denick request: DM to Milo failed', describeAxiosError(err));
+    await DenickRequest.deleteOne({ _id: doc._id }).catch(() => {});
+    return { status: 502, error: 'Couldn\'t message Milo on Discord. Try again in a bit.' };
+  }
+  return { status: 201, request: publicRequest(doc.toObject()) };
+}
+
 // Send Milo a denick request. Any key; body { nick, replay?, note? }.
 app.post('/denick-requests', requireWriteKey, writeLimiter, async (req, res) => {
   try {
-    const nick = String((req.body && req.body.nick) || '').trim();
-    if (!NAME_RE.test(nick)) return res.status(400).json({ error: 'Enter the nick (letters, numbers and _ only, up to 16).' });
-    const replay = String((req.body && req.body.replay) || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
-    if (replay.length > REPLAY_MAX_LENGTH) return res.status(400).json({ error: `The replay can be at most ${REPLAY_MAX_LENGTH} characters.` });
-    const note = cleanNoteText(req.body && req.body.note);
-    if (note === null) return res.status(400).json({ error: `The note can be at most ${NOTE_MAX_LENGTH} characters.` });
-    if (!discord.requestsOn()) return res.status(503).json({ error: 'The bot can\'t reach Milo right now, so requests are off.' });
-
-    const by = req.keyOwner;
-    const nickLower = nick.toLowerCase();
-    if (await DenickRequest.exists({ by, nickLower, status: 'open' })) {
-      return res.status(409).json({ error: `You already asked about ${nick}. Milo will get back to you.` });
-    }
-    if (!hasFullAccess(by)) {
-      const [open, today] = await Promise.all([
-        DenickRequest.countDocuments({ by, status: 'open' }),
-        DenickRequest.countDocuments({ by, createdAt: { $gt: new Date(Date.now() - DAY_MS) } })
-      ]);
-      if (open >= DENICK_REQUESTS_OPEN_MAX) return res.status(429).json({ error: `You have ${open} requests waiting. Wait for Milo to answer one first.` });
-      if (today >= DENICK_REQUESTS_DAY_MAX) return res.status(429).json({ error: `That's ${today} requests today, the most in a day. Try again tomorrow.` });
-    }
-
-    const doc = await DenickRequest.create({ nick, nickLower, replay, note: note || '', by });
-    try {
-      await discord.sendDenickRequest(doc.toObject());
-    } catch (err) {
-      console.error('Denick request: DM to Milo failed', describeAxiosError(err));
-      await DenickRequest.deleteOne({ _id: doc._id }).catch(() => {});
-      return res.status(502).json({ error: 'Couldn\'t message Milo on Discord. Try again in a bit.' });
-    }
-    return res.status(201).json({ request: publicRequest(doc.toObject()) });
+    const out = await createDenickRequest(req.keyOwner, req.body);
+    return res.status(out.status).json(out.error ? { error: out.error } : { request: out.request });
   } catch (err) {
     console.error('POST /denick-requests error', err);
     return res.status(500).json({ error: 'Something went wrong on the server.' });
