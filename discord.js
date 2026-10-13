@@ -218,7 +218,7 @@ module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
   NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status,
-  DenickRequest
+  DenickRequest, createDenickRequest
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -1040,6 +1040,16 @@ module.exports = function setupDiscord({
       footer: [results.length ? 'Newest first' : '', pages > 1 ? `Page ${page + 1} of ${pages}` : 'Denick']
     }), timing);
     const id = (k, p) => `dn:${k}:${mode}:${p}:${query}`;
+    // Nothing anywhere for a nick: offer to ask Milo, like the website does.
+    if (!results.length && mode === 'nick' && !found.partial && !found.limitedUntil && requestsOn()) {
+      return {
+        content: '-# Not in the database yet. Milo can try to denick it by hand, and usually answers within a day.',
+        png, kind: 'denick', theme, timing,
+        components: [{ type: ROW, components: [
+          { type: BUTTON, style: STYLE.green, label: 'Ask Milo to denick it', emoji: { name: '🕵️' }, custom_id: `dq:ask:${query}` }
+        ] }]
+      };
+    }
     const components = pages > 1 ? [{ type: ROW, components: [
       { type: BUTTON, style: STYLE.grey, label: '⏮', custom_id: id('f', 0), disabled: page === 0 },
       { type: BUTTON, style: STYLE.blurple, label: '◀ Prev', custom_id: id('p', Math.max(0, page - 1)), disabled: page === 0 },
@@ -1408,6 +1418,7 @@ module.exports = function setupDiscord({
     if (customId === 'st:W') return onStatsPick(interaction, res);
     if (customId === 'ss:R') return onStatusRefresh(interaction, res);
     if (customId.startsWith('dr:')) return onDenickRequestInteraction(interaction, res);
+    if (customId.startsWith('dq:')) return onAskMilo(interaction, res);
     const addMatch = /^add:(beaten|flags|confirm|cancel):([0-9a-f]{12})$/.exec(customId);
     if (addMatch) return onAddInteraction(interaction, res, addMatch[1], addMatch[2]);
 
@@ -1661,6 +1672,38 @@ module.exports = function setupDiscord({
     if (changed) lines[0] = `**Update:** ${lines[0]}`;
     if (r.reply) lines.push(quote(r.reply));
     return lines.join('\n');
+  }
+
+  // [Ask Milo to denick it] under an empty /denick: a pop-up for the replay
+  // and a note, then the same request the website sends, from the clicker.
+  async function onAskMilo(interaction, res) {
+    const m = /^dq:(ask|form):([A-Za-z0-9_]{1,16})$/.exec(interaction.data.custom_id || '');
+    if (!m) return reply(res, 'That doesn\'t do anything any more.');
+    const [, step, nick] = m;
+    const who = roster.get(userOf(interaction));
+    if (!who) return reply(res, NOT_LINKED);
+    if (step === 'ask') {
+      return res.json({ type: MODAL, data: {
+        custom_id: `dq:form:${nick}`, title: `Ask Milo about ${nick}`.slice(0, 45),
+        components: [
+          { type: ROW, components: [{ type: TEXT, custom_id: 'replay', label: 'Replay ID or link (optional)', style: 1, required: false, max_length: 120 }] },
+          { type: ROW, components: [{ type: TEXT, custom_id: 'note', label: 'Note (optional)', style: 2, required: false, max_length: NOTE_MAX_LENGTH,
+            placeholder: 'Anything that helps, like when you played them' }] }
+        ]
+      } });
+    }
+    res.json({ type: DEFER, data: { flags: EPHEMERAL } });
+    const values = Object.fromEntries(formValues(interaction));
+    let out;
+    try {
+      out = await createDenickRequest(who, { nick, replay: values.replay, note: values.note });
+    } catch (err) {
+      console.error('Denick request from Discord failed', err);
+      out = { error: OOPS };
+    }
+    return editOriginal(interaction, { content: out.error
+      ? out.error
+      : `🕵️ Sent! Milo usually answers within a day, and the bot will DM you about **${nick}**.` });
   }
 
   async function onDenickRequestInteraction(interaction, res) {
