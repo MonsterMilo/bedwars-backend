@@ -858,6 +858,45 @@ async function currentStats(uuid) {
   return player ? bedwarsStats(player) : null;
 }
 
+// --- Denick requests ---
+// When a nick isn't in any database, a roster member can ask Milo to denick
+// it by hand: POST /denick-requests saves it and the bot DMs Milo with
+// [Found] [Possible] [Not found] buttons (see discord.js). His answer is
+// DMed back to whoever asked and shown in their "Your requests" list on the
+// site. A Found answer also turns up in later searches for that nick (or
+// that player), as the source "Milo".
+const DENICK_REQUEST_STATUSES = ['open', 'found', 'possible', 'notfound'];
+const DenickRequest = mongoose.model('DenickRequest', new mongoose.Schema({
+  nick: { type: String, required: true },
+  nickLower: { type: String, required: true, index: true },
+  replay: { type: String, default: '' },
+  note: { type: String, default: '' },
+  by: { type: String, required: true, index: true }, // roster id or 'admin'
+  status: { type: String, enum: DENICK_REQUEST_STATUSES, default: 'open' },
+  names: { type: [String], default: [] }, // Found: one name; Possible: a few
+  namesLower: { type: [String], default: [], index: true },
+  reply: { type: String, default: '' }, // Milo's note back
+  answeredAt: { type: Date, default: null },
+  notified: { type: Boolean, default: false }, // the asker got the answer by DM
+  dm: { type: mongoose.Schema.Types.Mixed, default: null } // { channelId, messageId } of Milo's copy
+}, { timestamps: true, versionKey: false }));
+// A personal key can have this many waiting at once, and send this many a
+// day. Milo and the admin key have no cap.
+const DENICK_REQUESTS_OPEN_MAX = 3;
+const DENICK_REQUESTS_DAY_MAX = 10;
+const REPLAY_MAX_LENGTH = 120;
+
+// Found answers as denick entries, for the website's search and /denick.
+async function manualDenicks(mode, query) {
+  const q = String(query || '').toLowerCase();
+  const docs = await DenickRequest.find(
+    { status: 'found', ...(mode === 'nick' ? { nickLower: q } : { namesLower: q }) },
+    { nick: 1, names: 1, answeredAt: 1 }).sort({ answeredAt: -1 }).limit(50).lean();
+  return docs.filter(d => d.names[0]).map(d => ({
+    username: d.names[0], nick: d.nick, updated: new Date(d.answeredAt).getTime() || 0, source: 'Milo'
+  }));
+}
+
 // --- Discord bot (see discord.js) ---
 // /denick runs the website's Denicking search server-side (see denick.js).
 const denick = require('./denick')({
@@ -865,7 +904,8 @@ const denick = require('./denick')({
   denickerOn: () => !!DENICKER_API_KEY,
   bedlifyOn: () => !!BEDLIFY_API_KEY,
   spendDenicker: owner => spendLimit(denickerStore, DENICKER_LIMIT, owner),
-  spendBedlify: owner => spendLimit(bedlifyStore, BEDLIFY_LIMIT, owner)
+  spendBedlify: owner => spendLimit(bedlifyStore, BEDLIFY_LIMIT, owner),
+  manualDenicks
 });
 // Which sources work right now: GET /status below and the bot's /status.
 const status = require('./status')({
@@ -890,7 +930,77 @@ app.get('/status', proxyLimiter, async (req, res) => {
 const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status,
+  DenickRequest
+});
+
+// What the site sees of a request (never Milo's DM ids).
+const publicRequest = r => ({
+  id: r._id, nick: r.nick, replay: r.replay, note: r.note, status: r.status, names: r.names,
+  reply: r.reply, createdAt: r.createdAt, answeredAt: r.answeredAt
+});
+
+// Send Milo a denick request. Any key; body { nick, replay?, note? }.
+app.post('/denick-requests', requireWriteKey, writeLimiter, async (req, res) => {
+  try {
+    const nick = String((req.body && req.body.nick) || '').trim();
+    if (!NAME_RE.test(nick)) return res.status(400).json({ error: 'Enter the nick (letters, numbers and _ only, up to 16).' });
+    const replay = String((req.body && req.body.replay) || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    if (replay.length > REPLAY_MAX_LENGTH) return res.status(400).json({ error: `The replay can be at most ${REPLAY_MAX_LENGTH} characters.` });
+    const note = cleanNoteText(req.body && req.body.note);
+    if (note === null) return res.status(400).json({ error: `The note can be at most ${NOTE_MAX_LENGTH} characters.` });
+    if (!discord.requestsOn()) return res.status(503).json({ error: 'The bot can\'t reach Milo right now, so requests are off.' });
+
+    const by = req.keyOwner;
+    const nickLower = nick.toLowerCase();
+    if (await DenickRequest.exists({ by, nickLower, status: 'open' })) {
+      return res.status(409).json({ error: `You already asked about ${nick}. Milo will get back to you.` });
+    }
+    if (!hasFullAccess(by)) {
+      const [open, today] = await Promise.all([
+        DenickRequest.countDocuments({ by, status: 'open' }),
+        DenickRequest.countDocuments({ by, createdAt: { $gt: new Date(Date.now() - DAY_MS) } })
+      ]);
+      if (open >= DENICK_REQUESTS_OPEN_MAX) return res.status(429).json({ error: `You have ${open} requests waiting. Wait for Milo to answer one first.` });
+      if (today >= DENICK_REQUESTS_DAY_MAX) return res.status(429).json({ error: `That's ${today} requests today, the most in a day. Try again tomorrow.` });
+    }
+
+    const doc = await DenickRequest.create({ nick, nickLower, replay, note: note || '', by });
+    try {
+      await discord.sendDenickRequest(doc.toObject());
+    } catch (err) {
+      console.error('Denick request: DM to Milo failed', describeAxiosError(err));
+      await DenickRequest.deleteOne({ _id: doc._id }).catch(() => {});
+      return res.status(502).json({ error: 'Couldn\'t message Milo on Discord. Try again in a bit.' });
+    }
+    return res.status(201).json({ request: publicRequest(doc.toObject()) });
+  } catch (err) {
+    console.error('POST /denick-requests error', err);
+    return res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// The key's own requests, newest first, with Milo's answers.
+app.get('/denick-requests/mine', requireWriteKey, proxyLimiter, async (req, res) => {
+  try {
+    const docs = await DenickRequest.find({ by: req.keyOwner }).sort({ createdAt: -1 }).limit(20).lean();
+    return res.json({ requests: docs.map(publicRequest), on: discord.requestsOn() });
+  } catch (err) {
+    console.error('GET /denick-requests/mine error', err);
+    return res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// Milo's Found answers for a nick (mode "nick") or a player ("player"), as
+// denick entries. Same access as the other denick sources.
+app.get('/denick-requests/known/:mode/:name', validName('name'), requireKeyForDenicker, proxyLimiter, async (req, res) => {
+  if (!['nick', 'player'].includes(req.params.mode)) return res.status(404).json({ error: 'Not found' });
+  try {
+    return res.json({ success: true, entries: await manualDenicks(req.params.mode, req.params.name) });
+  } catch (err) {
+    console.error('GET /denick-requests/known error', err);
+    return res.status(500).json({ success: false, error: 'Something went wrong on the server.' });
+  }
 });
 
 // --- Sweats API: shared DB ---

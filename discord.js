@@ -20,6 +20,9 @@
 //   /denick <name>       who is behind a nick (or a player's nicks) across
 //                        every denick source, like the website's Denicking
 //                        section; roster members only, same limits
+//   denick requests      the website's "Ask Milo" form DMs Milo a nick to
+//                        denick by hand, with Found / Possible / Not found
+//                        buttons; his answer is DMed back to whoever asked
 //   /recap [week]        the weekly recap card (this week so far, or last
 //                        week). The bot also posts it to the Sweat Log
 //                        channel every Sunday at 8pm New York time.
@@ -214,7 +217,8 @@ const nyDay = d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric
 module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
-  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status
+  NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status,
+  DenickRequest
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -1403,6 +1407,7 @@ module.exports = function setupDiscord({
     if (customId.startsWith('dn:')) return onDenickPage(interaction, res);
     if (customId === 'st:W') return onStatsPick(interaction, res);
     if (customId === 'ss:R') return onStatusRefresh(interaction, res);
+    if (customId.startsWith('dr:')) return onDenickRequestInteraction(interaction, res);
     const addMatch = /^add:(beaten|flags|confirm|cancel):([0-9a-f]{12})$/.exec(customId);
     if (addMatch) return onAddInteraction(interaction, res, addMatch[1], addMatch[2]);
 
@@ -1566,6 +1571,145 @@ module.exports = function setupDiscord({
     }
   }
 
+  // --- Denick requests ---
+  // The website's "Ask Milo" form (POST /denick-requests in server.js) lands
+  // here: the bot DMs Milo the nick, replay and note with three buttons.
+  //   [Found]     pop-up for the name (+ an optional note back)
+  //   [Possible]  pop-up for a few names (+ note)
+  //   [Not found] pop-up with just the optional note
+  // The answer is DMed to whoever asked (by their roster link) and shown on
+  // the site. The buttons stay, so Milo can change his answer later; the
+  // asker then gets the new one. Only Milo's own Discord account can answer.
+  const discordIdOf = who => [...roster].find(([, w]) => w === who)?.[0] || null;
+  const requestsOn = () => enabled && !!discordIdOf('milo');
+  const dmChannels = new Map(); // discord user id -> DM channel id
+  async function dmChannelOf(userId) {
+    if (dmChannels.has(userId)) return dmChannels.get(userId);
+    const r = await bot.post('/users/@me/channels', { recipient_id: userId });
+    dmChannels.set(userId, r.data.id);
+    return r.data.id;
+  }
+  const REQUEST_ANSWERS = {
+    found: { label: 'Found', style: STYLE.green, emoji: '🔓' },
+    possible: { label: 'Possible', style: STYLE.blurple, emoji: '🔍' },
+    notfound: { label: 'Not found', style: STYLE.red, emoji: '❌' }
+  };
+  const POSSIBLE_MAX = 10;
+  const quote = txt => String(txt).split('\n').map(l => `> ${l}`).join('\n');
+  // A Hypixel replay link as a link; anything else (usually the replay's id,
+  // for /replay) as copyable code.
+  const replayLine = replay => (/^https?:\/\/\S+$/i.test(replay) ? replay : `\`${replay.replace(/`/g, '')}\``);
+  const nameList = names => names.map(n => `**${n}**`).join(', ');
+  function answerLine(r) {
+    if (r.status === 'found') return `🔓 **Found:** ${nameList(r.names)}`;
+    if (r.status === 'possible') return `🔍 **Possibly:** ${nameList(r.names)}`;
+    if (r.status === 'notfound') return '❌ **Not found**';
+    return null;
+  }
+
+  function requestMessage(r) {
+    const lines = [
+      `🕵️ **Denick request** from **${ROSTER_LABELS[r.by] || r.by}**`,
+      `Nick: **${r.nick}**`,
+      `Replay: ${r.replay ? replayLine(r.replay) : 'none'}`
+    ];
+    if (r.note) lines.push(`Note:\n${quote(r.note)}`);
+    const answer = answerLine(r);
+    if (answer) {
+      lines.push('', `${answer}${r.reply ? `\n${quote(r.reply)}` : ''}`);
+      lines.push(r.notified ? `-# Sent to ${ROSTER_LABELS[r.by] || r.by}.` : `-# ${ROSTER_LABELS[r.by] || r.by} isn't linked on Discord, so they'll only see it on the website.`);
+    }
+    return {
+      content: lines.join('\n'),
+      components: [{ type: ROW, components: Object.entries(REQUEST_ANSWERS).map(([id, a]) => ({
+        type: BUTTON, style: answer ? STYLE.grey : a.style, label: answer ? `${a.label} (change)` : a.label,
+        emoji: { name: a.emoji }, custom_id: `dr:${id}:${r._id}`
+      })) }]
+    };
+  }
+
+  // Throws if Milo can't be messaged; server.js then drops the request.
+  async function sendDenickRequest(r) {
+    const channelId = await dmChannelOf(discordIdOf('milo'));
+    const msg = await send('post', `/channels/${channelId}/messages`, requestMessage(r));
+    await DenickRequest.updateOne({ _id: r._id }, { $set: { dm: { channelId, messageId: msg.data.id } } })
+      .catch(err => console.error('Denick request: saving the DM id failed', err.message));
+  }
+
+  function answerForm(kind, r) {
+    const note = { type: ROW, components: [{
+      type: TEXT, custom_id: 'reply', label: `Note to ${ROSTER_LABELS[r.by] || r.by} (optional)`, style: 2, required: false,
+      max_length: NOTE_MAX_LENGTH, value: r.reply || undefined
+    }] };
+    const names = kind === 'found'
+      ? { type: TEXT, custom_id: 'names', label: 'Who it is', style: 1, required: true, min_length: 1, max_length: 16,
+        placeholder: 'Minecraft username', value: r.status === 'found' ? r.names[0] : undefined }
+      : { type: TEXT, custom_id: 'names', label: `Who it might be (up to ${POSSIBLE_MAX})`, style: 2, required: true, max_length: 200,
+        placeholder: 'One per line, or separated by commas', value: r.status === 'possible' ? r.names.join('\n') : undefined };
+    return {
+      custom_id: `dr:${kind}form:${r._id}`,
+      title: `${REQUEST_ANSWERS[kind].label}: ${r.nick}`.slice(0, 45),
+      components: kind === 'notfound' ? [note] : [{ type: ROW, components: [names] }, note]
+    };
+  }
+
+  function answerDm(r, changed) {
+    const lines = [];
+    if (r.status === 'found') lines.push(`🔓 Milo denicked **${r.nick}**: it's ${nameList(r.names)}.`);
+    else if (r.status === 'possible') lines.push(`🔍 Milo looked into **${r.nick}**. It might be ${nameList(r.names)}.`);
+    else lines.push(`❌ Milo couldn't find who's behind **${r.nick}**.`);
+    if (changed) lines[0] = `**Update:** ${lines[0]}`;
+    if (r.reply) lines.push(quote(r.reply));
+    return lines.join('\n');
+  }
+
+  async function onDenickRequestInteraction(interaction, res) {
+    const m = /^dr:(found|possible|notfound)(form)?:([a-f0-9]{24})$/.exec(interaction.data.custom_id || '');
+    if (!m) return reply(res, 'That doesn\'t do anything any more.');
+    const [, kind, isForm, id] = m;
+    if (roster.get(userOf(interaction)) !== 'milo') return reply(res, 'Only Milo can answer denick requests.');
+    const r = await DenickRequest.findById(id).lean();
+    if (!r) return reply(res, 'That request is gone.');
+    if (!isForm) return res.json({ type: MODAL, data: answerForm(kind, r) });
+
+    const values = Object.fromEntries(formValues(interaction));
+    const replyText = cleanNoteText(values.reply);
+    if (replyText === null) return reply(res, `The note can be at most ${NOTE_MAX_LENGTH} characters.`);
+    let names = [];
+    if (kind !== 'notfound') {
+      names = [...new Set(String(values.names || '').split(/[\s,]+/).filter(Boolean))];
+      const bad = names.filter(n => !NAME_RE.test(n));
+      if (bad.length) return reply(res, `${bad.slice(0, 3).join(', ')} ${bad.length === 1 ? 'isn\'t a' : 'aren\'t'} valid Minecraft username${bad.length === 1 ? '' : 's'}. Nothing was sent.`);
+      if (!names.length) return reply(res, 'Enter at least one name. Nothing was sent.');
+      if (kind === 'found' && names.length > 1) return reply(res, 'Found takes one name. Use Possible for a few. Nothing was sent.');
+      if (names.length > POSSIBLE_MAX) return reply(res, `That's more than ${POSSIBLE_MAX} names. Nothing was sent.`);
+    }
+    res.json({ type: DEFER_UPDATE });
+
+    const changed = r.status !== 'open';
+    let updated = await DenickRequest.findOneAndUpdate({ _id: id }, { $set: {
+      status: kind, names, namesLower: names.map(n => n.toLowerCase()), reply: replyText || '', answeredAt: new Date()
+    } }, { new: true }).lean();
+    if (!updated) return followUp(interaction, 'That request is gone.');
+
+    // Tell whoever asked (not Milo answering his own).
+    let notified = updated.by === 'milo';
+    const askerId = updated.by === 'milo' ? null : discordIdOf(updated.by);
+    if (askerId) {
+      try {
+        const channelId = await dmChannelOf(askerId);
+        await bot.post(`/channels/${channelId}/messages`, { content: answerDm(updated, changed), allowed_mentions: { parse: [] } });
+        notified = true;
+      } catch (err) {
+        console.error('Denick request: DM to the asker failed', describeAxiosError(err));
+        followUp(interaction, `Saved, but the DM to ${ROSTER_LABELS[updated.by] || updated.by} didn't go through. They'll still see it on the website.`);
+      }
+    }
+    updated = { ...updated, notified };
+    await DenickRequest.updateOne({ _id: id }, { $set: { notified } }).catch(() => {});
+    return editOriginal(interaction, requestMessage(updated));
+  }
+
   // [[custom_id, value], ...] from a submitted pop-up form.
   function formValues(interaction) {
     return ((interaction.data && interaction.data.components) || [])
@@ -1612,5 +1756,5 @@ module.exports = function setupDiscord({
     }
   });
 
-  return { postNewSweat, refreshCard };
+  return { postNewSweat, refreshCard, sendDenickRequest, requestsOn };
 };
