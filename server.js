@@ -574,7 +574,9 @@ const LIVE = { deletedAt: null };
 // --- Activity log ---
 // One entry per change made with a key: who (roster id or 'admin'), what,
 // and on which sweat. Edits keep a before/after of each changed field; note
-// actions keep the note text. Only the admin key can read it (GET /activity).
+// actions keep the note text. Denick lookups (site and bot) are logged too,
+// with what was searched and what came back. Only the admin key can read it
+// (GET /activity).
 const activitySchema = new mongoose.Schema({
   at: { type: Date, default: Date.now, index: true },
   who: { type: String, index: true },
@@ -586,7 +588,14 @@ const activitySchema = new mongoose.Schema({
   noteId: mongoose.Schema.Types.ObjectId,
   noteText: String,
   noteBefore: String, // note.edit: the text before the edit
-  noteAuthor: String  // note.delete: who had written the removed note
+  noteAuthor: String, // note.delete: who had written the removed note
+  // denick.search only:
+  via: String,         // 'site' or 'bot'
+  mode: String,        // 'nick' (who used it) or 'player' (a player's nicks)
+  query: String,       // the nick or player searched
+  resultCount: Number,
+  found: mongoose.Schema.Types.Mixed, // up to DENICK_LOG_FOUND [{ name, source }], newest first
+  partial: Boolean     // part of the database didn't answer (or a limit was hit)
 });
 const Activity = mongoose.model('Activity', activitySchema);
 
@@ -627,6 +636,23 @@ function logActivity(req, action, sweat, extra = {}) {
     username: sweat.username,
     uuid: sweat.uuid,
     ...extra
+  }).catch(err => console.error('activity log write failed', err.message));
+}
+
+// One denick lookup, from the website or the bot's /denick. who: roster id,
+// 'admin', or 'guest' (a site visitor with no key). results: the merged,
+// newest-first rows (only the first few names are kept); count: how many
+// there were in all. Fire-and-forget.
+const DENICK_LOG_FOUND = 3;
+function logDenick(who, via, mode, query, results, count, partial) {
+  const rows = Array.isArray(results) ? results : [];
+  const found = rows.slice(0, DENICK_LOG_FOUND).map(r => ({
+    name: String((mode === 'nick' ? r.username : r.nick) || '').slice(0, 16),
+    source: String(r.source || '').slice(0, 30)
+  })).filter(r => NAME_RE.test(r.name));
+  Activity.create({
+    who, action: 'denick.search', via, mode, query,
+    resultCount: Math.max(rows.length, count || 0), found, partial: !!partial
   }).catch(err => console.error('activity log write failed', err.message));
 }
 
@@ -931,7 +957,7 @@ const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
   NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status,
-  DenickRequest, createDenickRequest
+  DenickRequest, createDenickRequest, logDenick
 });
 
 // What the site sees of a request (never Milo's DM ids).
@@ -1314,6 +1340,23 @@ app.delete('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (re
     console.error('/sweats/:id/notes DELETE error', err);
     return res.status(500).json({ error: 'DB delete error' });
   }
+});
+
+// The website reports each Denicking search here once it has merged every
+// source (the gists are read in the browser, so only it knows the full
+// answer). Anyone who can search can report; a visitor with no key is
+// logged as 'guest'. Body { mode, query, count, results: [{ username, nick,
+// source }] (first few), partial }.
+app.post('/activity/denick', proxyLimiter, (req, res) => {
+  const b = req.body || {};
+  const mode = b.mode === 'player' ? 'player' : 'nick';
+  const query = String(b.query || '').trim();
+  if (!NAME_RE.test(query)) return res.status(400).json({ error: 'Invalid name' });
+  const results = (Array.isArray(b.results) ? b.results : []).slice(0, DENICK_LOG_FOUND)
+    .filter(r => r && typeof r === 'object');
+  const count = Number.isInteger(b.count) ? Math.min(Math.max(b.count, 0), 10000) : 0;
+  logDenick(keyOwner(req) || 'guest', 'site', mode, query, results, count, b.partial);
+  return res.status(204).end();
 });
 
 // --- Activity log + restore (admin key only) ---

@@ -218,7 +218,7 @@ module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
   NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status,
-  DenickRequest, createDenickRequest
+  DenickRequest, createDenickRequest, logDenick = () => {}
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -993,6 +993,7 @@ module.exports = function setupDiscord({
     const theme = themeOf(userOf(interaction));
     return withCard(interaction, res, async () => {
       const found = await denickSearch(who, mode, name);
+      logDenick(who, 'bot', mode, name, found.results, found.results.length, found.partial || !!found.limitedUntil);
       return denickPage(found, 0, theme);
     });
   }
