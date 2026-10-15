@@ -125,7 +125,8 @@ module.exports = function setupStatus({
         const r = await bedlifyPing();
         if (r.blockedFor) return { state: 'warn', detail: `Limit used up, back in ${Math.ceil(r.blockedFor / 1000)}s` };
         if (r.status === 200 || r.status === 404) return timed(Date.now() - t0, 'Working');
-        if (r.status === 401 || r.status === 403) return { state: 'down', detail: 'Key rejected' };
+        if (r.needsPremium) return { state: 'down', detail: 'Needs a Bedlify Premium key', log: r.error };
+        if (r.status === 401 || r.status === 403) return { state: 'down', detail: 'Key rejected', log: r.error };
         if (r.status === 429) return { state: 'warn', detail: 'Rate limited' };
         return { state: 'down', detail: r.status ? `Error ${r.status}` : 'Not answering', log: r.error };
       }
