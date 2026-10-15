@@ -439,7 +439,11 @@ async function bedlifyPing() {
     });
     const retryAfter = parseInt(res.headers['retry-after'], 10) || parseInt(res.headers['x-ratelimit-reset'], 10) || 60;
     if (res.status === 429 || res.headers['x-ratelimit-remaining'] === '0') bedlifyBlockedUntil = Date.now() + retryAfter * 1000;
-    return { status: res.status };
+    // Bedlify moved /nick behind premium keys in 2026-10; say so plainly
+    // when its refusal mentions premium (or is a 402 Payment Required).
+    const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data || '');
+    const needsPremium = res.status === 402 || ((res.status === 401 || res.status === 403) && /premium/i.test(body));
+    return { status: res.status, needsPremium, error: res.status >= 400 ? `${res.status} ${body.slice(0, 200)}` : undefined };
   } catch (err) {
     return { status: 0, error: describeAxiosError(err) };
   }
