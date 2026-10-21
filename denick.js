@@ -122,7 +122,8 @@ module.exports = function setupDenick({
       const entries = (data && data.success && Array.isArray(data.nicks) ? data.nicks : []).map(n => ({
         username: n.username,
         nick: n.nick,
-        updated: typeof n.updated === 'number' ? n.updated : (Date.parse(n.updated) || 0),
+        // Milliseconds; a number this small can only be Unix seconds.
+        updated: typeof n.updated === 'number' ? (n.updated > 0 && n.updated < 1e11 ? n.updated * 1000 : n.updated) : (Date.parse(n.updated) || 0),
         source: 'Denicker API'
       })).filter(e => e.username && e.nick);
       return { entries };

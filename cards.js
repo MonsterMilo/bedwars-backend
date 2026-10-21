@@ -625,10 +625,13 @@ function denickCard(themeId, data) {
       h('div', { flexDirection: 'column', flexGrow: 1, flexShrink: 1, minWidth: 0, gap: 5 },
         h('div', { alignItems: 'center', justifyContent: 'space-between', gap: 8 },
           text(r.name, { fontFamily: t.font, fontSize: size(t, 27), fontWeight: 800, color: plain, lineHeight: 1.2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1, textShadow: shadow }),
-          r.current
-            ? h('div', { alignItems: 'center', padding: '4px 10px', background: t.accent, borderRadius: t.chipRound ? 999 : (t.chipRadius || 0), border: t.chipBorder || 'none', flexShrink: 0 },
-              text('Current', { fontFamily: t.label_, fontSize: size(t, 15), fontWeight: 700, color: t.chipText, letterSpacing: 1, textTransform: 'uppercase', lineHeight: 1 }))
-            : text(r.when || '', { fontFamily: t.body, fontSize: size(t, 18), fontWeight: 700, color: faint, flexShrink: 0 })),
+          // The current row keeps its time next to the chip, like the others.
+          h('div', { alignItems: 'center', gap: 10, flexShrink: 0 },
+            r.when ? text(r.when, { fontFamily: t.body, fontSize: size(t, 18), fontWeight: 700, color: faint, flexShrink: 0 }) : null,
+            r.current
+              ? h('div', { alignItems: 'center', padding: '4px 10px', background: t.accent, borderRadius: t.chipRound ? 999 : (t.chipRadius || 0), border: t.chipBorder || 'none', flexShrink: 0 },
+                text('Current', { fontFamily: t.label_, fontSize: size(t, 15), fontWeight: 700, color: t.chipText, letterSpacing: 1, textTransform: 'uppercase', lineHeight: 1 }))
+              : null)),
         h('div', { alignItems: 'center', gap: 6, minWidth: 0 },
           text(r.source, { fontFamily: t.label_, fontSize: size(t, 15), fontWeight: 700, color: c, letterSpacing: t.labelSpacing, textTransform: t.labelCase, flexShrink: 0, whiteSpace: 'nowrap', textShadow: t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.75)' : 'none' }),
           r.also && r.also.length ? text(`+ ${r.also.join(', ')}`, { fontFamily: t.body, fontSize: size(t, 16), fontWeight: 700, color: faint, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 1 }) : null),
