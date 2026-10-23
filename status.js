@@ -132,7 +132,7 @@ module.exports = function setupStatus({
       }
     },
     ...denick.scrapedNames().map(name => ({
-      id: name.toLowerCase().replace(/\W+/g, ''), name: `${name} data`,
+      id: denick.scrapedId(name), name: `${name} data`,
       async run() {
         const s = await denick.scrapedStatus(name);
         if (!s.loaded) return { state: 'down', detail: 'Couldn\'t load the gist' };
