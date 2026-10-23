@@ -5,7 +5,7 @@
 //     and /bedlify routes, counted against the same per-person limits
 //     (denickerLimiter / bedlifyLimiter in server.js share their stores
 //     with this), so a person's bot and website searches share one budget.
-//   - Diamond Dome and Tricktracker, from the same public gists the website
+//   - Diamond Dome, Tricktracker and Observer, from the same public gists the website
 //     reads, kept in memory and refreshed every 30 minutes.
 //   - Milo's own answers to denick requests (Found ones), as "Milo".
 // Every source counts the same: one row per player (or per nick), and the
@@ -17,9 +17,13 @@ const axios = require('axios');
 // Both scraped datasets are frozen for good (Milo, Oct 2026): Diamond
 // Dome's denicking method died and Tricktracker won't be updated again.
 // /status only checks that each still loads and has nicks, never its age.
+// Observer (the #nicks channel of the "We scam and hack everyone" server,
+// added Oct 2026) is live: Milo refreshes it with his Refresh Observer
+// shortcut, and /status warns once its newest sighting gets old.
 const SCRAPED_SOURCES = [
   { name: 'Diamond Dome', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/169045d75d17d68a41d051bae056106d/raw/diamond-dome-nicks.json' },
-  { name: 'Tricktracker', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/f599b8b81224056ea42a436ece0be5ed/raw/tricktracker-nicks.json' }
+  { name: 'Tricktracker', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/f599b8b81224056ea42a436ece0be5ed/raw/tricktracker-nicks.json' },
+  { name: 'Observer', url: 'https://gist.githubusercontent.com/MonsterMilo/74fc374c134c5e09d5d79590fc7ed70f/raw/observer-nicks.json' }
 ];
 const SCRAPED_REFRESH_MS = 30 * 60 * 1000;
 const SCRAPED_RETRY_MS = 60 * 1000; // after a failed load, before trying again
