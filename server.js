@@ -961,7 +961,7 @@ app.post('/resolved-nicks', requireWriteKey, writeLimiter, async (req, res) => {
   const entries = list.filter(e => e && typeof e === 'object').map(e => ({
     nick: e.nick, player: e.player, source: e.source || 'Proxy', seenAt: e.seenAt || Date.now()
   }));
-  const changed = await resolved.record(entries);
+  const changed = await resolved.record(entries, { inGame: true });
   return res.json({ ok: true, changed });
 });
 

@@ -139,8 +139,12 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
 
   // --- Recording ---
   // entries: [{ nick, player, source, seenAt }]. quiet: save without posting.
+  // inGame: the proxy saw it in Milo's game - a pair that was only ever
+  // saved quietly (a gist's first load, or let go as old backlog) is posted
+  // then, once (Milo 2026-10-26: fkms = MegaCrafting showed in game but never
+  // reached the channel).
   // -> how many rows changed. Never rejects.
-  function record(entries, { quiet = false } = {}) {
+  function record(entries, { quiet = false, inGame = false } = {}) {
     const clean = (Array.isArray(entries) ? entries : [])
       .filter(e => e && NAME_RE.test(String(e.nick || '')) && NAME_RE.test(String(e.player || '')))
       .map(e => ({
@@ -175,6 +179,10 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
             touched = true;
           } else if (e.source !== row.source && !row.alsoIn.includes(e.source)) {
             row.alsoIn.push(e.source);
+            touched = true;
+          }
+          if (inGame && !quiet && !row.messageId && !row.needsPost) {
+            row.needsPost = true;
             touched = true;
           }
           if (touched) changed.set(key, row);
