@@ -945,6 +945,9 @@ const status = require('./status')({
   denickerOn: () => !!DENICKER_API_KEY,
   bedlifyOn: () => !!BEDLIFY_API_KEY
 });
+// Recorded games for tracked players (see replays.js): stored in Backblaze B2.
+const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, UUID_RE, NAME_RE });
+
 // Public, like the site's other read routes: it only says what works, never
 // any keys. Answers are shared and kept for a few minutes (see status.js);
 // ?fresh=1 re-checks sooner.
