@@ -1,4 +1,4 @@
-// --- Sweat Log image cards ---
+// --- Prism bot image cards ---
 // Every bot reply is drawn as a PNG in one of the website's six themes.
 // satori lays a card out from a tree of divs with CSS-like styles (see h()
 // below) and gives an SVG; resvg turns that into a PNG. The layouts are
@@ -656,7 +656,7 @@ function recapCard(themeId, data) {
   const shadow = c => (t.id === 'skyisles' ? '2px 2px 0 rgba(0,0,0,0.4)' : t.glow(c));
   const head = h('div', { alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', ...t.bar },
     h('div', { flexDirection: 'column', gap: 6 },
-      label(t, 'Sweat Log', { color: t.barDim || t.dim, fontSize: size(t, 16) }),
+      label(t, 'Prism', { color: t.barDim || t.dim, fontSize: size(t, 16) }),
       text('Weekly recap', { fontFamily: t.title || t.font, fontSize: size(t, 40), fontWeight: 800, color: t.barText || t.name, textShadow: t.nameShadow, lineHeight: 1 })),
     text(data.range, { fontFamily: t.body, fontSize: size(t, 24), fontWeight: 700, color: t.barDim || t.dim }));
   const summary = h('div', { gap: 14, marginTop: 16 },
