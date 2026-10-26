@@ -937,7 +937,18 @@ async function manualDenicks(mode, query) {
 // the resolved nicks channel. Fed by denickerGet, bedlifySightings, the
 // gists (onScraped below), Milo's Found answers (discord.js) and the proxy.
 const resolved = require('./resolved')({ mongoose });
-mongoose.connection.once('open', () => resolved.start());
+mongoose.connection.once('open', () => {
+  resolved.start();
+  // Milo's export of the Denicker Discord's #database channel (Oct 2026),
+  // in the gists' format: taken in quietly, never posted. Unchanged rows
+  // cost nothing, so it simply runs at every start.
+  try {
+    const data = require('./denick').parseScraped(require('./data/denicker-db-nicks.json'));
+    resolved.recordScraped({ name: 'Denicker DB', frozen: true }, data);
+  } catch (err) {
+    console.error('Resolved nicks: reading data/denicker-db-nicks.json failed', err.message);
+  }
+});
 
 // The proxy's Denick plugin sends what it resolves in game. Full-access keys
 // only (it runs on Milo's PC). Body { nicks: [{ nick, player, source,

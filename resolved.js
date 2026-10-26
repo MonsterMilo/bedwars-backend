@@ -226,8 +226,8 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
       for (const o of owners) entries.push({ nick, player: o.player, source: source.name, seenAt: o.last });
     }
     try {
-      const seen = source.frozen || await ResolvedImport.exists({ _id: source.name });
-      const n = await record(entries, { quiet: !seen });
+      const seen = !!(await ResolvedImport.exists({ _id: source.name }));
+      const n = await record(entries, { quiet: source.frozen || !seen });
       if (!seen) {
         await ResolvedImport.updateOne({ _id: source.name }, { $set: { at: new Date() } }, { upsert: true });
         console.log(`Resolved nicks: took in ${source.name} quietly (${n} rows changed)`);
@@ -251,8 +251,20 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
     return { generatedAt: now(), count: nicks.length, nicks };
   }
 
+  // One-off (Oct 2026): the first version posted the frozen gists' first
+  // load instead of taking it in quietly. Nothing had been posted yet (the
+  // channel wasn't set up), and Milo doesn't want old nicks posted, so
+  // anything still waiting from before this fix is let go.
+  async function clearFrozenBacklog() {
+    if (await ResolvedImport.exists({ _id: 'fix:frozen-backlog' })) return;
+    const res = await ResolvedNick.updateMany({ needsPost: true, messageId: null }, { $set: { needsPost: false, taken: false } });
+    for (const r of rows.values()) if (r.needsPost && !r.messageId) { r.needsPost = false; r.taken = false; }
+    await ResolvedImport.updateOne({ _id: 'fix:frozen-backlog' }, { $set: { at: new Date() } }, { upsert: true });
+    console.log(`Resolved nicks: let go of ${res.modifiedCount || 0} old waiting posts`);
+  }
+
   function start() {
-    load().then(retryWaiting).catch(err => console.error('Resolved nicks: loading failed', err.message));
+    load().then(() => queued(clearFrozenBacklog)).then(retryWaiting).catch(err => console.error('Resolved nicks: loading failed', err.message));
     const timer = setInterval(retryWaiting, RETRY_MS);
     if (timer.unref) timer.unref();
   }
