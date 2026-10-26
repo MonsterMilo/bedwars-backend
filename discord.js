@@ -39,6 +39,8 @@
 //   DISCORD_BOT_TOKEN   Bot > Reset Token
 //   DISCORD_CHANNEL_ID  the channel new sweats are posted to
 //   DISCORD_ROSTER      who's who: "milo:<discord user id>,potat:<id>,..."
+//   RESOLVED_NICKS_CHANNEL_ID  optional: the channel every resolved nick is
+//                       posted to once (see resolved.js)
 // Missing any of the first four just turns the bot off.
 
 const crypto = require('crypto');
@@ -218,7 +220,7 @@ module.exports = function setupDiscord({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
   NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status,
-  DenickRequest, createDenickRequest, logDenick = () => {}
+  DenickRequest, createDenickRequest, logDenick = () => {}, resolved = null
 }) {
   const APP_ID = process.env.DISCORD_APP_ID;
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -1735,6 +1737,8 @@ module.exports = function setupDiscord({
       status: kind, names, namesLower: names.map(n => n.toLowerCase()), reply: replyText || '', answeredAt: new Date()
     } }, { new: true }).lean();
     if (!updated) return followUp(interaction, 'That request is gone.');
+    // A Found answer is a resolved nick like any other (resolved.js).
+    if (kind === 'found' && resolved) resolved.record([{ nick: updated.nick, player: names[0], source: 'Milo', seenAt: Date.now() }]);
 
     // Tell whoever asked (not Milo answering his own).
     let notified = updated.by === 'milo';

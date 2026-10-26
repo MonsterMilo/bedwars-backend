@@ -342,6 +342,10 @@ async function denickerGet(params) {
     params: { ...params, sources: 'MANUAL_STARFISH', key: DENICKER_API_KEY },
     timeout: 8_000
   });
+  // Whatever it knows goes into the resolved nicks list (resolved.js).
+  if (res.data && res.data.success && Array.isArray(res.data.nicks)) {
+    resolved.record(res.data.nicks.map(n => ({ nick: n.nick, player: n.username, seenAt: n.updated, source: 'Denicker API' })));
+  }
   return res.data;
 }
 
@@ -422,6 +426,7 @@ async function bedlifySightings(param, value) {
   const sightings = [...pairs.values()].sort((a, b) => b.last - a.last);
   if (bedlifyCache.size >= BEDLIFY_CACHE_MAX) bedlifyCache.delete(bedlifyCache.keys().next().value);
   bedlifyCache.set(cacheKey, { at: Date.now(), sightings });
+  resolved.record(sightings.map(s => ({ nick: s.nick, player: s.player, seenAt: s.last, source: 'Bedlify' })));
   return sightings;
 }
 
@@ -927,6 +932,39 @@ async function manualDenicks(mode, query) {
   }));
 }
 
+// --- Resolved nicks (see resolved.js) ---
+// Every nick any source resolves, once, with whoever had it last, posted to
+// the resolved nicks channel. Fed by denickerGet, bedlifySightings, the
+// gists (onScraped below), Milo's Found answers (discord.js) and the proxy.
+const resolved = require('./resolved')({ mongoose });
+mongoose.connection.once('open', () => resolved.start());
+
+// The proxy's Denick plugin sends what it resolves in game. Full-access keys
+// only (it runs on Milo's PC). Body { nicks: [{ nick, player, source,
+// seenAt? (ms, defaults to now) }] }, up to RESOLVED_POST_MAX.
+const RESOLVED_POST_MAX = 50;
+app.post('/resolved-nicks', requireWriteKey, writeLimiter, async (req, res) => {
+  if (!hasFullAccess(req.keyOwner)) return res.status(403).json({ error: 'Only Milo\'s key can add resolved nicks' });
+  const list = Array.isArray(req.body && req.body.nicks) ? req.body.nicks : [];
+  if (!list.length || list.length > RESOLVED_POST_MAX) return res.status(400).json({ error: `Send 1 to ${RESOLVED_POST_MAX} nicks` });
+  const entries = list.filter(e => e && typeof e === 'object').map(e => ({
+    nick: e.nick, player: e.player, source: e.source || 'Proxy', seenAt: e.seenAt || Date.now()
+  }));
+  const changed = await resolved.record(entries);
+  return res.json({ ok: true, changed });
+});
+
+// The whole list in the gists' format, for the proxy and the site to read
+// in place of the gists later. Same access as the other denick sources.
+app.get('/resolved-nicks/export', requireKeyForDenicker, proxyLimiter, async (req, res) => {
+  try {
+    return res.json({ success: true, ...(await resolved.exportAll()) });
+  } catch (err) {
+    console.error('GET /resolved-nicks/export error', err);
+    return res.status(500).json({ success: false, error: 'Something went wrong on the server.' });
+  }
+});
+
 // --- Discord bot (see discord.js) ---
 // /denick runs the website's Denicking search server-side (see denick.js).
 const denick = require('./denick')({
@@ -935,7 +973,8 @@ const denick = require('./denick')({
   bedlifyOn: () => !!BEDLIFY_API_KEY,
   spendDenicker: owner => spendLimit(denickerStore, DENICKER_LIMIT, owner),
   spendBedlify: owner => spendLimit(bedlifyStore, BEDLIFY_LIMIT, owner),
-  manualDenicks
+  manualDenicks,
+  onScraped: (source, data) => resolved.recordScraped(source, data)
 });
 // Which sources work right now: GET /status below and the bot's /status.
 const status = require('./status')({
@@ -964,7 +1003,7 @@ const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
   NUMERIC_FIELDS, BOOLEAN_FIELDS, createSweat, lookupPlayerStats, resolvePlayer, currentStats, denick, todayUS, status,
-  DenickRequest, createDenickRequest, logDenick
+  DenickRequest, createDenickRequest, logDenick, resolved
 });
 
 // What the site sees of a request (never Milo's DM ids).
