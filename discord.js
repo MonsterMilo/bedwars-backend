@@ -1,4 +1,4 @@
-// --- Discord bot: Sweat Log ---
+// --- Discord bot: Prism (posts to the Sweat Log channel) ---
 // Every reply is an image card (see cards.js) in the theme of whoever asked,
 // with buttons and menus underneath:
 //   new sweats           posted to the Sweat Log channel, with an "Edit this
@@ -266,7 +266,7 @@ module.exports = function setupDiscord({
     if (skinsLoading.has(id)) return skinsLoading.get(id);
     const t0 = Date.now();
     const loading = axios.get(`https://visage.surgeplay.com/full/320/${id}`, {
-      responseType: 'arraybuffer', timeout: 5000, headers: { 'User-Agent': 'SweatLog/1.0' }
+      responseType: 'arraybuffer', timeout: 5000, headers: { 'User-Agent': 'Prism/1.0' }
     }).then(r => {
       const data = `data:image/png;base64,${Buffer.from(r.data).toString('base64')}`;
       if (skins.size > 300) skins.delete(skins.keys().next().value);
@@ -496,7 +496,7 @@ module.exports = function setupDiscord({
   // says when it was added and by whom.
   // Looked-up cards also show how the player's stats changed since then.
   const lookupHeader = (sweat, extra = {}) => ({
-    footer: [`Added ${addedOn(sweat)}${sweat.addedBy ? ` by ${ROSTER_LABELS[sweat.addedBy] || sweat.addedBy}` : ''}`, 'Sweat Log'],
+    footer: [`Added ${addedOn(sweat)}${sweat.addedBy ? ` by ${ROSTER_LABELS[sweat.addedBy] || sweat.addedBy}` : ''}`, 'Prism'],
     live: true,
     ...extra
   });
@@ -806,7 +806,7 @@ module.exports = function setupDiscord({
     const png = await cards.render(cards.sweatCard(sweat, p.theme, {
       skin,
       preview: true,
-      footer: ['Preview · not saved yet', 'Sweat Log'],
+      footer: ['Preview · not saved yet', 'Prism'],
       note: p.noteText ? { text: p.noteText, by: ROSTER_LABELS[p.who], count: 1 } : null
     }), timing);
     return {
@@ -922,7 +922,7 @@ module.exports = function setupDiscord({
     const png = await cards.render(cards.listCard(theme, {
       title: 'Beaten by', who: state.person, lines, rows,
       empty: filters.length ? 'Nobody matches those filters.' : 'Nobody yet.',
-      footer: [`Page ${page + 1} of ${pages}`, 'Sweat Log']
+      footer: [`Page ${page + 1} of ${pages}`, 'Prism']
     }), timing);
 
     const id = (k, p) => `bt:${k}:${p}:${state.person}:${sort.id}:${state.flag}:${state.minStar}:${state.minFkdr}:${state.name}`;
@@ -961,7 +961,7 @@ module.exports = function setupDiscord({
     const hit = faces.get(key);
     if (hit && Date.now() - hit.at < 60 * 60 * 1000) return Promise.resolve(hit.data);
     return axios.get(`https://mc-heads.net/avatar/${encodeURIComponent(name)}/64`, {
-      responseType: 'arraybuffer', timeout: 3000, headers: { 'User-Agent': 'SweatLog/1.0' }
+      responseType: 'arraybuffer', timeout: 3000, headers: { 'User-Agent': 'Prism/1.0' }
     }).then(r => {
       const data = `data:image/png;base64,${Buffer.from(r.data).toString('base64')}`;
       if (faces.size > 500) faces.delete(faces.keys().next().value);
@@ -1128,7 +1128,7 @@ module.exports = function setupDiscord({
         topFkdr && { star: topFkdr.star, username: topFkdr.username, value: `${topFkdr.fkdr.toFixed(2)} FKDR`, color: fk(topFkdr.fkdr) },
         topWlr && { star: topWlr.star, username: topWlr.username, value: `${topWlr.wlr.toFixed(2)} WLR`, color: wl(topWlr.wlr) }
       ].filter(Boolean),
-      footer: [dates.length ? `First sweat ${day(new Date(dates[0]))} · latest ${ago(dates[dates.length - 1])}` : 'No sweats yet', 'Sweat Log']
+      footer: [dates.length ? `First sweat ${day(new Date(dates[0]))} · latest ${ago(dates[dates.length - 1])}` : 'No sweats yet', 'Prism']
     }), timing);
     const components = [{ type: ROW, components: [{
       type: SELECT, custom_id: 'st:W', min_values: 1, max_values: 1,
@@ -1169,7 +1169,7 @@ module.exports = function setupDiscord({
       .reduce((o, f) => { o[f] = 1; return o; }, {});
     const sweats = await Sweat.find(filter, keep).lean();
     let pages = 1, page = 0;
-    const data = { title: board.title, right: period.name, footer: [`${plural(sweats.length, 'sweat')} counted`, 'Sweat Log'] };
+    const data = { title: board.title, right: period.name, footer: [`${plural(sweats.length, 'sweat')} counted`, 'Prism'] };
     if (board.kind === 'people') {
       // Sweats added with the admin key count as "Admin" for who logged most.
       const people = board.id === 'logged' ? [...ROSTER_FIELDS, 'admin'] : ROSTER_FIELDS;
@@ -1297,7 +1297,7 @@ module.exports = function setupDiscord({
         color: cards.indexColor(theme, index(sw))
       })),
       empty: full ? 'Quiet week. Nobody new on the list.' : 'Nobody new on the list yet this week.',
-      footer: [topLogger ? `Logged the most: ${ROSTER_LABELS[topLogger[0]] || topLogger[0]} (${topLogger[1]})` : 'Nothing logged', full ? 'Every Sunday · Sweat Log' : 'So far · full recap Sunday 8pm ET']
+      footer: [topLogger ? `Logged the most: ${ROSTER_LABELS[topLogger[0]] || topLogger[0]} (${topLogger[1]})` : 'Nothing logged', full ? 'Every Sunday · Prism' : 'So far · full recap Sunday 8pm ET']
     }), timing);
 
     // The text above the card says the headline in words too.
@@ -1459,7 +1459,7 @@ module.exports = function setupDiscord({
     const tracked = !!(sweat.discordPost && sweat.discordPost.messageId === msg.id);
     // A channel post keeps its footer and caption; a lookup gets its own.
     const headerFor = s => (tracked
-      ? { ...sweat.discordPost, footer: sweat.discordPost.footer || ['Sweat Log', addedOn(s)] }
+      ? { ...sweat.discordPost, footer: sweat.discordPost.footer || ['Prism', addedOn(s)] }
       : lookupHeader(s));
 
     // Answers "updating..." first (drawing takes a moment), then the card.
