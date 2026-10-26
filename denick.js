@@ -77,7 +77,7 @@ function mergeEntries(entries, keyField) {
 
 module.exports = function setupDenick({
   denickerGet, bedlifySightings, resolvePlayer, describeAxiosError,
-  denickerOn, bedlifyOn, spendDenicker, spendBedlify, manualDenicks, http = axios
+  denickerOn, bedlifyOn, spendDenicker, spendBedlify, manualDenicks, onScraped = () => {}, http = axios
 }) {
   // --- Scraped sources ---
   const scraped = SCRAPED_SOURCES.map(s => ({ ...s, data: null, at: 0, failedAt: 0, loading: null }));
@@ -93,6 +93,7 @@ module.exports = function setupDenick({
         source.data = parseScraped(body);
         source.at = Date.now();
         console.log(`Denick: ${source.name} loaded (${source.data.byNick.size} nicks)`);
+        onScraped(source, source.data); // into the resolved nicks list (resolved.js)
         return source.data;
       })
       .catch(err => {
