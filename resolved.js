@@ -58,7 +58,8 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     messageId: { type: String, default: null },
     needsPost: { type: Boolean, default: false, index: true },
     taken: { type: Boolean, default: false }, // the waiting post is a takeover ("was ...")
-    style: { type: Number, default: 1 }       // which look its message was drawn in (STYLE)
+    style: { type: Number, default: 1 },      // which look its message was drawn in (STYLE)
+    slot: { type: Number, default: 0 }        // its place among the embeds of a shared message
   }, { timestamps: true, versionKey: false }));
   // Which gists have been taken in once already.
   const ResolvedImport = mongoose.models.ResolvedImport || mongoose.model('ResolvedImport', new mongoose.Schema({
@@ -90,44 +91,50 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
   const queued = work => (chain = chain.then(work, work));
 
   // --- Discord ---
-  // The channel shows each player once, with their newest nick: one message
-  // per nick, and only the newest of a player's nicks has one (Milo, Oct
-  // 2026). Players are matched by uuid, so a renamed player is still the
-  // same player; every message links the uuid (looked up just before
-  // posting when no source gave it).
-  // Each nick is a small embed in its newest source's colour: the nick, who
-  // it is (linked to their NameMC page by uuid) with their head, where it
-  // was seen and when; the uuid sits quietly in the footer.
+  // The channel shows each player once, with their newest nick (Milo, Oct
+  // 2026): only the newest of a player's nicks is shown. Players are matched
+  // by uuid, so a renamed player is still the same player.
+  // Each nick is an embed in its newest source's colour (no reds or oranges,
+  // which read as "wrong"): the nick, who it is (linked to their NameMC page
+  // by uuid) with their head, where it was seen and when; the uuid sits
+  // quietly in the footer. New nicks get a message each; the catch-up packs
+  // 10 embeds into a message. A row's messageId can be shared by up to 10
+  // rows (slot = its place in that message); taking one out redraws the
+  // message without it, or deletes it once it's empty.
   const SOURCE_COLORS = {
-    'Denicker API': 0x55ffff, 'Denicker DB': 0x55ffff, 'Diamond Dome': 0xffaa00, Tricktracker: 0xaa00aa,
-    Bedlify: 0xff5555, Milo: 0xff55ff
+    'Denicker API': 0x55ffff, 'Denicker DB': 0x4fc3f7, 'Diamond Dome': 0x7c8cff, Tricktracker: 0xaa77ff,
+    Bedlify: 0xd17bff, Milo: 0xff55ff
   };
+  const OTHER_COLOR = 0x55ff99;
+  const PER_MESSAGE = 10; // Discord's most embeds in one message
   const stamp = ms => (ms ? `<t:${Math.floor(ms / 1000)}:R>` : 'a while ago');
   const playerLink = row => (row.uuid ? `[**${row.player}**](https://namemc.com/profile/${row.uuid})` : `**${row.player}**`);
-  function messageOf(row) {
+  function embedOf(row) {
     const was = row.taken && row.history[0];
     const lines = [`→ ${playerLink(row)}`];
     if (was) lines.push(`-# was ${was.player}`);
     const also = row.alsoIn.length ? ` · also ${row.alsoIn.join(', ')}` : '';
     lines.push(`-# ${row.source || 'Unknown'}${also} · seen ${stamp(row.seenAt)}`);
-    const embed = {
+    return {
       title: `${was ? '🔁' : '🔓'}  ${row.nick}`,
       description: lines.join('\n'),
-      color: SOURCE_COLORS[row.source] ?? 0x55ff55,
+      color: SOURCE_COLORS[row.source] ?? OTHER_COLOR,
       ...(row.uuid ? {
         thumbnail: { url: `https://visage.surgeplay.com/head/64/${row.uuid}` },
         footer: { text: row.uuid }
       } : {})
     };
-    return { content: '', embeds: [embed], allowed_mentions: { parse: [] } };
   }
+  const messageOf = list => ({ content: '', embeds: list.map(embedOf), allowed_mentions: { parse: [] } });
 
   const nameUuid = new Map(); // playerLower -> uuid, from rows that know it
   const keyOf = r => r.uuid || nameUuid.get(r.playerLower) || `n:${r.playerLower}`;
   const groupOf = row => { const k = keyOf(row); return [...rows.values()].filter(r => keyOf(r) === k); };
   const newestOf = group => group.reduce((a, b) => (b.seenAt > a.seenAt ? b : a));
+  const rowsIn = id => [...rows.values()].filter(r => r.messageId === id).sort((a, b) => (a.slot || 0) - (b.slot || 0));
   const save = (row, set) => ResolvedNick.updateOne({ nickLower: row.nickLower }, { $set: set });
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const ignore404 = err => { if (!err.response || err.response.status !== 404) throw err; };
 
   async function ensureUuid(row) {
     if (row.uuid || row.uuidTried || !resolvePlayer) return;
@@ -136,89 +143,101 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
       const id = String((p && p.id) || '').replace(/-/g, '').toLowerCase();
       if (UUID_RE.test(id)) row.uuid = id;
     } catch {
-      // Unknown name now (renamed since): posted without one.
+      // Unknown name now (renamed since): shown without one.
     }
     row.uuidTried = true;
     if (row.uuid) nameUuid.set(row.playerLower, row.uuid);
     await save(row, { uuid: row.uuid || null, uuidTried: true });
   }
-  async function deleteMessage(row) {
+  // Redraws a message from the rows still in it, or deletes it if none are.
+  async function redraw(id) {
+    const list = rowsIn(id);
+    if (!list.length) return bot.delete(`/channels/${CHANNEL_ID}/messages/${id}`).catch(ignore404);
+    for (const r of list) await ensureUuid(r);
+    await bot.patch(`/channels/${CHANNEL_ID}/messages/${id}`, messageOf(list)).catch(ignore404);
+    for (const r of list) if (r.style !== STYLE) { r.style = STYLE; await save(r, { style: STYLE }); }
+  }
+  async function takeOut(row) {
     const id = row.messageId;
     row.messageId = null;
     await save(row, { messageId: null });
-    await bot.delete(`/channels/${CHANNEL_ID}/messages/${id}`)
-      .catch(err => { if (!err.response || err.response.status !== 404) throw err; });
+    await sleep(POST_GAP_MS);
+    await redraw(id);
   }
 
-  // One job: 'post' (or re-post) a row, 'edit' a message drawn in an older
-  // look (adding its uuid), or 'delete' the message of a nick that isn't its
-  // player's newest.
-  // -> false when there was nothing to do.
-  async function runJob(kind, row) {
-    if (kind === 'edit') {
-      if (!row.messageId || row.style === STYLE) return false;
+  // Posts up to 10 rows as one message, then takes each one's old message
+  // and its player's older nicks out of theirs. Rows that aren't (or are no
+  // longer) their player's newest are dropped instead. -> false if nothing
+  // was sent.
+  async function postRows(list) {
+    const ready = [];
+    let sent = false;
+    for (const row of list) {
+      if (row.messageId && !row.needsPost) continue;
       await ensureUuid(row);
-      await bot.patch(`/channels/${CHANNEL_ID}/messages/${row.messageId}`, messageOf(row));
-      row.style = STYLE;
-      await save(row, { style: STYLE });
-      return true;
-    }
-    if (kind === 'delete') {
-      if (!row.messageId || newestOf(groupOf(row)) === row) return false;
-      await deleteMessage(row);
-      return true;
-    }
-    if (row.messageId && !row.needsPost) return false;
-    await ensureUuid(row);
-    const group = groupOf(row);
-    if (newestOf(group) !== row) {
+      if (newestOf(groupOf(row)) === row) { ready.push(row); continue; }
       // The player has a newer nick, which is the one shown.
       row.needsPost = false; row.taken = false;
       await save(row, { needsPost: false, taken: false });
-      if (!row.messageId) return false;
-      await deleteMessage(row);
-      return true;
+      if (row.messageId) { await takeOut(row); sent = true; }
     }
-    const old = row.messageId;
-    const r = await bot.post(`/channels/${CHANNEL_ID}/messages`, messageOf(row));
-    Object.assign(row, { messageId: r.data.id, needsPost: false, taken: false, style: STYLE });
-    await save(row, { messageId: row.messageId, needsPost: false, taken: false, style: STYLE });
-    // The nick's old message, and the player's older nicks, would now be wrong.
-    if (old) {
-      await sleep(POST_GAP_MS);
-      await bot.delete(`/channels/${CHANNEL_ID}/messages/${old}`)
-        .catch(err => { if (!err.response || err.response.status !== 404) console.warn('Resolved nicks: deleting an old message failed', err.message); });
+    if (!ready.length) return sent;
+    const r = await bot.post(`/channels/${CHANNEL_ID}/messages`, messageOf(ready));
+    const stale = new Set();
+    for (const [slot, row] of ready.entries()) {
+      if (row.messageId) stale.add(row.messageId);
+      Object.assign(row, { messageId: r.data.id, slot, needsPost: false, taken: false, style: STYLE });
+      await save(row, { messageId: row.messageId, slot, needsPost: false, taken: false, style: STYLE });
+      for (const other of groupOf(row)) {
+        if (other === row || !other.messageId) continue;
+        stale.add(other.messageId);
+        other.messageId = null;
+        await save(other, { messageId: null });
+      }
     }
-    for (const other of group) {
-      if (other === row || !other.messageId) continue;
+    for (const id of stale) {
       await sleep(POST_GAP_MS);
-      await deleteMessage(other).catch(err => console.warn('Resolved nicks: deleting an older nick\'s message failed', err.message));
+      await redraw(id).catch(err => console.warn('Resolved nicks: tidying an old message failed', err.message));
     }
     return true;
   }
 
-  // New nicks go first; the catch-up (backfill) runs in the gaps, slower.
+  // New nicks go first, one message each; the catch-up (backfill) runs in
+  // the gaps, slower. Backfill jobs: ['post', [nickLower x10]],
+  // ['redraw', messageId] (an older look) or ['out', nickLower] (not its
+  // player's newest any more).
   const posts = []; // nickLower, in order
-  let backfill = []; // [kind, nickLower]
+  let backfill = [];
   let posting = false;
   function schedulePost(nickLower) {
     if (!postingOn) return;
     if (!posts.includes(nickLower)) posts.push(nickLower);
     if (!posting) drain();
   }
+  async function runJob([kind, what]) {
+    if (kind === 'post') return postRows(what.map(k => rows.get(k)).filter(Boolean));
+    if (kind === 'redraw') {
+      const list = rowsIn(what);
+      if (!list.length || list.every(r => r.style === STYLE)) return false;
+      await redraw(what);
+      return true;
+    }
+    const row = rows.get(what);
+    if (!row || !row.messageId || newestOf(groupOf(row)) === row) return false;
+    await takeOut(row);
+    return true;
+  }
   async function drain() {
     posting = true;
     while (posts.length || backfill.length) {
       const live = posts.length > 0;
-      const [kind, key] = live ? ['post', posts.shift()] : backfill.shift();
-      const row = rows.get(key);
-      if (!row) continue;
+      const job = live ? ['post', [posts.shift()]] : backfill.shift();
       try {
-        if (!(await runJob(kind, row))) continue;
+        if (!(await runJob(job))) continue;
       } catch (err) {
-        console.warn(`Resolved nicks: ${kind} failed`, err.response ? err.response.status : err.message);
+        console.warn(`Resolved nicks: ${job[0]} failed`, err.response ? err.response.status : err.message);
         if (err.response && err.response.status === 429) {
-          if (live) posts.unshift(key); else backfill.unshift([kind, key]);
+          if (live) posts.unshift(job[1][0]); else backfill.unshift(job);
           await sleep((Number(err.response.data && err.response.data.retry_after) || 5) * 1000);
           continue;
         }
@@ -229,11 +248,10 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
   }
 
   // Works out what the channel is missing: every player's newest nick
-  // posted (oldest sighting first), old-look messages redrawn, and
-  // messages of nicks that aren't their player's newest any more removed.
-  // Runs at start and every few minutes; finished work drops out by itself.
-  function plan() {
-    if (!postingOn || backfill.length) return;
+  // posted (oldest sighting first, 10 to a message), older-look messages
+  // redrawn, and nicks that aren't their player's newest any more taken
+  // out. Runs at start and every few minutes; finished work drops out.
+  function counts() {
     nameUuid.clear();
     for (const r of rows.values()) if (r.uuid) nameUuid.set(r.playerLower, r.uuid);
     const groups = new Map();
@@ -242,23 +260,30 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
       if (!groups.has(k)) groups.set(k, []);
       groups.get(k).push(r);
     }
-    const deletes = [], edits = [], toPost = [];
+    const outs = [], redraws = new Set(), toPost = [];
     for (const group of groups.values()) {
       const newest = newestOf(group);
-      // Posting the newest removes the others itself, so the player is never
-      // left without a message while they wait their turn.
+      // Posting the newest takes the others out itself, so the player is
+      // never left without a message while they wait their turn.
       if (!newest.messageId || newest.needsPost) { toPost.push(newest); continue; }
-      if (newest.style !== STYLE) edits.push(newest);
-      for (const r of group) if (r !== newest && r.messageId) deletes.push(r);
+      if (newest.style !== STYLE) redraws.add(newest.messageId);
+      for (const r of group) if (r !== newest && r.messageId) outs.push(r);
     }
+    return { players: groups.size, nicks: rows.size, outs, redraws: [...redraws], toPost };
+  }
+  function plan() {
+    if (!postingOn || backfill.length) return;
+    const { outs, redraws, toPost } = counts();
     toPost.sort((a, b) => a.seenAt - b.seenAt);
+    const batches = [];
+    for (let i = 0; i < toPost.length; i += PER_MESSAGE) batches.push(toPost.slice(i, i + PER_MESSAGE).map(r => r.nickLower));
     backfill = [
-      ...deletes.map(r => ['delete', r.nickLower]),
-      ...edits.map(r => ['edit', r.nickLower]),
-      ...toPost.map(r => ['post', r.nickLower])
+      ...outs.map(r => ['out', r.nickLower]),
+      ...redraws.map(id => ['redraw', id]),
+      ...batches.map(b => ['post', b])
     ];
     if (backfill.length) {
-      console.log(`Resolved nicks: catching up ${toPost.length} posts, ${edits.length} redraws, ${deletes.length} removals`);
+      console.log(`Resolved nicks: catching up ${toPost.length} nicks in ${batches.length} messages, ${redraws.length} redraws, ${outs.length} take-outs`);
       if (!posting) drain();
     }
   }
@@ -408,7 +433,12 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     if (timer.unref) timer.unref();
   }
 
-  const stats = () => ({ nicks: rows.size, waiting: [...rows.values()].filter(r => r.needsPost).length, postingOn });
+  // For a "how many will it post" check: players, nicks, and what the
+  // catch-up still has to do.
+  const stats = () => {
+    const c = counts();
+    return { nicks: c.nicks, players: c.players, toPost: c.toPost.length, messages: Math.ceil(c.toPost.length / PER_MESSAGE), redraws: c.redraws.length, postingOn };
+  };
 
   return { record, recordScraped, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
 };
