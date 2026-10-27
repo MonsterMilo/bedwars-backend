@@ -28,6 +28,10 @@ const POST_GAP_MS = 1200; // Discord allows 5 messages per 5 seconds in a channe
 const BACKFILL_GAP_MS = 3000; // catching up on old nicks, slower than new ones
 const PLAN_MS = 10 * 60 * 1000; // how often the channel is checked for what it's missing
 const UUID_RE = /^[0-9a-f]{32}$/;
+// The catch-up only brings in nicks seen since this (Milo: "only nicks from
+// October"), and only once RESOLVED_NICKS_CATCHUP=on; until then it just
+// logs how much it would post.
+const CATCHUP_SINCE = Date.UTC(2026, 9, 1);
 const STYLE = 2; // messages in an older look (1: plain text) get redrawn
 
 // Milliseconds from whatever a source gives: ms, Unix seconds or a date string.
@@ -41,6 +45,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
   const CHANNEL_ID = process.env.RESOLVED_NICKS_CHANNEL_ID;
   const postingOn = !!(TOKEN && CHANNEL_ID);
+  const catchupOn = process.env.RESOLVED_NICKS_CATCHUP === 'on';
   const bot = http.create({ baseURL: API, timeout: 10000, headers: { Authorization: `Bot ${TOKEN}` } });
   if (!postingOn) console.warn('Resolved nicks: set RESOLVED_NICKS_CHANNEL_ID (and DISCORD_BOT_TOKEN) to post them to Discord. They\'re still saved.');
 
@@ -265,18 +270,27 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
       const newest = newestOf(group);
       // Posting the newest takes the others out itself, so the player is
       // never left without a message while they wait their turn.
-      if (!newest.messageId || newest.needsPost) { toPost.push(newest); continue; }
+      if (!newest.messageId || newest.needsPost) {
+        if (newest.needsPost || newest.seenAt >= CATCHUP_SINCE) toPost.push(newest);
+        continue;
+      }
       if (newest.style !== STYLE) redraws.add(newest.messageId);
       for (const r of group) if (r !== newest && r.messageId) outs.push(r);
     }
     return { players: groups.size, nicks: rows.size, outs, redraws: [...redraws], toPost };
   }
+  let lastOffLine = '';
   function plan() {
     if (!postingOn || backfill.length) return;
-    const { outs, redraws, toPost } = counts();
+    const { players, outs, redraws, toPost } = counts();
     toPost.sort((a, b) => a.seenAt - b.seenAt);
     const batches = [];
     for (let i = 0; i < toPost.length; i += PER_MESSAGE) batches.push(toPost.slice(i, i + PER_MESSAGE).map(r => r.nickLower));
+    if (!catchupOn) {
+      const line = `Resolved nicks: catch-up is off (RESOLVED_NICKS_CATCHUP=on starts it). It would post ${toPost.length} nicks in ${batches.length} messages (${players} players in all; only nicks seen since Oct 1), redraw ${redraws.length} and take out ${outs.length}.`;
+      if (line !== lastOffLine) console.log(lastOffLine = line);
+      return;
+    }
     backfill = [
       ...outs.map(r => ['out', r.nickLower]),
       ...redraws.map(id => ['redraw', id]),
