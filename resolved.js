@@ -13,10 +13,9 @@
 //   - a newer sighting of a different player takes the nick over: the old
 //     message is deleted and a new one says who has it now and who had it
 //   - an older sighting of a different player only goes in the history
-// Each gist's very first load (and every load of a frozen gist) is taken in
-// quietly, so the channel starts with what's new rather than 10k old nicks.
-// Pairs learned while the channel isn't set up yet wait and are posted once
-// it is. GET /resolved-nicks/export hands the whole list back in the gists'
+// The channel shows each player once, with their newest nick, linked to
+// their uuid. Gist loads are taken in quietly and caught up on slowly by
+// plan(), so new nicks are never stuck behind 10k old ones. GET /resolved-nicks/export hands the whole list back in the gists'
 // format, so the proxy and the site can read it in place of the gists later.
 
 const axios = require('axios');
@@ -26,8 +25,10 @@ const NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
 const SOURCE_RE = /^[A-Za-z0-9 _.'-]{1,30}$/;
 const HISTORY_MAX = 10;
 const POST_GAP_MS = 1200; // Discord allows 5 messages per 5 seconds in a channel
-const RETRY_MS = 10 * 60 * 1000; // waiting posts are tried again this often
-const RETRY_BATCH = 50;
+const BACKFILL_GAP_MS = 3000; // catching up on old nicks, slower than new ones
+const PLAN_MS = 10 * 60 * 1000; // how often the channel is checked for what it's missing
+const UUID_RE = /^[0-9a-f]{32}$/;
+const STYLE = 2; // messages in an older look (1: plain text) get redrawn
 
 // Milliseconds from whatever a source gives: ms, Unix seconds or a date string.
 function toMs(v) {
@@ -36,7 +37,7 @@ function toMs(v) {
   return Date.parse(v) || 0;
 }
 
-module.exports = function setupResolved({ mongoose, http = axios, now = Date.now }) {
+module.exports = function setupResolved({ mongoose, resolvePlayer = null, http = axios, now = Date.now }) {
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
   const CHANNEL_ID = process.env.RESOLVED_NICKS_CHANNEL_ID;
   const postingOn = !!(TOKEN && CHANNEL_ID);
@@ -48,13 +49,16 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
     nickLower: { type: String, required: true, unique: true },
     player: { type: String, required: true },
     playerLower: { type: String, required: true, index: true },
+    uuid: { type: String, default: null },        // the player's, without dashes
+    uuidTried: { type: Boolean, default: false }, // looked up by name already (found or not)
     source: { type: String, default: '' },  // where the newest sighting came from
     alsoIn: { type: [String], default: [] }, // other sources that know this pair
     seenAt: { type: Number, default: 0 },    // newest sighting, ms
     history: { type: [{ _id: false, player: String, source: String, seenAt: Number }], default: [] }, // earlier owners, newest first
     messageId: { type: String, default: null },
     needsPost: { type: Boolean, default: false, index: true },
-    taken: { type: Boolean, default: false } // the waiting post is a takeover ("was ...")
+    taken: { type: Boolean, default: false }, // the waiting post is a takeover ("was ...")
+    style: { type: Number, default: 1 }       // which look its message was drawn in (STYLE)
   }, { timestamps: true, versionKey: false }));
   // Which gists have been taken in once already.
   const ResolvedImport = mongoose.models.ResolvedImport || mongoose.model('ResolvedImport', new mongoose.Schema({
@@ -69,7 +73,10 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
     if (!loaded) {
       loaded = ResolvedNick.find({}).lean()
         .then(docs => {
-          docs.forEach(d => rows.set(d.nickLower, d));
+          docs.forEach(d => {
+            rows.set(d.nickLower, d);
+            if (d.uuid) nameUuid.set(d.playerLower, d.uuid);
+          });
           console.log(`Resolved nicks: ${docs.length} loaded`);
         })
         .catch(err => { loaded = null; throw err; });
@@ -83,17 +90,116 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
   const queued = work => (chain = chain.then(work, work));
 
   // --- Discord ---
+  // The channel shows each player once, with their newest nick: one message
+  // per nick, and only the newest of a player's nicks has one (Milo, Oct
+  // 2026). Players are matched by uuid, so a renamed player is still the
+  // same player; every message links the uuid (looked up just before
+  // posting when no source gave it).
+  // Each nick is a small embed in its newest source's colour: the nick, who
+  // it is (linked to their NameMC page by uuid) with their head, where it
+  // was seen and when; the uuid sits quietly in the footer.
+  const SOURCE_COLORS = {
+    'Denicker API': 0x55ffff, 'Denicker DB': 0x55ffff, 'Diamond Dome': 0xffaa00, Tricktracker: 0xaa00aa,
+    Bedlify: 0xff5555, Milo: 0xff55ff
+  };
   const stamp = ms => (ms ? `<t:${Math.floor(ms / 1000)}:R>` : 'a while ago');
+  const playerLink = row => (row.uuid ? `[**${row.player}**](https://namemc.com/profile/${row.uuid})` : `**${row.player}**`);
   function messageOf(row) {
-    const was = row.history[0];
-    const sources = [row.source, ...row.alsoIn].filter(Boolean);
-    const head = was && row.taken
-      ? `🔁 **${row.nick}** → **${row.player}** (was ${was.player})`
-      : `🔓 **${row.nick}** → **${row.player}**`;
-    return `${head}\n-# ${sources.join(' · ') || 'Unknown source'} · seen ${stamp(row.seenAt)}`;
+    const was = row.taken && row.history[0];
+    const lines = [`→ ${playerLink(row)}`];
+    if (was) lines.push(`-# was ${was.player}`);
+    const also = row.alsoIn.length ? ` · also ${row.alsoIn.join(', ')}` : '';
+    lines.push(`-# ${row.source || 'Unknown'}${also} · seen ${stamp(row.seenAt)}`);
+    const embed = {
+      title: `${was ? '🔁' : '🔓'}  ${row.nick}`,
+      description: lines.join('\n'),
+      color: SOURCE_COLORS[row.source] ?? 0x55ff55,
+      ...(row.uuid ? {
+        thumbnail: { url: `https://visage.surgeplay.com/head/64/${row.uuid}` },
+        footer: { text: row.uuid }
+      } : {})
+    };
+    return { content: '', embeds: [embed], allowed_mentions: { parse: [] } };
   }
 
+  const nameUuid = new Map(); // playerLower -> uuid, from rows that know it
+  const keyOf = r => r.uuid || nameUuid.get(r.playerLower) || `n:${r.playerLower}`;
+  const groupOf = row => { const k = keyOf(row); return [...rows.values()].filter(r => keyOf(r) === k); };
+  const newestOf = group => group.reduce((a, b) => (b.seenAt > a.seenAt ? b : a));
+  const save = (row, set) => ResolvedNick.updateOne({ nickLower: row.nickLower }, { $set: set });
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function ensureUuid(row) {
+    if (row.uuid || row.uuidTried || !resolvePlayer) return;
+    try {
+      const p = await resolvePlayer(row.player);
+      const id = String((p && p.id) || '').replace(/-/g, '').toLowerCase();
+      if (UUID_RE.test(id)) row.uuid = id;
+    } catch {
+      // Unknown name now (renamed since): posted without one.
+    }
+    row.uuidTried = true;
+    if (row.uuid) nameUuid.set(row.playerLower, row.uuid);
+    await save(row, { uuid: row.uuid || null, uuidTried: true });
+  }
+  async function deleteMessage(row) {
+    const id = row.messageId;
+    row.messageId = null;
+    await save(row, { messageId: null });
+    await bot.delete(`/channels/${CHANNEL_ID}/messages/${id}`)
+      .catch(err => { if (!err.response || err.response.status !== 404) throw err; });
+  }
+
+  // One job: 'post' (or re-post) a row, 'edit' a message drawn in an older
+  // look (adding its uuid), or 'delete' the message of a nick that isn't its
+  // player's newest.
+  // -> false when there was nothing to do.
+  async function runJob(kind, row) {
+    if (kind === 'edit') {
+      if (!row.messageId || row.style === STYLE) return false;
+      await ensureUuid(row);
+      await bot.patch(`/channels/${CHANNEL_ID}/messages/${row.messageId}`, messageOf(row));
+      row.style = STYLE;
+      await save(row, { style: STYLE });
+      return true;
+    }
+    if (kind === 'delete') {
+      if (!row.messageId || newestOf(groupOf(row)) === row) return false;
+      await deleteMessage(row);
+      return true;
+    }
+    if (row.messageId && !row.needsPost) return false;
+    await ensureUuid(row);
+    const group = groupOf(row);
+    if (newestOf(group) !== row) {
+      // The player has a newer nick, which is the one shown.
+      row.needsPost = false; row.taken = false;
+      await save(row, { needsPost: false, taken: false });
+      if (!row.messageId) return false;
+      await deleteMessage(row);
+      return true;
+    }
+    const old = row.messageId;
+    const r = await bot.post(`/channels/${CHANNEL_ID}/messages`, messageOf(row));
+    Object.assign(row, { messageId: r.data.id, needsPost: false, taken: false, style: STYLE });
+    await save(row, { messageId: row.messageId, needsPost: false, taken: false, style: STYLE });
+    // The nick's old message, and the player's older nicks, would now be wrong.
+    if (old) {
+      await sleep(POST_GAP_MS);
+      await bot.delete(`/channels/${CHANNEL_ID}/messages/${old}`)
+        .catch(err => { if (!err.response || err.response.status !== 404) console.warn('Resolved nicks: deleting an old message failed', err.message); });
+    }
+    for (const other of group) {
+      if (other === row || !other.messageId) continue;
+      await sleep(POST_GAP_MS);
+      await deleteMessage(other).catch(err => console.warn('Resolved nicks: deleting an older nick\'s message failed', err.message));
+    }
+    return true;
+  }
+
+  // New nicks go first; the catch-up (backfill) runs in the gaps, slower.
   const posts = []; // nickLower, in order
+  let backfill = []; // [kind, nickLower]
   let posting = false;
   function schedulePost(nickLower) {
     if (!postingOn) return;
@@ -102,43 +208,65 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
   }
   async function drain() {
     posting = true;
-    while (posts.length) {
-      const row = rows.get(posts.shift());
-      if (!row || !row.needsPost) continue;
+    while (posts.length || backfill.length) {
+      const live = posts.length > 0;
+      const [kind, key] = live ? ['post', posts.shift()] : backfill.shift();
+      const row = rows.get(key);
+      if (!row) continue;
       try {
-        const old = row.messageId;
-        const r = await bot.post(`/channels/${CHANNEL_ID}/messages`, { content: messageOf(row), allowed_mentions: { parse: [] } });
-        row.messageId = r.data.id;
-        row.needsPost = false;
-        row.taken = false;
-        await ResolvedNick.updateOne({ nickLower: row.nickLower }, { $set: { messageId: row.messageId, needsPost: false, taken: false } });
-        // The nick's old message would now be wrong: only the new one stays.
-        if (old) {
-          await new Promise(r => setTimeout(r, POST_GAP_MS));
-          await bot.delete(`/channels/${CHANNEL_ID}/messages/${old}`)
-            .catch(err => { if (!err.response || err.response.status !== 404) console.warn('Resolved nicks: deleting an old message failed', err.message); });
-        }
+        if (!(await runJob(kind, row))) continue;
       } catch (err) {
-        // Left as needsPost; the retry timer tries again.
-        console.warn('Resolved nicks: posting failed', err.response ? err.response.status : err.message);
+        console.warn(`Resolved nicks: ${kind} failed`, err.response ? err.response.status : err.message);
         if (err.response && err.response.status === 429) {
-          posts.unshift(row.nickLower);
-          await new Promise(r => setTimeout(r, (Number(err.response.data && err.response.data.retry_after) || 5) * 1000));
+          if (live) posts.unshift(key); else backfill.unshift([kind, key]);
+          await sleep((Number(err.response.data && err.response.data.retry_after) || 5) * 1000);
           continue;
         }
       }
-      await new Promise(r => setTimeout(r, POST_GAP_MS));
+      await sleep(live ? POST_GAP_MS : BACKFILL_GAP_MS);
     }
     posting = false;
   }
-  function retryWaiting() {
-    if (!postingOn) return;
-    const waiting = [...rows.values()].filter(r => r.needsPost).sort((a, b) => a.seenAt - b.seenAt).slice(0, RETRY_BATCH);
-    waiting.forEach(r => schedulePost(r.nickLower));
+
+  // Works out what the channel is missing: every player's newest nick
+  // posted (oldest sighting first), old-look messages redrawn, and
+  // messages of nicks that aren't their player's newest any more removed.
+  // Runs at start and every few minutes; finished work drops out by itself.
+  function plan() {
+    if (!postingOn || backfill.length) return;
+    nameUuid.clear();
+    for (const r of rows.values()) if (r.uuid) nameUuid.set(r.playerLower, r.uuid);
+    const groups = new Map();
+    for (const r of rows.values()) {
+      const k = keyOf(r);
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(r);
+    }
+    const deletes = [], edits = [], toPost = [];
+    for (const group of groups.values()) {
+      const newest = newestOf(group);
+      // Posting the newest removes the others itself, so the player is never
+      // left without a message while they wait their turn.
+      if (!newest.messageId || newest.needsPost) { toPost.push(newest); continue; }
+      if (newest.style !== STYLE) edits.push(newest);
+      for (const r of group) if (r !== newest && r.messageId) deletes.push(r);
+    }
+    toPost.sort((a, b) => a.seenAt - b.seenAt);
+    backfill = [
+      ...deletes.map(r => ['delete', r.nickLower]),
+      ...edits.map(r => ['edit', r.nickLower]),
+      ...toPost.map(r => ['post', r.nickLower])
+    ];
+    if (backfill.length) {
+      console.log(`Resolved nicks: catching up ${toPost.length} posts, ${edits.length} redraws, ${deletes.length} removals`);
+      if (!posting) drain();
+    }
   }
 
   // --- Recording ---
-  // entries: [{ nick, player, source, seenAt }]. quiet: save without posting.
+  // entries: [{ nick, player, uuid?, source, seenAt }]. quiet: save without
+  // posting now (the catch-up in plan() still shows it if it's the player's
+  // newest nick).
   // -> how many rows changed. Never rejects.
   function record(entries, { quiet = false } = {}) {
     const clean = (Array.isArray(entries) ? entries : [])
@@ -146,7 +274,8 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
       .map(e => ({
         nick: String(e.nick), player: String(e.player),
         source: SOURCE_RE.test(String(e.source || '')) ? String(e.source) : 'Unknown',
-        seenAt: Math.min(toMs(e.seenAt), now())
+        seenAt: Math.min(toMs(e.seenAt), now()),
+        uuid: UUID_RE.test(String(e.uuid || '').replace(/-/g, '').toLowerCase()) ? String(e.uuid).replace(/-/g, '').toLowerCase() : null
       }));
     if (!clean.length) return Promise.resolve(0);
     return queued(async () => {
@@ -158,20 +287,29 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
         let row = rows.get(key);
         if (!row) {
           row = { nick: e.nick, nickLower: key, player: e.player, playerLower, source: e.source, alsoIn: [],
-            seenAt: e.seenAt, history: [], messageId: null, needsPost: !quiet };
+            seenAt: e.seenAt, history: [], messageId: null, needsPost: !quiet, uuid: e.uuid, uuidTried: false };
+          if (e.uuid) nameUuid.set(playerLower, e.uuid);
           rows.set(key, row);
           changed.set(key, row);
           continue;
         }
-        if (row.playerLower === playerLower) {
+        // The same player: the same uuid (even under a new name), or the
+        // same name when either uuid is unknown.
+        if (e.uuid && row.uuid ? e.uuid === row.uuid : row.playerLower === playerLower) {
           let touched = false;
+          if (e.uuid && !row.uuid) {
+            row.uuid = e.uuid;
+            nameUuid.set(row.playerLower, e.uuid);
+            touched = true;
+          }
           if (e.seenAt > row.seenAt) {
             if (e.source !== row.source) {
               row.alsoIn = [row.source, ...row.alsoIn.filter(s => s !== row.source && s !== e.source)];
               row.source = e.source;
             }
             row.seenAt = e.seenAt;
-            row.player = e.player; // the newest capitalisation
+            row.player = e.player; // the newest name / capitalisation
+            row.playerLower = playerLower;
             touched = true;
           } else if (e.source !== row.source && !row.alsoIn.includes(e.source)) {
             row.alsoIn.push(e.source);
@@ -184,7 +322,7 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
           // Someone else has it now.
           row.history = [{ player: row.player, source: row.source, seenAt: row.seenAt },
             ...row.history.filter(h => h.player.toLowerCase() !== playerLower && h.player.toLowerCase() !== row.playerLower)].slice(0, HISTORY_MAX);
-          Object.assign(row, { player: e.player, playerLower, source: e.source, alsoIn: [], seenAt: e.seenAt });
+          Object.assign(row, { player: e.player, playerLower, source: e.source, alsoIn: [], seenAt: e.seenAt, uuid: e.uuid, uuidTried: false });
           if (!quiet || row.messageId) { row.needsPost = true; row.taken = true; }
           changed.set(key, row);
         } else {
@@ -203,7 +341,8 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
             filter: { nickLower: r.nickLower },
             update: { $set: {
               nick: r.nick, player: r.player, playerLower: r.playerLower, source: r.source, alsoIn: r.alsoIn,
-              seenAt: r.seenAt, history: r.history, needsPost: r.needsPost, taken: !!r.taken
+              seenAt: r.seenAt, history: r.history, needsPost: r.needsPost, taken: !!r.taken,
+              uuid: r.uuid || null, uuidTried: !!r.uuidTried
             } },
             upsert: true
           }
@@ -223,7 +362,7 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
     if (!data || !data.byNick) return 0;
     const entries = [];
     for (const { nick, owners } of data.byNick.values()) {
-      for (const o of owners) entries.push({ nick, player: o.player, source: source.name, seenAt: o.last });
+      for (const o of owners) entries.push({ nick, player: o.player, uuid: o.uuid, source: source.name, seenAt: o.last });
     }
     try {
       const seen = !!(await ResolvedImport.exists({ _id: source.name }));
@@ -240,13 +379,13 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
   }
 
   // The whole list in the gists' format: [nick, [[player, count, first,
-  // last, game, source], ...]] (times in seconds), current owner first.
+  // last, source, uuid], ...]] (times in seconds), current owner first.
   async function exportAll() {
     await load();
     const sec = ms => Math.floor((ms || 0) / 1000);
     const nicks = [...rows.values()].sort((a, b) => b.seenAt - a.seenAt).map(r => [r.nick, [
-      [r.player, 1, sec(r.seenAt), sec(r.seenAt), 'Unknown', r.source],
-      ...r.history.map(h => [h.player, 1, sec(h.seenAt), sec(h.seenAt), 'Unknown', h.source])
+      [r.player, 1, sec(r.seenAt), sec(r.seenAt), r.source, r.uuid || null],
+      ...r.history.map(h => [h.player, 1, sec(h.seenAt), sec(h.seenAt), h.source, null])
     ]]);
     return { generatedAt: now(), count: nicks.length, nicks };
   }
@@ -264,8 +403,8 @@ module.exports = function setupResolved({ mongoose, http = axios, now = Date.now
   }
 
   function start() {
-    load().then(() => queued(clearFrozenBacklog)).then(retryWaiting).catch(err => console.error('Resolved nicks: loading failed', err.message));
-    const timer = setInterval(retryWaiting, RETRY_MS);
+    load().then(() => queued(clearFrozenBacklog)).then(plan).catch(err => console.error('Resolved nicks: loading failed', err.message));
+    const timer = setInterval(plan, PLAN_MS);
     if (timer.unref) timer.unref();
   }
 

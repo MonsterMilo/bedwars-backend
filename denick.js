@@ -30,8 +30,8 @@ const SCRAPED_SOURCES = [
 const SCRAPED_REFRESH_MS = 30 * 60 * 1000;
 const SCRAPED_RETRY_MS = 60 * 1000; // after a failed load, before trying again
 
-// { nicks: [[nick, [[player, count, first, last, game], ...]], ...] } (times
-// in seconds) -> the two lookup maps the website and plugin build.
+// { nicks: [[nick, [[player, count, first, last, game, uuid?], ...]], ...] }
+// (times in seconds) -> the two lookup maps the website and plugin build.
 function parseScraped(data) {
   const byNick = new Map();
   const byPlayer = new Map();
@@ -42,8 +42,9 @@ function parseScraped(data) {
     if (typeof nick !== 'string' || !Array.isArray(rawOwners) || rawOwners.length === 0) continue;
     const owners = rawOwners
       .filter(o => Array.isArray(o) && typeof o[0] === 'string')
-      .map(([player, count, first, last, game]) => ({
-        player, count: count || 1, first: (first || 0) * 1000, last: (last || 0) * 1000, game: game || 'Unknown'
+      .map(([player, count, first, last, game, uuid]) => ({
+        player, count: count || 1, first: (first || 0) * 1000, last: (last || 0) * 1000, game: game || 'Unknown',
+        ...(typeof uuid === 'string' && /^[0-9a-f]{32}$/i.test(uuid) ? { uuid: uuid.toLowerCase() } : {})
       }))
       .sort((a, b) => b.last - a.last);
     if (owners.length === 0) continue;
