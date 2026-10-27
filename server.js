@@ -965,6 +965,18 @@ app.post('/resolved-nicks', requireWriteKey, writeLimiter, async (req, res) => {
   return res.json({ ok: true, changed });
 });
 
+// The resolved list as denick entries for a nick ("nick") or a player
+// ("player"), for the website's search. Same access as the other sources.
+app.get('/resolved-nicks/search/:mode/:name', validName('name'), requireKeyForDenicker, proxyLimiter, async (req, res) => {
+  if (!['nick', 'player'].includes(req.params.mode)) return res.status(404).json({ error: 'Not found' });
+  try {
+    return res.json({ success: true, entries: await resolved.search(req.params.mode, req.params.name) });
+  } catch (err) {
+    console.error('GET /resolved-nicks/search error', err);
+    return res.status(500).json({ success: false, error: 'Something went wrong on the server.' });
+  }
+});
+
 // The whole list in the gists' format, for the proxy and the site to read
 // in place of the gists later. Same access as the other denick sources.
 app.get('/resolved-nicks/export', requireKeyForDenicker, proxyLimiter, async (req, res) => {
@@ -985,6 +997,7 @@ const denick = require('./denick')({
   spendDenicker: owner => spendLimit(denickerStore, DENICKER_LIMIT, owner),
   spendBedlify: owner => spendLimit(bedlifyStore, BEDLIFY_LIMIT, owner),
   manualDenicks,
+  resolvedSearch: (mode, query) => resolved.search(mode, query),
   onScraped: (source, data) => resolved.recordScraped(source, data)
 });
 // Which sources work right now: GET /status below and the bot's /status.

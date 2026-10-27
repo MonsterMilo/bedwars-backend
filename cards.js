@@ -596,7 +596,7 @@ function denickCard(themeId, data) {
   // Where the accent is itself gold (Private Bank, Hollow Grave), Denicker
   // takes the theme's blue so it can't be mistaken for Diamond Dome.
   const denickerColor = t.id === 'ledger' || t.id === 'hollowgrave' ? t.mc['9'] : t.accent;
-  const SOURCE_COLORS = { 'Denicker API': denickerColor, 'Diamond Dome': t.mc['6'], Tricktracker: t.mc['5'], Bedlify: t.mc.c, Milo: t.roster.milo };
+  const SOURCE_COLORS = { 'Denicker API': denickerColor, 'Denicker DB': denickerColor, 'Diamond Dome': t.mc['6'], Tricktracker: t.mc['5'], Bedlify: t.mc.c, Milo: t.roster.milo };
   const sourceColor = s => SOURCE_COLORS[s] || t.dim;
   const plain = t.slotText || t.text;
   const faint = t.slotLabel || t.dim;
