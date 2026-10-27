@@ -344,7 +344,7 @@ async function denickerGet(params) {
   });
   // Whatever it knows goes into the resolved nicks list (resolved.js).
   if (res.data && res.data.success && Array.isArray(res.data.nicks)) {
-    resolved.record(res.data.nicks.map(n => ({ nick: n.nick, player: n.username, seenAt: n.updated, source: 'Denicker API' })));
+    resolved.record(res.data.nicks.map(n => ({ nick: n.nick, player: n.username, uuid: n.uuid || params.uuid, seenAt: n.updated, source: 'Denicker API' })));
   }
   return res.data;
 }
@@ -936,7 +936,7 @@ async function manualDenicks(mode, query) {
 // Every nick any source resolves, once, with whoever had it last, posted to
 // the resolved nicks channel. Fed by denickerGet, bedlifySightings, the
 // gists (onScraped below), Milo's Found answers (discord.js) and the proxy.
-const resolved = require('./resolved')({ mongoose });
+const resolved = require('./resolved')({ mongoose, resolvePlayer });
 mongoose.connection.once('open', () => {
   resolved.start();
   // Milo's export of the Denicker Discord's #database channel (Oct 2026),
@@ -951,15 +951,15 @@ mongoose.connection.once('open', () => {
 });
 
 // The proxy's Denick plugin sends what it resolves in game. Full-access keys
-// only (it runs on Milo's PC). Body { nicks: [{ nick, player, source,
-// seenAt? (ms, defaults to now) }] }, up to RESOLVED_POST_MAX.
+// only (it runs on Milo's PC). Body { nicks: [{ nick, player, uuid?,
+// source, seenAt? (ms, defaults to now) }] }, up to RESOLVED_POST_MAX.
 const RESOLVED_POST_MAX = 50;
 app.post('/resolved-nicks', requireWriteKey, writeLimiter, async (req, res) => {
   if (!hasFullAccess(req.keyOwner)) return res.status(403).json({ error: 'Only Milo\'s key can add resolved nicks' });
   const list = Array.isArray(req.body && req.body.nicks) ? req.body.nicks : [];
   if (!list.length || list.length > RESOLVED_POST_MAX) return res.status(400).json({ error: `Send 1 to ${RESOLVED_POST_MAX} nicks` });
   const entries = list.filter(e => e && typeof e === 'object').map(e => ({
-    nick: e.nick, player: e.player, source: e.source || 'Proxy', seenAt: e.seenAt || Date.now()
+    nick: e.nick, player: e.player, uuid: e.uuid, source: e.source || 'Proxy', seenAt: e.seenAt || Date.now()
   }));
   const changed = await resolved.record(entries);
   return res.json({ ok: true, changed });
