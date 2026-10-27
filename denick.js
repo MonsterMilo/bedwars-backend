@@ -8,6 +8,8 @@
 //   - Diamond Dome, Tricktracker and Bedlify's #nicks list, from the same public gists the website
 //     reads, kept in memory and refreshed every 30 minutes.
 //   - Milo's own answers to denick requests (Found ones), as "Milo".
+//   - the resolved nicks list (resolved.js), which also holds imports like
+//     the Denicker DB export, each under the source that saw it.
 // Every source counts the same: one row per player (or per nick), and the
 // newest sighting wins, with any other source that knows the pair noted
 // as "also in" (Milo's rule, same as the website and the plugin).
@@ -78,7 +80,7 @@ function mergeEntries(entries, keyField) {
 
 module.exports = function setupDenick({
   denickerGet, bedlifySightings, resolvePlayer, describeAxiosError,
-  denickerOn, bedlifyOn, spendDenicker, spendBedlify, manualDenicks, onScraped = () => {}, http = axios
+  denickerOn, bedlifyOn, spendDenicker, spendBedlify, manualDenicks, resolvedSearch = null, onScraped = () => {}, http = axios
 }) {
   // --- Scraped sources ---
   const scraped = SCRAPED_SOURCES.map(s => ({ ...s, data: null, at: 0, failedAt: 0, loading: null }));
@@ -165,6 +167,16 @@ module.exports = function setupDenick({
     });
   }
 
+  // The resolved nicks list (resolved.js): everything any source ever
+  // turned up, including imports like the Denicker DB export. Never rejects.
+  function fromResolved(mode, query) {
+    if (!resolvedSearch) return Promise.resolve([]);
+    return resolvedSearch(mode, query).catch(err => {
+      console.error('Denick: resolved nicks failed', err.message);
+      return [];
+    });
+  }
+
   // mode: 'nick' (who used this nick) or 'player' (the nicks a player used).
   // owner: the roster id searching, for the per-person limits.
   // -> { mode, query, results, partial, limitedUntil (ms, or 0) }
@@ -172,13 +184,14 @@ module.exports = function setupDenick({
     const uuidPromise = mode === 'player'
       ? resolvePlayer(query).then(p => p && p.id, () => null)
       : Promise.resolve(null);
-    const [denicker, bedlify, milo] = await Promise.all([
+    const [denicker, bedlify, milo, resolvedList] = await Promise.all([
       uuidPromise.then(uuid => fromDenicker(owner, mode, query, uuid)),
       fromBedlify(owner, mode, query),
       fromMilo(mode, query),
+      fromResolved(mode, query),
       ...scraped.map(loadScraped)
     ]);
-    const results = mergeEntries([...denicker.entries, ...bedlify.entries, ...milo, ...scrapedEntries(mode, query)],
+    const results = mergeEntries([...denicker.entries, ...bedlify.entries, ...milo, ...resolvedList, ...scrapedEntries(mode, query)],
       mode === 'nick' ? 'username' : 'nick');
     return {
       mode, query, results,

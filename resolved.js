@@ -417,6 +417,27 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     }
   }
 
+  // Search entries for the website's Denicking section and /denick, like the
+  // other sources: mode 'nick' (who used it) or 'player' (their nicks). The
+  // current owner and the earlier ones in the history, each under the
+  // source that saw them; denick.js's merge keeps the newest.
+  async function search(mode, query) {
+    await load();
+    const q = String(query || '').toLowerCase();
+    const entry = (nick, player, source, seenAt) => ({ username: player, nick, updated: seenAt || 0, source: source || 'Unknown' });
+    if (mode === 'nick') {
+      const r = rows.get(q);
+      return r ? [entry(r.nick, r.player, r.source, r.seenAt), ...r.history.map(h => entry(r.nick, h.player, h.source, h.seenAt))] : [];
+    }
+    const uuid = nameUuid.get(q);
+    const out = [];
+    for (const r of rows.values()) {
+      if (r.playerLower === q || (uuid && r.uuid === uuid)) out.push(entry(r.nick, r.player, r.source, r.seenAt));
+      for (const h of r.history) if (h.player.toLowerCase() === q) out.push(entry(r.nick, h.player, h.source, h.seenAt));
+    }
+    return out;
+  }
+
   // The whole list in the gists' format: [nick, [[player, count, first,
   // last, source, uuid], ...]] (times in seconds), current owner first.
   async function exportAll() {
@@ -454,7 +475,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     return { nicks: c.nicks, players: c.players, toPost: c.toPost.length, messages: Math.ceil(c.toPost.length / PER_MESSAGE), redraws: c.redraws.length, postingOn };
   };
 
-  return { record, recordScraped, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
+  return { record, recordScraped, search, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
 };
 
 module.exports.toMs = toMs;
