@@ -23,6 +23,8 @@
 //   denick requests      the website's "Ask Milo" form DMs Milo a nick to
 //                        denick by hand, with Found / Possible / Not found
 //                        buttons; his answer is DMed back to whoever asked
+//   /addnick <nick> <player>  Milo only (hidden from everyone else): add a
+//                        nick he denicked himself to the resolved nicks list
 //   /recap [week]        the weekly recap card (this week so far, or last
 //                        week). The bot also posts it to the Sweat Log
 //                        channel every Sunday at 8pm New York time.
@@ -655,6 +657,15 @@ module.exports = function setupDiscord({
     options: [{ type: 3, name: 'theme', description: 'Leave empty to see yours', required: false,
       choices: cards.THEME_IDS.map(id => ({ name: cards.THEMES[id].label, value: id })) }]
   }];
+  const ADDNICK_COMMAND = {
+    name: 'addnick',
+    description: 'Add a nick you denicked yourself to the resolved nicks list',
+    type: 1,
+    options: [
+      { type: 3, name: 'nick', description: 'The nick', required: true, min_length: 1, max_length: 16 },
+      { type: 3, name: 'player', description: 'Who it is (Minecraft username)', required: true, min_length: 1, max_length: 16 }
+    ]
+  };
   // The first card after a start is slower (fonts and the drawing library
   // load), so one throwaway card per theme is drawn at start instead.
   if (enabled) {
@@ -671,7 +682,13 @@ module.exports = function setupDiscord({
     // app to their account) in any DM or group chat. integration_types:
     // 0 = added to a server, 1 = added to a user. contexts: 0 = server,
     // 1 = DM with the bot, 2 = other DMs and group chats.
-    const everywhere = COMMANDS.map(c => ({ ...c, integration_types: [0, 1], contexts: [0, 1, 2] }));
+    // /addnick is Milo's alone: servers only, hidden from everyone without
+    // admin rights there (default_member_permissions '0'), and refused for
+    // anyone but Milo even if they find it.
+    const everywhere = [
+      ...COMMANDS.map(c => ({ ...c, integration_types: [0, 1], contexts: [0, 1, 2] })),
+      { ...ADDNICK_COMMAND, integration_types: [0], contexts: [0], default_member_permissions: '0' }
+    ];
     bot.put(`/applications/${APP_ID}/commands`, everywhere)
       .then(() => console.log('Discord commands registered'))
       .catch(err => console.error('Discord command registration failed', describeAxiosError(err)));
@@ -1353,6 +1370,29 @@ module.exports = function setupDiscord({
   // --- /status ---
   // Read-only, anyone can use it. [Check again] (custom_id "ss:R") re-runs
   // the checks if the last ones are over 30 seconds old (see status.js).
+  // /addnick: Milo adds a nick by hand, as source "Milo" (resolved.js does
+  // the rest: no duplicates, newest owner wins, posted to the channel).
+  async function onAddNick(interaction, res) {
+    if (roster.get(userOf(interaction)) !== 'milo') return reply(res, 'Only Milo can use this.');
+    if (!resolved) return reply(res, 'The resolved nicks list isn\'t available right now.');
+    const nick = String(optionOf(interaction, 'nick') || '').trim();
+    const name = String(optionOf(interaction, 'player') || '').trim();
+    if (!NAME_RE.test(nick)) return reply(res, `**${nick}** isn't a valid nick (letters, numbers and _ only, up to 16).`);
+    if (!NAME_RE.test(name)) return reply(res, `**${name}** isn't a valid Minecraft username.`);
+    res.json({ type: DEFER, data: { flags: EPHEMERAL } });
+    let player;
+    try {
+      player = await resolvePlayer(name);
+    } catch (err) {
+      return editOriginal(interaction, { content: err.status === 404 ? `No Minecraft account is called **${name}**. Nothing was added.` : OOPS });
+    }
+    const ign = player.name || name;
+    const changed = await resolved.record([{ nick, player: ign, uuid: player.id, source: 'Milo', seenAt: Date.now() }]);
+    return editOriginal(interaction, { content: changed
+      ? `🔓 Added **${nick}** → **${ign}**. It'll show in searches and the resolved nicks channel.`
+      : `**${nick}** → **${ign}** was already on the list.` });
+  }
+
   async function onStatus(interaction, res) {
     const theme = themeOf(userOf(interaction));
     return withCard(interaction, res, async () => statusMessage(await status.get(), theme));
@@ -1773,7 +1813,8 @@ module.exports = function setupDiscord({
   // --- The endpoint Discord calls ---
   const COMMAND_HANDLERS = {
     sweat: onSweatCommand, add: onAdd, beaten: onBeaten, stats: onStats,
-    leaderboard: onLeaderboard, random: onRandom, theme: onTheme, denick: onDenick, recap: onRecap, status: onStatus
+    leaderboard: onLeaderboard, random: onRandom, theme: onTheme, denick: onDenick, recap: onRecap, status: onStatus,
+    addnick: onAddNick
   };
   app.post('/discord/interactions', async (req, res) => {
     if (!enabled) return res.status(503).json({ error: 'Discord bot not configured' });
