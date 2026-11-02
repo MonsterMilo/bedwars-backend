@@ -22,6 +22,11 @@ const loadFonts = () => [
   font('Garamond', 'EBGaramond-500.ttf', 500), font('Garamond', 'EBGaramond-700.ttf', 700),
   font('Chakra', 'ChakraPetch-600.ttf', 600), font('Chakra', 'ChakraPetch-700.ttf', 700),
   font('Sora', 'Sora-500.ttf', 500), font('Sora', 'Sora-700.ttf', 700),
+  // Harvest: Ultra (wood type), Stardos Stencil (crate stamps), Bitter, Kalam (handwriting).
+  font('Ultra', 'Ultra.ttf'),
+  font('Stencil', 'StardosStencil-700.ttf', 700),
+  font('Bitter', 'Bitter-500.ttf', 500), font('Bitter', 'Bitter-700.ttf', 700),
+  font('Kalam', 'Kalam-700.ttf', 700),
   // ✫ ✪ ⚑ ⚠ and other symbols the theme fonts don't have.
   font('Symbols', 'DejaVuSans-Bold.ttf', 700)
 ];

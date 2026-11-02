@@ -1,5 +1,5 @@
 // --- Prism bot image cards ---
-// Every bot reply is drawn as a PNG in one of the website's six themes.
+// Every bot reply is drawn as a PNG in one of the website's themes.
 // satori lays a card out from a tree of divs with CSS-like styles (see h()
 // below) and gives an SVG; resvg turns that into a PNG. The layouts are
 // shared; each theme only supplies colours, fonts and a few details, the
@@ -147,6 +147,26 @@ const THEMES = {
     mc: { 0: '#4d6d78', 1: '#4a6cf0', 2: '#1fbf8f', 3: '#1aa3a3', 4: '#e0566b', 5: '#9b6bff', 6: '#f2b35a', 7: '#9fb8c0', 8: '#6f8c96', 9: '#5b8cff', a: '#5ef2b5', b: '#5ff0f0', c: '#ff7a8a', d: '#e28bff', e: '#f7e27a', f: '#e8fbff' },
     roster: { milo: '#35e6c4', potat: '#9b6bff', aballs: '#ffb454', zoiv: '#ff6bb8', max: '#4ade9f', sqoz: '#4fc3f7', kermit: '#9fe64f', ssent: '#ff8f5c', key: '#ffe066' },
     cheating: '#ff5a5a', boosting: '#f2b35a', removed: '#4d6d78'
+  },
+  // A produce crate at a harvest fair: pine crate wood in a walnut frame, a
+  // lithographed cream label with a red border for the name, stencilled
+  // crate stamps for headings, handwritten notes, the website's harvest
+  // table roster colours (cranberry, plum, corn, ...).
+  harvest: {
+    label: 'Harvest', font: 'Ultra', label_: 'Stencil', body: 'Bitter', note: 'Kalam',
+    labelCase: 'uppercase', labelSpacing: 2, bigger: 0.9, miniPx: 25, // Ultra is very wide
+    page: { background: 'linear-gradient(180deg, #f2c27a 0%, #e7c99a 55%, #c98a4a 100%)' },
+    panel: { background: 'linear-gradient(180deg, #e2bd86 0%, #d4a96c 50%, #dcb682 100%)', border: '3px solid #5a3a22', borderRadius: 6 },
+    rim: { background: '#5a3a22', padding: 5, borderRadius: 9 },
+    bar: { background: '#fbf3e2', border: '2px solid #a8322b', boxShadow: '0 0 0 3px #fbf3e2, 0 0 0 5px #a8322b', borderRadius: 4 },
+    slot: { background: 'rgba(251,243,226,0.55)', border: '2px solid #5a3a22', borderRadius: 3 },
+    skinBg: { background: 'radial-gradient(circle at 50% 35%, #fbf3e2 0%, #f1dcb2 75%)', border: '3px solid #a8322b', borderRadius: 4 },
+    text: '#3b2414', dim: '#6e4a2c', name: '#3b2414', nameShadow: 'none', barText: '#3b2414', barDim: '#a8322b',
+    glow: () => 'none', chipText: '#fbf3e2', chipRound: true,
+    accent: '#a8322b', track: 'rgba(90,58,34,0.16)',
+    mc: { 0: '#2b2724', 1: '#23346b', 2: '#3f6a22', 3: '#1f5e62', 4: '#8e1f1a', 5: '#5e2a63', 6: '#9a5a10', 7: '#6b5a48', 8: '#4a3d30', 9: '#34557a', a: '#4f7a32', b: '#2a6f7a', c: '#b3261e', d: '#8a3a7a', e: '#8a6a0c', f: '#3b2414' },
+    roster: { milo: '#b8362b', potat: '#7a5aa6', aballs: '#c98a1c', zoiv: '#d4618a', max: '#6f8f3a', sqoz: '#4a7aa6', kermit: '#2f7d60', ssent: '#d66a26', key: '#b08a4a' },
+    cheating: '#b3261e', boosting: '#c98a1c', removed: '#6b5a48'
   }
 };
 const THEME_IDS = Object.keys(THEMES);
@@ -292,6 +312,7 @@ const RIVAL_LOOK = {
   casefiles: { word: 'Repeat offender', font: 'Anton', color: '#a32f1d', box: { border: '4px solid #a32f1d', transform: 'rotate(-3deg)', background: 'rgba(163,47,29,0.06)' }, size: 24 },
   ledger: { word: 'Rival', font: 'Playfair', color: '#f0d28a', box: { background: 'linear-gradient(90deg, #5a121c, #9a2535 45%, #6a1622)', border: '2px solid #c9a24a' }, icon: '⚔', labelCase: 'none' },
   deepcurrent: { word: 'Hostile', font: 'Chakra', color: '#ff5a5a', box: { background: 'rgba(30,6,12,0.92)', border: '2px solid rgba(255,90,90,0.7)', borderRadius: 6 }, glow: '0 0 8px rgba(255,90,90,0.7)', diamond: true },
+  harvest: { word: 'Sly fox', font: 'Ultra', color: '#fbf3e2', box: { background: '#d66a26', border: '3px solid #5a3a22', borderRadius: 999 }, size: 20, labelCase: 'none' },
   skyisles: { word: 'Nemesis', font: 'Jersey', color: '#ff55ff', box: { background: '#100010', border: '3px solid #2a0960' }, glow: '2px 2px 0 #3f003f', icon: '⚔', size: 30, labelCase: 'none' },
 };
 function rivalRow(t, rival) {
@@ -580,7 +601,7 @@ function recapCard(themeId, data) {
   const flagColor = s.cheating ? t.cheating : s.boosting ? t.boosting : null;
   const mini = (heading, shown, color) => h('div', { flexDirection: 'column', alignItems: 'center', flexGrow: 1, flexBasis: 0, padding: '8px 4px', background: t.track, borderRadius: t.chipRound ? 12 : (t.chipRadius || 0) },
     label(t, heading, { fontSize: size(t, 14), color: faint }),
-    text(shown, { fontFamily: t.font, fontSize: size(t, 30), fontWeight: 800, color, lineHeight: 1, marginTop: 4, textShadow: shadow(color) }));
+    text(shown, { fontFamily: t.font, fontSize: size(t, t.miniPx || 30), fontWeight: 800, color, lineHeight: 1, marginTop: 4, textShadow: shadow(color) }));
   const scariest = h('div', { flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0, padding: '14px 18px', ...t.slot,
     ...(flagColor ? (t.chipBorder ? { border: `3px solid ${flagColor}` } : { borderColor: flagColor, borderWidth: 2 }) : {}) },
     label(t, 'Scariest new sweat', { color: faint }),
