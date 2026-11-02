@@ -1,0 +1,30 @@
+name: Tests
+
+# Runs the tests (npm test: unit tests, plus the API tests against an
+# in-memory MongoDB) on every pull request and every push to main, so a
+# broken change shows a red X before it's merged (merging deploys).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - name: Cache the MongoDB binary for the API tests
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}-v1
+      - run: npm test
