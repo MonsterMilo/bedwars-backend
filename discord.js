@@ -12,7 +12,7 @@
 //   /stats [person]      numbers on the list, or on one person's beats
 //   /leaderboard         who has beaten / logged the most, or the top sweats
 //   /random [person]     a random sweat (read-only)
-//   /theme [theme]       pick your card theme (the website's six); the
+//   /theme [theme]       pick your card theme (the website's themes); the
 //                        Sweat Log channel always uses the default (Neon)
 //   /status              which sources work right now (Bordic, Hypixel key,
 //                        Urchin, Denicker, Bedlify, the denick gists,
@@ -339,11 +339,24 @@ module.exports = function setupDiscord({
     const total = startedAt ? `, ${((Date.now() - startedAt) / 1000).toFixed(1)} s in all` : '';
     console.log(`Discord card ${msg.kind}/${msg.theme}: skin ${t.skinMs ?? 0} ms, ${draw}, upload ${uploadMs} ms${total}`);
   }
+  // Discord's rate limits answer 429 with how long to wait. Wait (up to
+  // 10 seconds) and send again, twice at most, so a burst of edits on the
+  // site doesn't leave a Sweat Log card one change behind.
   async function send(method, url, msg, startedAt) {
     const t0 = Date.now();
-    const r = await bot[method](url, form(msg));
-    logCard(msg, Date.now() - t0, startedAt);
-    return r;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const r = await bot[method](url, form(msg));
+        logCard(msg, Date.now() - t0, startedAt);
+        return r;
+      } catch (err) {
+        const wait = err.response && err.response.status === 429
+          ? Math.ceil((Number(err.response.data && err.response.data.retry_after) || 1) * 1000) : 0;
+        if (!wait || attempt >= 2 || wait > 10000) throw err;
+        console.warn(`Discord rate limit: waiting ${wait} ms before sending again`);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
   }
   const original = interaction => `/webhooks/${APP_ID}/${interaction.token}/messages/@original`;
   const editOriginal = (interaction, msg) => send('patch', original(interaction), msg, interaction._receivedAt)
@@ -1111,7 +1124,8 @@ module.exports = function setupDiscord({
   }
 
   async function statsPage(person, theme) {
-    const keep = ['username', 'uuid', 'star', 'fkdr', 'wlr', 'cheating', 'boosting', 'createdAt', 'addedBy', 'notes', ...ROSTER_FIELDS]
+    // Notes are only counted here, so only their ids are fetched.
+    const keep = ['username', 'uuid', 'star', 'fkdr', 'wlr', 'cheating', 'boosting', 'createdAt', 'addedBy', 'notes._id', ...ROSTER_FIELDS]
       .reduce((o, f) => { o[f] = 1; return o; }, {});
     const everything = await Sweat.find(LIVE, keep).lean();
     const list = person ? everything.filter(sw => sw[person]) : everything;

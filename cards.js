@@ -9,34 +9,15 @@
 // leaderboardCard (/leaderboard), denickCard (/denick), recapCard (the
 // Sunday recap and /recap). render(tree) gives the PNG.
 
-const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const satori = require('satori').default;
-const { Resvg } = require('@resvg/resvg-js');
+const { Worker } = require('worker_threads');
+const { draw: drawHere } = require('./cards-draw');
 
 const W = 1000; // layout width in px (all sizes below are for this width)
 // The PNG is drawn at 800px wide: Discord shows cards at ~400-550px, so
 // it's still sharp, and it's about a third less work than 1000px.
 const OUT_W = 800;
-
-// --- Fonts (all from Google Fonts, SIL Open Font License; DejaVu for symbols) ---
-const FONT_DIR = path.join(__dirname, 'fonts');
-const font = (name, file, weight = 400) => ({ name, data: fs.readFileSync(path.join(FONT_DIR, file)), weight, style: 'normal' });
-const FONTS = [
-  font('Jersey', 'Jersey10.ttf'),
-  font('Silkscreen', 'Silkscreen-400.ttf', 400), font('Silkscreen', 'Silkscreen-700.ttf', 700),
-  font('Manrope', 'Manrope-500.ttf', 500), font('Manrope', 'Manrope-700.ttf', 700), font('Manrope', 'Manrope-800.ttf', 800),
-  font('Anton', 'Anton.ttf'),
-  font('Courier Prime', 'CourierPrime-400.ttf', 400), font('Courier Prime', 'CourierPrime-700.ttf', 700),
-  font('Caveat', 'Caveat-700.ttf', 700),
-  font('Playfair', 'PlayfairDisplay-700.ttf', 700),
-  font('Garamond', 'EBGaramond-500.ttf', 500), font('Garamond', 'EBGaramond-700.ttf', 700),
-  font('Chakra', 'ChakraPetch-600.ttf', 600), font('Chakra', 'ChakraPetch-700.ttf', 700),
-  font('Sora', 'Sora-500.ttf', 500), font('Sora', 'Sora-700.ttf', 700),
-  // ✫ ✪ ⚑ ⚠ and other symbols the theme fonts don't have.
-  font('Symbols', 'DejaVuSans-Bold.ttf', 700)
-];
 
 // --- Hypixel prestige colours (same rules as the website's prestigeTagHtml) ---
 const PRESTIGE_BASE = '7f6b2349d5';
@@ -676,6 +657,53 @@ function statusCard(themeId, data) {
   return frame(t, data.footer, head, h('div', { flexDirection: 'column', marginTop: 6 }, data.sources.map(row)));
 }
 
+// --- The drawing worker ---
+// One worker thread draws every card, one at a time, so a slow card never
+// holds up the main thread. If the worker can't start or dies, it's started
+// again on the next card; CARDS_IN_PROCESS=1 draws on the main thread
+// instead (the old way).
+const DRAW_TIMEOUT_MS = 30 * 1000;
+let worker = null;
+let nextJob = 1;
+const jobs = new Map(); // id -> { resolve, reject, timer }
+function failAll(err) {
+  for (const [id, job] of jobs) { clearTimeout(job.timer); job.reject(err); jobs.delete(id); }
+}
+function getWorker() {
+  if (worker) return worker;
+  const w = new Worker(path.join(__dirname, 'card-worker.js'));
+  w.on('message', ({ id, png, error }) => {
+    const job = jobs.get(id);
+    if (!job) return;
+    jobs.delete(id);
+    clearTimeout(job.timer);
+    if (error) job.reject(new Error(error)); else job.resolve(Buffer.from(png.buffer, png.byteOffset, png.byteLength));
+  });
+  w.on('error', err => { console.error('Card worker failed', err); if (worker === w) worker = null; failAll(err); });
+  w.on('exit', code => { if (worker === w) worker = null; if (jobs.size) failAll(new Error(`Card worker stopped (${code})`)); });
+  w.unref(); // never keeps the process alive on shutdown
+  worker = w;
+  return w;
+}
+function draw(tree) {
+  if (process.env.CARDS_IN_PROCESS === '1') return drawHere(tree, W, OUT_W);
+  return new Promise((resolve, reject) => {
+    const id = nextJob++;
+    const timer = setTimeout(() => {
+      jobs.delete(id);
+      reject(new Error('Drawing the card took too long'));
+    }, DRAW_TIMEOUT_MS);
+    jobs.set(id, { resolve, reject, timer });
+    try {
+      getWorker().postMessage({ id, tree, width: W, outWidth: OUT_W });
+    } catch (err) {
+      jobs.delete(id);
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}
+
 // Finished cards are kept for a while: the same card asked for again (a
 // lookup repeated, a page flipped back, a redraw with nothing changed) is
 // sent straight away instead of drawn again. Keyed on everything that goes
@@ -695,8 +723,7 @@ async function render(tree, timing = {}) {
     return hit.png;
   }
   const t0 = Date.now();
-  const svg = await satori(tree, { width: W, fonts: FONTS });
-  const png = new Resvg(svg, { fitTo: { mode: 'width', value: OUT_W } }).render().asPng();
+  const png = await draw(tree);
   timing.cached = false;
   timing.drawMs = Date.now() - t0;
   cache.set(key, { png, at: Date.now() });
