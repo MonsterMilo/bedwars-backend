@@ -1369,7 +1369,8 @@ module.exports = function setupDiscord({
 
   // --- /status ---
   // Read-only, anyone can use it. [Check again] (custom_id "ss:R") re-runs
-  // the checks if the last ones are over 30 seconds old (see status.js).
+  // the checks if the last ones are over 30 seconds old (see status.js), for
+  // roster members; for anyone else it shows the saved answer.
   // /addnick: Milo adds a nick by hand, as source "Milo" (resolved.js does
   // the rest: no duplicates, newest owner wins, posted to the channel).
   async function onAddNick(interaction, res) {
@@ -1401,7 +1402,10 @@ module.exports = function setupDiscord({
   async function onStatusRefresh(interaction, res) {
     res.json({ type: DEFER_UPDATE });
     const theme = themeOfMessage(interaction.message) || themeOf(userOf(interaction));
-    return editOriginal(interaction, await statusMessage(await status.get({ fresh: true }), theme))
+    // A real re-check costs a metered Denicker lookup, so only roster
+    // members can force one; anyone else just sees the saved answer again.
+    const fresh = !!roster.get(userOf(interaction));
+    return editOriginal(interaction, await statusMessage(await status.get({ fresh }), theme))
       .catch(() => {});
   }
 
