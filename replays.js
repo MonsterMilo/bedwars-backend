@@ -16,6 +16,12 @@ const crypto = require('crypto');
 const axios = require('axios');
 
 const UPLOAD_LINK_SECONDS = 15 * 60;
+// An upload that never said "done" this long after its link was made is
+// given up on: its row and any half-sent file are removed.
+const PENDING_GIVE_UP_MS = 24 * 60 * 60 * 1000;
+const SWEEP_MS = 60 * 60 * 1000;
+// Backblaze's free storage, for the use shown on /status.
+const FREE_BYTES = 10 * 1e9;
 const DOWNLOAD_LINK_SECONDS = 10 * 60;
 const MAX_BYTES = 400 * 1024 * 1024;
 const PLAYERS_MAX = 16;
@@ -50,7 +56,7 @@ function presign({ method, bucket, endpoint, region, keyId, secret, key, expires
 
 module.exports = function setupReplays({
   app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, UUID_RE, NAME_RE,
-  env = process.env, http = axios
+  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now
 }) {
   const config = () => {
     const endpoint = String(env.B2_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
@@ -81,8 +87,20 @@ module.exports = function setupReplays({
     uploadedBy: r.uploadedBy || null
   });
 
+  // Only Milo's plugin uploads, so only full-access keys can: a personal key
+  // (or a leaked one) can't fill the bucket.
+  const requireFullAccess = (req, res, next) => (hasFullAccess(req.keyOwner)
+    ? next()
+    : res.status(403).json({ error: 'Only Milo\'s key can upload replays' }));
+
+  // Removes a replay's file from B2 (a missing file counts as removed).
+  async function removeFile(key) {
+    const r = await http.delete(link('DELETE', key, 60), { validateStatus: () => true, timeout: 10000 });
+    if (r.status >= 300 && r.status !== 404) throw new Error(`B2 delete answered ${r.status}`);
+  }
+
   // The plugin: "a game for these players" -> an upload link for it.
-  app.post('/replays', requireWriteKey, writeLimiter, async (req, res) => {
+  app.post('/replays', requireWriteKey, requireFullAccess, writeLimiter, async (req, res) => {
     if (!config()) return res.status(503).json({ error: 'Replay storage is not set up on the server' });
     const b = req.body || {};
     const sizeBytes = Number(b.sizeBytes);
@@ -110,15 +128,26 @@ module.exports = function setupReplays({
   });
 
   // The plugin: "it's uploaded" -> checked in B2, then it shows on the site.
-  app.post('/replays/:id/done', requireWriteKey, writeLimiter, async (req, res) => {
+  // The upload link can't lock the file's size, so the real size is checked
+  // here: over the cap, or well over what the plugin said it would send,
+  // and the file is deleted instead of listed.
+  app.post('/replays/:id/done', requireWriteKey, requireFullAccess, writeLimiter, async (req, res) => {
     try {
       if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Bad id' });
       const doc = await Replay.findById(req.params.id);
       if (!doc) return res.status(404).json({ error: 'No such replay' });
       const head = await http.head(link('HEAD', doc.key, 60), { validateStatus: () => true, timeout: 10000 });
       if (head.status !== 200) return res.status(409).json({ error: `The file isn't in storage (${head.status})` });
+      const actual = Number(head.headers['content-length']) || 0;
+      const declared = Number(doc.sizeBytes) || 0;
+      if (actual > MAX_BYTES || actual > declared * 1.05 + 1024 * 1024) {
+        await removeFile(doc.key).catch(err => console.error('/replays done: removing an oversized file failed', err.message));
+        await Replay.deleteOne({ _id: doc._id });
+        console.warn(`/replays done: ${doc._id} was ${actual} bytes (said ${declared}, cap ${MAX_BYTES}), so it was deleted`);
+        return res.status(413).json({ error: 'The uploaded file is bigger than allowed, so it was deleted' });
+      }
       doc.status = 'ready';
-      doc.sizeBytes = Number(head.headers['content-length']) || doc.sizeBytes;
+      doc.sizeBytes = actual || doc.sizeBytes;
       await doc.save();
       return res.json(publicReplay(doc));
     } catch (err) {
@@ -156,7 +185,50 @@ module.exports = function setupReplays({
     }
   });
 
-  return { Replay, configured: () => !!config() };
+  // Milo can remove a replay (its file and its row).
+  app.delete('/replays/:id', requireWriteKey, requireFullAccess, writeLimiter, async (req, res) => {
+    if (!config()) return res.status(503).json({ error: 'Replay storage is not set up on the server' });
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Bad id' });
+      const doc = await Replay.findById(req.params.id).lean();
+      if (!doc) return res.status(404).json({ error: 'No such replay' });
+      await removeFile(doc.key);
+      await Replay.deleteOne({ _id: doc._id });
+      return res.json({ ok: true, deletedId: String(doc._id) });
+    } catch (err) {
+      console.error('/replays DELETE error', err.message);
+      return res.status(500).json({ error: 'Delete failed' });
+    }
+  });
+
+  // Uploads that never finished: once a day old, their row and any file
+  // that half-arrived are removed. Runs an hour after start, then hourly.
+  async function sweepPending() {
+    if (!config() || mongoose.connection.readyState !== 1) return 0;
+    const stale = await Replay.find({ status: 'pending', createdAt: { $lt: new Date(now() - PENDING_GIVE_UP_MS) } }, { key: 1 }).limit(100).lean();
+    let removed = 0;
+    for (const doc of stale) {
+      try {
+        await removeFile(doc.key);
+        await Replay.deleteOne({ _id: doc._id, status: 'pending' });
+        removed++;
+      } catch (err) {
+        console.warn('Replays: clearing an unfinished upload failed', err.message);
+      }
+    }
+    if (removed) console.log(`Replays: cleared ${removed} unfinished upload(s)`);
+    return removed;
+  }
+  const sweeper = setInterval(() => { sweepPending().catch(err => console.warn('Replays: sweep failed', err.message)); }, SWEEP_MS);
+  if (sweeper.unref) sweeper.unref();
+
+  // For /status: how much of the free storage the finished replays use.
+  async function usage() {
+    const [row] = await Replay.aggregate([{ $match: { status: 'ready' } }, { $group: { _id: null, count: { $sum: 1 }, bytes: { $sum: '$sizeBytes' } } }]);
+    return { count: row ? row.count : 0, bytes: row ? row.bytes : 0, freeBytes: FREE_BYTES };
+  }
+
+  return { Replay, configured: () => !!config(), sweepPending, usage };
 };
 
 module.exports.presign = presign;

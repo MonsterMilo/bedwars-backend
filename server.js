@@ -1066,10 +1066,11 @@ const status = require('./status')({
   hypixelKey: () => HYPIXEL_API_KEY,
   urchinOn: () => !!URCHIN_KEY,
   denickerOn: () => !!DENICKER_API_KEY,
-  bedlifyOn: () => !!BEDLIFY_API_KEY
+  bedlifyOn: () => !!BEDLIFY_API_KEY,
+  replays: () => replays
 });
 // Recorded games for tracked players (see replays.js): stored in Backblaze B2.
-const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, UUID_RE, NAME_RE });
+const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, hasFullAccess, UUID_RE, NAME_RE });
 
 // Public, like the site's other read routes: it only says what works, never
 // any keys. Answers are shared and kept for a few minutes (see status.js).
