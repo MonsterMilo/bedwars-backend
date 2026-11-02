@@ -86,7 +86,8 @@ module.exports = function setupDenick({
 
   // Never rejects. A failed refresh keeps the copy already loaded.
   function loadScraped(source) {
-    if (source.data && Date.now() - source.at < SCRAPED_REFRESH_MS) return Promise.resolve(source.data);
+    // A frozen gist never changes, so once it's loaded it stays loaded.
+    if (source.data && (source.frozen || Date.now() - source.at < SCRAPED_REFRESH_MS)) return Promise.resolve(source.data);
     if (source.loading) return source.data ? Promise.resolve(source.data) : source.loading;
     if (Date.now() - source.failedAt < SCRAPED_RETRY_MS) return Promise.resolve(source.data);
     source.loading = http.get(source.url, { timeout: 20_000, responseType: 'json' })
