@@ -634,9 +634,26 @@ const activitySchema = new mongoose.Schema({
   query: String,       // the nick or player searched
   resultCount: Number,
   found: mongoose.Schema.Types.Mixed, // up to DENICK_LOG_FOUND [{ name, source }], newest first
-  partial: Boolean     // part of the database didn't answer (or a limit was hit)
+  partial: Boolean,    // part of the database didn't answer (or a limit was hit)
+  // denick.search entries are kept for a year, then MongoDB removes them
+  // (TTL index below). Every other entry (adds, edits, deletes, notes) has
+  // no expiresAt and is kept for good.
+  expiresAt: Date
 });
+const DENICK_LOG_KEEP_DAYS = 365;
+activitySchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+// The Activity view filters by action and pages newest first.
+activitySchema.index({ action: 1, _id: -1 });
 const Activity = mongoose.model('Activity', activitySchema);
+// Searches logged before expiry existed get theirs (a year after they were
+// made). After the first run this matches nothing.
+mongoose.connection.once('open', () => {
+  Activity.updateMany(
+    { action: 'denick.search', expiresAt: null },
+    [{ $set: { expiresAt: { $add: ['$at', DENICK_LOG_KEEP_DAYS * DAY_MS] } } }]
+  ).then(r => { if (r.modifiedCount) console.log(`Activity: ${r.modifiedCount} older denick searches will now expire after a year`); })
+    .catch(err => console.error('Activity: setting expiry on older searches failed', err.message));
+});
 
 // One-off fill-in for sweats saved before addedBy existed: take it from the
 // activity log's "sweat.add" entry. Runs at every start but only touches
@@ -691,7 +708,8 @@ function logDenick(who, via, mode, query, results, count, partial) {
   })).filter(r => NAME_RE.test(r.name));
   Activity.create({
     who, action: 'denick.search', via, mode, query,
-    resultCount: Math.max(rows.length, count || 0), found, partial: !!partial
+    resultCount: Math.max(rows.length, count || 0), found, partial: !!partial,
+    expiresAt: new Date(Date.now() + DENICK_LOG_KEEP_DAYS * DAY_MS)
   }).catch(err => console.error('activity log write failed', err.message));
 }
 
@@ -1017,9 +1035,11 @@ app.get('/resolved-nicks/search/:mode/:name', validName('name'), requireKeyForDe
   }
 });
 
-// The whole list in the gists' format, for the proxy and the site to read
-// in place of the gists later. Same access as the other denick sources.
-app.get('/resolved-nicks/export', requireKeyForDenicker, proxyLimiter, async (req, res) => {
+// The whole list in the gists' format, for the proxy to read in place of
+// the gists later. Full-access keys only (Milo's plugin): a personal key
+// can search one name at a time, but not take the whole list in one call.
+app.get('/resolved-nicks/export', requireWriteKey, proxyLimiter, async (req, res) => {
+  if (!hasFullAccess(req.keyOwner)) return res.status(403).json({ success: false, error: 'Only Milo\'s key can export the whole list' });
   try {
     return res.json({ success: true, ...(await resolved.exportAll()) });
   } catch (err) {
@@ -1052,11 +1072,13 @@ const status = require('./status')({
 const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, UUID_RE, NAME_RE });
 
 // Public, like the site's other read routes: it only says what works, never
-// any keys. Answers are shared and kept for a few minutes (see status.js);
-// ?fresh=1 re-checks sooner.
+// any keys. Answers are shared and kept for a few minutes (see status.js).
+// ?fresh=1 re-checks sooner, but only for someone with a key: each re-check
+// makes a real (metered) Denicker lookup, so a visitor with no key always
+// gets the saved answer.
 app.get('/status', proxyLimiter, async (req, res) => {
   try {
-    return res.json(await status.get({ fresh: req.query.fresh === '1' }));
+    return res.json(await status.get({ fresh: req.query.fresh === '1' && !!keyOwner(req) }));
   } catch (err) {
     console.error('/status error', err);
     return res.status(500).json({ error: 'Status check failed' });
@@ -1457,7 +1479,18 @@ app.delete('/sweats/:id/notes/:noteId', requireWriteKey, writeLimiter, async (re
 // answer). Anyone who can search can report; a visitor with no key is
 // logged as 'guest'. Body { mode, query, count, results: [{ username, nick,
 // source }] (first few), partial }.
-app.post('/activity/denick', proxyLimiter, (req, res) => {
+// Visitors with no key get a much tighter cap than the general one, so a
+// script can't flood Milo's Activity view with made-up searches. Nobody
+// searches more than a few times a minute by hand.
+const guestActivityLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => !!keyOwner(req),
+  message: { error: 'Too many searches logged in a short time.' }
+});
+app.post('/activity/denick', guestActivityLimiter, proxyLimiter, (req, res) => {
   const b = req.body || {};
   const mode = b.mode === 'player' ? 'player' : 'nick';
   const query = String(b.query || '').trim();
