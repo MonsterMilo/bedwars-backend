@@ -1093,10 +1093,13 @@ const status = require('./status')({
   urchinOn: () => !!URCHIN_KEY,
   denickerOn: () => !!DENICKER_API_KEY,
   bedlifyOn: () => !!BEDLIFY_API_KEY,
-  replays: () => replays
+  replays: () => replays,
+  backups: () => backups
 });
 // Recorded games for tracked players (see replays.js): stored in Backblaze B2.
 const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, hasFullAccess, UUID_RE, NAME_RE });
+// A copy of the whole database every day, in the same B2 bucket (see backup.js).
+const backups = require('./backup')({ mongoose });
 
 // Public, like the site's other read routes: it only says what works, never
 // any keys. Answers are shared and kept for a few minutes (see status.js).

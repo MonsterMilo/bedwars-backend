@@ -54,16 +54,19 @@ function presign({ method, bucket, endpoint, region, keyId, secret, key, expires
   return `https://${host}${uri}?${query}&X-Amz-Signature=${signature}`;
 }
 
+/** The B2 settings from env, or null when any is missing. */
+function b2Config(env) {
+  const endpoint = String(env.B2_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  const region = (endpoint.match(/^s3\.([a-z0-9-]+)\./) || [])[1];
+  if (!env.B2_KEY_ID || !env.B2_APP_KEY || !env.B2_BUCKET || !endpoint || !region) return null;
+  return { keyId: env.B2_KEY_ID, secret: env.B2_APP_KEY, bucket: env.B2_BUCKET, endpoint, region };
+}
+
 module.exports = function setupReplays({
   app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, UUID_RE, NAME_RE,
   hasFullAccess = () => true, env = process.env, http = axios, now = Date.now
 }) {
-  const config = () => {
-    const endpoint = String(env.B2_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
-    const region = (endpoint.match(/^s3\.([a-z0-9-]+)\./) || [])[1];
-    if (!env.B2_KEY_ID || !env.B2_APP_KEY || !env.B2_BUCKET || !endpoint || !region) return null;
-    return { keyId: env.B2_KEY_ID, secret: env.B2_APP_KEY, bucket: env.B2_BUCKET, endpoint, region };
-  };
+  const config = () => b2Config(env);
   const link = (method, key, expires, extra) => presign({ method, key, expires, extra, ...config() });
 
   const Replay = mongoose.model('Replay', new mongoose.Schema({
@@ -232,3 +235,4 @@ module.exports = function setupReplays({
 };
 
 module.exports.presign = presign;
+module.exports.b2Config = b2Config;
