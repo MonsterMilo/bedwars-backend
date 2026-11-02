@@ -1891,3 +1891,7 @@ module.exports = function setupDiscord({
 
   return { postNewSweat, refreshCard, sendDenickRequest, requestsOn };
 };
+
+// For the tests.
+module.exports.recapSlot = recapSlot;
+module.exports.previousSlot = previousSlot;
