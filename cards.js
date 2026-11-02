@@ -34,9 +34,6 @@ const FONTS = [
   font('Garamond', 'EBGaramond-500.ttf', 500), font('Garamond', 'EBGaramond-700.ttf', 700),
   font('Chakra', 'ChakraPetch-600.ttf', 600), font('Chakra', 'ChakraPetch-700.ttf', 700),
   font('Sora', 'Sora-500.ttf', 500), font('Sora', 'Sora-700.ttf', 700),
-  font('Grenze Gotisch', 'GrenzeGotisch-700.ttf', 700),
-  font('Grenze', 'Grenze-600.ttf', 600), font('Grenze', 'Grenze-700.ttf', 700),
-  font('Crimson Pro', 'CrimsonPro-600.ttf', 600),
   // ✫ ✪ ⚑ ⚠ and other symbols the theme fonts don't have.
   font('Symbols', 'DejaVuSans-Bold.ttf', 700)
 ];
@@ -169,23 +166,6 @@ const THEMES = {
     mc: { 0: '#4d6d78', 1: '#4a6cf0', 2: '#1fbf8f', 3: '#1aa3a3', 4: '#e0566b', 5: '#9b6bff', 6: '#f2b35a', 7: '#9fb8c0', 8: '#6f8c96', 9: '#5b8cff', a: '#5ef2b5', b: '#5ff0f0', c: '#ff7a8a', d: '#e28bff', e: '#f7e27a', f: '#e8fbff' },
     roster: { milo: '#35e6c4', potat: '#9b6bff', aballs: '#ffb454', zoiv: '#ff6bb8', max: '#4ade9f', sqoz: '#4fc3f7', kermit: '#9fe64f', ssent: '#ff8f5c', key: '#ffe066' },
     cheating: '#ff5a5a', boosting: '#f2b35a', removed: '#4d6d78'
-  },
-  hollowgrave: {
-    label: 'Hollow Grave', font: 'Grenze', label_: 'Grenze', body: 'Crimson Pro', note: 'Crimson Pro', title: 'Grenze Gotisch',
-    labelCase: 'uppercase', labelSpacing: 2, chipRadius: 6,
-    // A moonlit graveyard: night sky, carved stone panels, a headstone
-    // behind the skin, candle-orange glow on names.
-    page: { background: 'radial-gradient(circle at 82% 0%, #3b2f4f 0%, #120d1c 38%, #07060a 100%)' },
-    panel: { background: '#18141f', border: '2px solid #3a3544', borderRadius: 14 },
-    bar: { background: 'linear-gradient(180deg, #3a3544 0%, #2a2632 100%)', borderTop: '2px solid #575066', borderBottom: '2px solid #1c1924', borderLeft: '2px solid #2a2632', borderRight: '2px solid #2a2632', borderRadius: 10 },
-    slot: { background: '#1f1a28', border: '1px solid rgba(232,224,240,0.09)', borderTop: '3px solid #3a3544', borderRadius: 8 },
-    skinBg: { background: 'radial-gradient(circle at 50% 24%, rgba(241,216,138,0.2) 0%, #2a2632 58%)', border: '2px solid #4a4456', borderTopLeftRadius: 115, borderTopRightRadius: 115, borderBottomLeftRadius: 8, borderBottomRightRadius: 8 },
-    text: '#ece4f2', dim: '#aa9fb9', name: '#ece4f2', nameShadow: '0 0 12px rgba(242,140,40,0.8)',
-    glow: () => '0 2px 0 rgba(0,0,0,0.6)', chipText: '#07060a',
-    accent: '#f28c28', track: 'rgba(232,224,240,0.06)',
-    mc: { 0: '#716780', 1: '#7a7cff', 2: '#5ccf6a', 3: '#3fc8c8', 4: '#ff5468', 5: '#b47cff', 6: '#f28c28', 7: '#c9c0d8', 8: '#8a8098', 9: '#7fa0ff', a: '#b8ff5c', b: '#7fe8ff', c: '#ff6f6f', d: '#ff7fd8', e: '#ffe066', f: '#f6f0fb' },
-    roster: { milo: '#f28c28', potat: '#b47cff', aballs: '#ffcf5a', zoiv: '#ff6f9e', max: '#b8ff5c', sqoz: '#7fb4ff', kermit: '#5ee0a8', ssent: '#e2533a', key: '#f1d88a' },
-    cheating: '#ff5468', boosting: '#f28c28', removed: '#716780'
   }
 };
 const THEME_IDS = Object.keys(THEMES);
@@ -324,70 +304,17 @@ const ratioColor = (t, v, steps) => t.mc[tierCode(v, steps)];
 // --- Rivals (tryout) ---
 // Someone the roster has beaten in 2+ logged games. Each theme names and
 // dresses them its own way, the same as the website: a neon tag, a rubber
-// stamp, a claret bookmark, a hostile sonar contact, a Minecraft item
-// tooltip, and a caged grave (a mortsafe). rival: { games, who: [{ key, n }] }
+// stamp, a claret bookmark, a hostile sonar contact and a Minecraft item
+// tooltip. rival: { games, who: [{ key, n }] }
 const RIVAL_LOOK = {
   neon: { word: 'Rival', font: 'Manrope', color: '#ff4fd8', box: { background: '#0a0d18', border: '2px solid #ff4fd8', borderRadius: 999 }, glow: '0 0 10px rgba(255,79,216,0.9)', icon: '⚔' },
   casefiles: { word: 'Repeat offender', font: 'Anton', color: '#a32f1d', box: { border: '4px solid #a32f1d', transform: 'rotate(-3deg)', background: 'rgba(163,47,29,0.06)' }, size: 24 },
   ledger: { word: 'Rival', font: 'Playfair', color: '#f0d28a', box: { background: 'linear-gradient(90deg, #5a121c, #9a2535 45%, #6a1622)', border: '2px solid #c9a24a' }, icon: '⚔', labelCase: 'none' },
   deepcurrent: { word: 'Hostile', font: 'Chakra', color: '#ff5a5a', box: { background: 'rgba(30,6,12,0.92)', border: '2px solid rgba(255,90,90,0.7)', borderRadius: 6 }, glow: '0 0 8px rgba(255,90,90,0.7)', diamond: true },
   skyisles: { word: 'Nemesis', font: 'Jersey', color: '#ff55ff', box: { background: '#100010', border: '3px solid #2a0960' }, glow: '2px 2px 0 #3f003f', icon: '⚔', size: 30, labelCase: 'none' },
-  hollowgrave: { word: 'Restless', font: 'Grenze', color: '#b8ff5c', box: { background: 'linear-gradient(180deg, #3a3544, #2a2632)', border: '2px solid #575066', borderRadius: 6 }, glow: '0 0 10px rgba(184,255,92,0.6)', icon: '✝' }
 };
-// Hollow Grave's badge is a mortsafe, the same as the website: iron bars
-// with spear-point tops, rust under the bolts, soil heaped at the foot and
-// a padlock with the count in Roman numerals.
-const ROMAN = [[1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'], [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']];
-const toRoman = n => ROMAN.reduce((out, [v, d]) => { while (n >= v) { out += d; n -= v; } return out; }, '');
-function mortsafe(games) {
-  const iron = 'linear-gradient(90deg, #050407 0%, #6e6578 30%, #1c1820 55%, #08070a 100%)';
-  const rail = 'linear-gradient(180deg, #6e6578 0%, #1c1820 45%, #050407 100%)';
-  const W = 150, HT = 70, bars = [6, 40, 74, 108, 142];
-  const abs = (style, ...kids) => h('div', { position: 'absolute', ...style }, ...kids);
-  const cage = abs({ left: 12, top: 30, width: W, height: HT },
-    // Spear points, then the bars with rust bleeding down from the bolts.
-    bars.map(x => abs({ left: x - 4, top: 2, width: 10, height: 10, background: 'linear-gradient(135deg, #8a8094 0%, #1c1820 50%, #050407 100%)', transform: 'rotate(45deg)' })),
-    bars.map(x => abs({ left: x - 3, top: 8, width: 6, height: HT - 8, background: iron })),
-    bars.map((x, i) => abs({ left: x - 3, top: 16, width: 6, height: [26, 18, 30, 14, 22][i], background: 'linear-gradient(180deg, rgba(128,58,22,0.9) 0%, rgba(128,58,22,0) 100%)' })),
-    abs({ left: 0, top: 13, width: W, height: 7, background: rail }),
-    abs({ left: 0, top: HT - 14, width: W, height: 7, background: rail }),
-    bars.map(x => abs({ left: x - 2, top: 14, width: 5, height: 5, borderRadius: 3, background: '#a59bb0', border: '1px solid #1c1820' })),
-    // Disturbed soil heaped at the foot.
-    abs({ left: -8, top: HT - 10, width: W + 16, height: 18, borderRadius: 40, background: 'radial-gradient(ellipse at 50% 30%, #241a20 0%, #0d0a12 70%)' }),
-    abs({ left: 22, top: HT - 15, width: 9, height: 7, borderRadius: 5, background: '#1d1620' }),
-    abs({ left: 96, top: HT - 17, width: 7, height: 6, borderRadius: 4, background: '#241b22' }),
-    // The padlock: shackle round the top rail, the count cut into the face.
-    abs({ left: 58, top: 4, width: 22, height: 20, border: '5px solid #2a2530', borderBottom: 'none', borderTopLeftRadius: 12, borderTopRightRadius: 12 }),
-    abs({
-      left: 52, top: 20, width: 34, height: 32, borderRadius: 5, flexDirection: 'column', alignItems: 'center', justifyContent: 'flex-start',
-      background: 'linear-gradient(160deg, #3a3441 0%, #17131b 50%, #060508 100%)', border: '2px solid #050407', paddingTop: 3
-    },
-      text(toRoman(games), { fontFamily: 'Grenze', fontSize: 15, fontWeight: 700, color: '#c9bfd3', lineHeight: 1 }),
-      h('div', { width: 6, height: 6, borderRadius: 3, background: '#050407', marginTop: 2 }),
-      h('div', { width: 2, height: 5, background: '#050407' })));
-  // The headstone behind it, so the dark iron stands out on the card.
-  return h('div', { position: 'relative', width: W + 24, height: HT + 36, flexShrink: 0 },
-    abs({
-      left: 4, top: 0, width: W + 16, height: HT + 24, justifyContent: 'center',
-      background: 'linear-gradient(180deg, #5a5368 0%, #3a3544 55%, #2a2632 100%)', border: '2px solid #6a6278',
-      borderTopLeftRadius: 60, borderTopRightRadius: 60, borderBottomLeftRadius: 4, borderBottomRightRadius: 4
-    }, text('R.I.P.', { fontFamily: 'Grenze', fontSize: 15, fontWeight: 700, color: '#2a2530', letterSpacing: 4, marginTop: 10, lineHeight: 1 })),
-    cage);
-}
-
 function rivalRow(t, rival) {
   const look = RIVAL_LOOK[t.id] || RIVAL_LOOK.neon;
-  if (t.id === 'hollowgrave') {
-    const person = w => h('div', { alignItems: 'center', gap: 7 },
-      rosterIcons(t, [w.key], 26),
-      text(LABELS[w.key] || w.key, { fontFamily: t.body, fontSize: size(t, 21), fontWeight: 700, color: t.text, lineHeight: 1 }),
-      w.n > 1 ? text(`×${w.n}`, { fontFamily: t.font, fontSize: size(t, 21), fontWeight: 800, color: look.color, lineHeight: 1 }) : null);
-    return h('div', { alignItems: 'center', flexWrap: 'wrap', gap: 18, marginTop: 16 },
-      mortsafe(rival.games),
-      h('div', { flexDirection: 'column', gap: 10 },
-        text(`Caged after ${rival.games} risings`, { fontFamily: 'Grenze', fontSize: size(t, 26), fontWeight: 700, color: t.text, lineHeight: 1 }),
-        h('div', { alignItems: 'center', flexWrap: 'wrap', gap: 14 }, rival.who.map(person))));
-  }
   const px = size(t, look.size ? Math.round(look.size / (t.bigger || 1)) : 22);
   const badge = h('div', { alignItems: 'center', gap: 9, padding: '6px 14px', flexShrink: 0, ...look.box },
     look.icon ? text(look.icon, { fontFamily: 'Symbols', fontSize: Math.round(px * 0.8), color: look.color, textShadow: look.glow || 'none' }) : null,
@@ -593,9 +520,9 @@ function leaderboardCard(themeId, data) {
 // his answers to denick requests).
 function denickCard(themeId, data) {
   const t = { ...theme(themeId), id: themeId in THEMES ? themeId : 'neon' };
-  // Where the accent is itself gold (Private Bank, Hollow Grave), Denicker
+  // Where the accent is itself gold (Private Bank), Denicker
   // takes the theme's blue so it can't be mistaken for Diamond Dome.
-  const denickerColor = t.id === 'ledger' || t.id === 'hollowgrave' ? t.mc['9'] : t.accent;
+  const denickerColor = t.id === 'ledger' ? t.mc['9'] : t.accent;
   const SOURCE_COLORS = { 'Denicker API': denickerColor, 'Denicker DB': denickerColor, 'Diamond Dome': t.mc['6'], Tricktracker: t.mc['5'], Bedlify: t.mc.c, Milo: t.roster.milo };
   const sourceColor = s => SOURCE_COLORS[s] || t.dim;
   const plain = t.slotText || t.text;
