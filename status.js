@@ -39,7 +39,7 @@ const timed = (ms, detail) => (ms > SLOW_MS
 
 module.exports = function setupStatus({
   mongoose, Sweat, LIVE, bordicGet, coralGet, denickerGet, bedlifyPing, denick,
-  hypixelKey, urchinOn, denickerOn, bedlifyOn, describeAxiosError, replays = () => null, http = axios
+  hypixelKey, urchinOn, denickerOn, bedlifyOn, describeAxiosError, replays = () => null, backups = () => null, http = axios
 }) {
   const CHECKS = [
     {
@@ -143,6 +143,20 @@ module.exports = function setupStatus({
         const share = u.bytes / u.freeBytes;
         const detail = `${u.count.toLocaleString('en-US')} replays, ${gb(u.bytes)} GB of ${gb(u.freeBytes)} GB free`;
         return { state: share >= 0.8 ? 'warn' : 'ok', detail: share >= 0.8 ? `Nearly full: ${detail}` : detail };
+      }
+    },
+    {
+      // The daily database copy (backup.js). Late after 36 hours.
+      id: 'backups', name: 'Database backup',
+      async run() {
+        const b = backups();
+        if (!b || !b.configured()) return { state: 'off', detail: 'Not set up' };
+        if (mongoose.connection.readyState !== 1) return { state: 'down', detail: 'Database not connected' };
+        const last = await b.latest();
+        if (!last) return { state: 'warn', detail: 'No copy yet' };
+        const at = new Date(last.at).getTime();
+        const detail = `Last copy ${ago(at)}, ${(last.bytes / 1e6).toFixed(1)} MB, keeping ${b.keepDays} days`;
+        return { state: Date.now() - at > 36 * 60 * 60 * 1000 ? 'warn' : 'ok', detail };
       }
     },
     ...denick.scrapedNames().map(name => ({
