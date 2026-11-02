@@ -491,13 +491,22 @@ async function resolvePlayer(identifier) {
     }
     const bordicDetail = describeAxiosError(bordicErr);
     console.warn('Bordic resolve failed, falling back to Mojang:', bordicDetail);
+    let mojangRes;
     try {
-      const mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(identifier)}`, { timeout: 10_000 });
-      return mojangRes.data;
+      mojangRes = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(identifier)}`, { timeout: 10_000 });
     } catch (mojangErr) {
       mojangErr.bordicDetail = bordicDetail;
+      if (mojangErr.response && mojangErr.response.status === 404) mojangErr.status = 404;
       throw mojangErr;
     }
+    // Mojang answers 204 with no body (older API) for an unknown name: the
+    // same "not found" as a 404, so every caller can just check err.status.
+    if (!mojangRes.data || !mojangRes.data.id) {
+      const notFound = new Error('Not found');
+      notFound.status = 404;
+      throw notFound;
+    }
+    return mojangRes.data;
   }
 }
 
@@ -509,6 +518,9 @@ function isRetryable(err) {
 }
 
 // Get Hypixel's raw player payload (wrapped as { player }), trying Bordic first.
+// Bordic can also answer with no player (not cached yet, or never played):
+// then our own key is tried too, and if that can't help either the answer
+// stays "no player" rather than an error.
 // Bordic answers straight from its cache for players it has seen lately, but
 // has to go to Hypixel for one it hasn't, which can be slow or briefly fail.
 // That's why a player that loaded fine when added (cache warm) could later
@@ -520,14 +532,25 @@ async function getHypixelPlayer(identifier) {
     const data = await bordicGet('/v3/cache/hypixel', { uuid }, 15_000);
     return { player: data.player };
   };
+  const fromHypixel = async () => {
+    // Hypixel's v2 API, with the key in the API-Key header (the old
+    // /player?key= form is deprecated).
+    const hypRes = await axios.get('https://api.hypixel.net/v2/player', {
+      params: { uuid },
+      headers: { 'API-Key': HYPIXEL_API_KEY },
+      timeout: 15_000
+    });
+    return hypRes.data;
+  };
+  let bordicAnswer;
   try {
     try {
-      return await fromBordic();
+      bordicAnswer = await fromBordic();
     } catch (firstErr) {
       if (!isRetryable(firstErr)) throw firstErr;
       console.warn('Bordic hypixel/player failed, retrying once:', describeAxiosError(firstErr));
       await new Promise(r => setTimeout(r, 1_500));
-      return await fromBordic();
+      bordicAnswer = await fromBordic();
     }
   } catch (bordicErr) {
     const bordicDetail = describeAxiosError(bordicErr);
@@ -537,17 +560,20 @@ async function getHypixelPlayer(identifier) {
       throw bordicErr;
     }
     try {
-      const hypRes = await axios.get('https://api.hypixel.net/player', {
-        params: { key: HYPIXEL_API_KEY, uuid },
-        timeout: 15_000
-      });
-      return hypRes.data;
+      return await fromHypixel();
     } catch (hypErr) {
       // Surface both failure reasons - the fallback failing (often just an
       // expired temp key) shouldn't hide why the primary source failed too.
       hypErr.bordicDetail = bordicDetail;
       throw hypErr;
     }
+  }
+  if (bordicAnswer.player || !HYPIXEL_API_KEY) return bordicAnswer;
+  try {
+    const direct = await fromHypixel();
+    return direct && direct.player ? direct : bordicAnswer;
+  } catch {
+    return bordicAnswer; // the backup key is often expired: keep "no player"
   }
 }
 
@@ -1426,6 +1452,12 @@ async function loadNoteForChange(req, res, action) {
   }
   if (!withinChangeWindow(req, note.createdAt, action)) {
     res.status(403).json({ error: changeWindowError(action, 'notes') });
+    return null;
+  }
+  // An edited note still shows who wrote it, so a personal key may only
+  // edit its own (removing someone else's stays allowed, within the window).
+  if (action === 'edit' && !hasFullAccess(req.keyOwner) && (note.author || '') !== req.keyOwner) {
+    res.status(403).json({ error: 'You can only edit notes you wrote yourself' });
     return null;
   }
   return { sweat, note };

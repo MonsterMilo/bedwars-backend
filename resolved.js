@@ -141,14 +141,18 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const ignore404 = err => { if (!err.response || err.response.status !== 404) throw err; };
 
+  // Only a real "no such name" (renamed since) marks the row as tried; a
+  // timeout, a rate limit or Bordic being down leaves it to try next time,
+  // so a short outage can't leave nicks without their head and link for good.
   async function ensureUuid(row) {
     if (row.uuid || row.uuidTried || !resolvePlayer) return;
     try {
       const p = await resolvePlayer(row.player);
       const id = String((p && p.id) || '').replace(/-/g, '').toLowerCase();
       if (UUID_RE.test(id)) row.uuid = id;
-    } catch {
-      // Unknown name now (renamed since): shown without one.
+    } catch (err) {
+      const notFound = err && (err.status === 404 || (err.response && [204, 404].includes(err.response.status)));
+      if (!notFound) return; // try again next time
     }
     row.uuidTried = true;
     if (row.uuid) nameUuid.set(row.playerLower, row.uuid);
@@ -395,6 +399,61 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     });
   }
 
+  // Takes back what one source said about a nick: Milo changing a Found
+  // answer, for example. If that source's player is the nick's current
+  // owner, the newest earlier owner (from the history) takes it back, or
+  // the nick is removed when there's nobody else; its message is redrawn.
+  // An older mention in the history is just dropped. Never rejects.
+  // -> true if anything changed.
+  function retract(nick, player, source) {
+    const key = String(nick || '').toLowerCase();
+    const who = String(player || '').toLowerCase();
+    return queued(async () => {
+      await load();
+      const row = rows.get(key);
+      if (!row) return false;
+      if (row.playerLower === who && row.source === source) {
+        const oldMessage = row.messageId;
+        if (row.alsoIn.length) {
+          // Another source knows the same pair: it stays, under that source.
+          row.source = row.alsoIn[0];
+          row.alsoIn = row.alsoIn.slice(1);
+          await save(row, { source: row.source, alsoIn: row.alsoIn });
+          if (oldMessage && postingOn) await redraw(oldMessage).catch(err => console.warn('Resolved nicks: redrawing a taken-back nick failed', err.message));
+          return true;
+        }
+        const back = row.history[0];
+        if (!back) {
+          rows.delete(key);
+          await ResolvedNick.deleteOne({ nickLower: key });
+          if (oldMessage && postingOn) await redraw(oldMessage).catch(err => console.warn('Resolved nicks: tidying a taken-back nick failed', err.message));
+          return true;
+        }
+        Object.assign(row, {
+          player: back.player, playerLower: back.player.toLowerCase(), source: back.source || 'Unknown', seenAt: back.seenAt || 0,
+          history: row.history.slice(1), alsoIn: [], uuid: null, uuidTried: false, taken: false, needsPost: !!oldMessage
+        });
+        await save(row, { player: row.player, playerLower: row.playerLower, source: row.source, seenAt: row.seenAt,
+          history: row.history, alsoIn: [], uuid: null, uuidTried: false, taken: false, needsPost: row.needsPost });
+        if (row.needsPost) schedulePost(key);
+        return true;
+      }
+      if (row.playerLower === who && row.alsoIn.includes(source)) {
+        row.alsoIn = row.alsoIn.filter(s => s !== source);
+        await save(row, { alsoIn: row.alsoIn });
+        return true;
+      }
+      const before = row.history.length;
+      row.history = row.history.filter(h => !(h.player.toLowerCase() === who && h.source === source));
+      if (row.history.length === before) return false;
+      await save(row, { history: row.history });
+      return true;
+    }).catch(err => {
+      console.error('Resolved nicks: taking back failed', err.message);
+      return false;
+    });
+  }
+
   // A gist just loaded (parsed as in denick.js). Its first load ever, and
   // every load of a frozen one, goes in quietly.
   async function recordScraped(source, data) {
@@ -475,7 +534,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     return { nicks: c.nicks, players: c.players, toPost: c.toPost.length, messages: Math.ceil(c.toPost.length / PER_MESSAGE), redraws: c.redraws.length, postingOn };
   };
 
-  return { record, recordScraped, search, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
+  return { record, retract, recordScraped, search, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
 };
 
 module.exports.toMs = toMs;
