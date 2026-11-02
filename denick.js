@@ -16,18 +16,17 @@
 
 const axios = require('axios');
 
-// Both scraped datasets are frozen for good (Milo, Oct 2026): Diamond
-// Dome's denicking method died and Tricktracker won't be updated again.
-// /status only checks that each still loads and has nicks, never its age.
-// Bedlify's #nicks list (the #nicks channel of the "We scam and hack everyone"
-// server, added Oct 2026, shown as "Bedlify" like the live Bedlify lookup;
-// status id 'observer' so it doesn't clash with that check) is live: Milo
-// refreshes it with his Refresh Observer
-// shortcut, and /status warns once its newest sighting gets old.
+// All three scraped datasets are frozen for good: Diamond Dome's
+// denicking method died and Tricktracker won't be updated again (Milo, Oct
+// 2026), and Bedlify's #nicks list (the #nicks channel of the "We scam and
+// hack everyone" server, shown as "Bedlify" like the live Bedlify lookup;
+// status id 'observer' so it doesn't clash with that check) stopped too
+// (Milo, Nov 2026). /status only checks that each still loads and has nicks,
+// never its age.
 const SCRAPED_SOURCES = [
   { name: 'Diamond Dome', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/169045d75d17d68a41d051bae056106d/raw/diamond-dome-nicks.json' },
   { name: 'Tricktracker', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/f599b8b81224056ea42a436ece0be5ed/raw/tricktracker-nicks.json' },
-  { name: 'Bedlify', id: 'observer', url: 'https://gist.githubusercontent.com/MonsterMilo/74fc374c134c5e09d5d79590fc7ed70f/raw/observer-nicks.json' }
+  { name: 'Bedlify', id: 'observer', frozen: true, url: 'https://gist.githubusercontent.com/MonsterMilo/74fc374c134c5e09d5d79590fc7ed70f/raw/observer-nicks.json' }
 ];
 const SCRAPED_REFRESH_MS = 30 * 60 * 1000;
 const SCRAPED_RETRY_MS = 60 * 1000; // after a failed load, before trying again
