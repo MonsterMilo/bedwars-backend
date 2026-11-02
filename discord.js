@@ -215,6 +215,10 @@ function recapSlot(now = new Date()) {
   if (toInstant(wall) > now.getTime()) wall -= 7 * DAY_MS;
   return new Date(toInstant(wall));
 }
+// The Sunday 8pm before `slot`. Not just 7 x 24 hours back: the week a
+// clock change happens in is an hour shorter or longer, and every sweat
+// should land in exactly one recap.
+const previousSlot = slot => recapSlot(new Date(slot.getTime() - 1));
 // "Oct 5" in New York time.
 const nyDay = d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: RECAP_TZ });
 
@@ -729,7 +733,14 @@ module.exports = function setupDiscord({
       let line = null;
       if (!sweat) {
         let player;
-        try { player = await resolvePlayer(name); } catch { return `**${name}** isn't on the sweat list.`; }
+        try {
+          player = await resolvePlayer(name);
+        } catch (err) {
+          // Not a real name: not on the list. Anything else (the lookup
+          // services down) means it couldn't be checked for a renamed player.
+          if (err.status === 404) return `**${name}** isn't on the sweat list.`;
+          return `**${name}** isn't on the sweat list under that name, and the name lookup isn't answering right now, so a renamed player couldn't be checked. Try again in a minute.`;
+        }
         const forms = uuidForms(player.id);
         sweat = forms.length ? await Sweat.findOne({ ...LIVE, uuid: { $in: forms } }).sort({ createdAt: -1 }).lean() : null;
         if (!sweat) return `**${player.name || name}** isn't on the sweat list.`;
@@ -1026,7 +1037,11 @@ module.exports = function setupDiscord({
     const who = roster.get(userOf(interaction));
     if (!fresh && !who) return reply(res, NOT_LINKED);
     res.json({ type: DEFER_UPDATE });
-    const found = fresh ? kept.found : await denickSearch(who, mode, name);
+    let found = fresh ? kept.found : null;
+    if (!found) {
+      found = await denickSearch(who, mode, name);
+      logDenick(who, 'bot', mode, name, found.results, found.results.length, found.partial || !!found.limitedUntil);
+    }
     return editOriginal(interaction, await denickPage(found, Number(page), themeOfMessage(interaction.message) || themeOf(userOf(interaction))));
   }
 
@@ -1271,7 +1286,7 @@ module.exports = function setupDiscord({
       .reduce((o, f) => { o[f] = 1; return o; }, {});
     const [sweats, before] = await Promise.all([
       Sweat.find({ ...LIVE, createdAt: { $gte: from, $lt: to } }, keep).lean(),
-      full ? Sweat.countDocuments({ ...LIVE, createdAt: { $gte: new Date(from.getTime() - 7 * DAY_MS), $lt: from } }) : null
+      full ? Sweat.countDocuments({ ...LIVE, createdAt: { $gte: previousSlot(from), $lt: from } }) : null
     ]);
     const key = sw => (sw.uuid || sw.username || '').replace(/-/g, '').toLowerCase();
     const seen = new Set();
@@ -1330,7 +1345,7 @@ module.exports = function setupDiscord({
     const theme = themeOf(userOf(interaction));
     const slot = recapSlot();
     return withCard(interaction, res, () => (last
-      ? recapMessage(new Date(slot.getTime() - 7 * DAY_MS), slot, theme, true)
+      ? recapMessage(previousSlot(slot), slot, theme, true)
       : recapMessage(slot, new Date(), theme, false)));
   }
 
@@ -1353,7 +1368,7 @@ module.exports = function setupDiscord({
     }
     const startedAt = Date.now();
     try {
-      const msg = await recapMessage(new Date(slot.getTime() - 7 * DAY_MS), slot, DEFAULT_THEME, true);
+      const msg = await recapMessage(previousSlot(slot), slot, DEFAULT_THEME, true);
       await send('post', `/channels/${CHANNEL_ID}/messages`, msg, startedAt);
       console.log(`Weekly recap posted for ${slot.toISOString()}`);
     } catch (err) {
@@ -1385,7 +1400,9 @@ module.exports = function setupDiscord({
     try {
       player = await resolvePlayer(name);
     } catch (err) {
-      return editOriginal(interaction, { content: err.status === 404 ? `No Minecraft account is called **${name}**. Nothing was added.` : OOPS });
+      return editOriginal(interaction, { content: err.status === 404
+        ? `No Minecraft account is called **${name}**. Nothing was added.`
+        : `Couldn't look up **${name}** right now (the name lookup isn't answering). Nothing was added, try again in a minute.` });
     }
     const ign = player.name || name;
     const changed = await resolved.record([{ nick, player: ign, uuid: player.id, source: 'Milo', seenAt: Date.now() }]);
@@ -1781,8 +1798,17 @@ module.exports = function setupDiscord({
       status: kind, names, namesLower: names.map(n => n.toLowerCase()), reply: replyText || '', answeredAt: new Date()
     } }, { new: true }).lean();
     if (!updated) return followUp(interaction, 'That request is gone.');
-    // A Found answer is a resolved nick like any other (resolved.js).
-    if (kind === 'found' && resolved) resolved.record([{ nick: updated.nick, player: names[0], source: 'Milo', seenAt: Date.now() }]);
+    // A Found answer is a resolved nick like any other (resolved.js). If an
+    // earlier Found answer named someone else (or the answer is no longer
+    // Found), that one is taken back first, so searches and the resolved
+    // nicks channel don't keep the old name.
+    if (resolved) {
+      const before = r.status === 'found' ? r.names[0] : null;
+      if (before && !(kind === 'found' && names[0].toLowerCase() === before.toLowerCase())) {
+        await resolved.retract(updated.nick, before, 'Milo');
+      }
+      if (kind === 'found') resolved.record([{ nick: updated.nick, player: names[0], source: 'Milo', seenAt: Date.now() }]);
+    }
 
     // Tell whoever asked (not Milo answering his own).
     let notified = updated.by === 'milo';
