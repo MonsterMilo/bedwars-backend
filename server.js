@@ -12,7 +12,25 @@ const mongoose = require('mongoose');
 const crypto = require('crypto');
 
 const app = express();
-app.set('trust proxy', 1); // Render sits behind a proxy; needed for correct client IPs in rate limiting
+// Render sits behind a proxy; needed for correct client IPs in rate limiting.
+// TRUST_PROXY is how many proxies sit in front of the app (default 1). The
+// first request after each start logs what that gives (see below), so the
+// hop count can be checked in Render's logs.
+const TRUST_PROXY = /^\d+$/.test(process.env.TRUST_PROXY || '') ? Number(process.env.TRUST_PROXY) : 1;
+app.set('trust proxy', TRUST_PROXY);
+let ipChecked = false;
+app.use((req, res, next) => {
+  const forwarded = req.get('x-forwarded-for');
+  if (!ipChecked && forwarded) {
+    ipChecked = true;
+    const hops = forwarded.split(',').map(s => s.trim()).filter(Boolean);
+    const verdict = hops[0] === req.ip
+      ? 'the first address (the visitor), so per-IP rate limits are right'
+      : `not the first address, so it's probably a proxy and every visitor may share one limit: set TRUST_PROXY=${hops.length} in Render`;
+    console.log(`Client IP check: trust proxy ${TRUST_PROXY}, x-forwarded-for has ${hops.length} address(es), and the IP used is ${verdict}`);
+  }
+  next();
+});
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const HYPIXEL_API_KEY = process.env.HYPIXEL_API_KEY;
@@ -535,10 +553,22 @@ async function getHypixelPlayer(identifier) {
 
 // --- MongoDB (Mongoose) setup ---
 mongoose.set('strictQuery', false);
-mongoose
-  .connect(MONGODB_URI || 'mongodb://localhost:27017/bedwars')
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.warn('MongoDB connection error:', err.message));
+// Mongoose only reconnects by itself once a first connection has worked. If
+// that first try fails (an Atlas blip during a deploy), keep trying, with a
+// growing wait, instead of running without a database until the next
+// deploy. The startup jobs below wait for the 'open' this eventually gives.
+let mongoRetryMs = 5000;
+function connectMongo() {
+  mongoose
+    .connect(MONGODB_URI || 'mongodb://localhost:27017/bedwars')
+    .then(() => console.log('Connected to MongoDB'))
+    .catch(err => {
+      console.warn(`MongoDB connection error: ${err.message}. Trying again in ${mongoRetryMs / 1000}s.`);
+      setTimeout(connectMongo, mongoRetryMs);
+      mongoRetryMs = Math.min(mongoRetryMs * 2, 60 * 1000);
+    });
+}
+connectMongo();
 
 const sweatSchemaFields = {
   username: { type: String, required: true },
@@ -722,7 +752,14 @@ function cleanNoteText(raw) {
 
 
 // --- Health ---
+// /ping: always ok while the server is up (the keep-alive pinger uses it).
+// /health: also says whether MongoDB is connected, answering 503 when it
+// isn't, for Render's health check.
 app.get('/ping', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+app.get('/health', (req, res) => {
+  const db = mongoose.connection.readyState === 1;
+  res.status(db ? 200 : 503).json({ ok: db, db: db ? 'connected' : 'not connected', ts: new Date().toISOString() });
+});
 
 // Who the presented key belongs to, so the site can say "Writing as Milo"
 // and check a key when it's entered. { who: null } for no/unknown key.
@@ -943,7 +980,10 @@ mongoose.connection.once('open', () => {
   // in the gists' format: taken in quietly, never posted. Unchanged rows
   // cost nothing, so it simply runs at every start.
   try {
-    const data = require('./denick').parseScraped(require('./data/denicker-db-nicks.json'));
+    // Read with fs rather than require, so the raw JSON isn't kept in
+    // require's cache for the life of the process (about 10 MB).
+    const raw = JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'data', 'denicker-db-nicks.json'), 'utf8'));
+    const data = require('./denick').parseScraped(raw);
     resolved.recordScraped({ name: 'Denicker DB', frozen: true }, data);
   } catch (err) {
     console.error('Resolved nicks: reading data/denicker-db-nicks.json failed', err.message);
@@ -1532,4 +1572,42 @@ app.get('/stats/uuid/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter
   }
 });
 
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+// --- Errors ---
+// Every error answers as short JSON, never Express's default HTML page with
+// a stack trace and file paths (that page shows whenever NODE_ENV isn't
+// "production"). Refused origins and bad JSON are the caller's fault, so
+// they get a 4xx and only a one-line log.
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  if (res.headersSent) return req.socket.destroy();
+  if (err && err.message === 'Not allowed by CORS') return res.status(403).json({ error: 'This website isn\'t allowed to use the API' });
+  if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'The request body isn\'t valid JSON' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'The request is too big' });
+  const status = err && Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
+  if (status === 500) console.error(`Unhandled error on ${req.method} ${req.path}`, err);
+  return res.status(status).json({ error: status === 500 ? 'Something went wrong on the server.' : 'Bad request' });
+});
+
+// A promise someone forgot to catch is logged, not a crash: Node would
+// otherwise stop the whole server (and the bot) over one failed request.
+process.on('unhandledRejection', err => console.error('Unhandled promise rejection', err));
+
+const server = app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+
+// Render sends SIGTERM before replacing the server on a deploy. Stop taking
+// new requests, give the ones in flight (and replies that are still being
+// drawn) a few seconds, then close the database and exit.
+let stopping = false;
+function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  console.log(`${signal}: finishing up before exit`);
+  server.close();
+  setTimeout(() => {
+    // The database gets two seconds to close cleanly; then exit regardless.
+    setTimeout(() => process.exit(0), 2000);
+    mongoose.disconnect().catch(() => {}).finally(() => process.exit(0));
+  }, 8000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
