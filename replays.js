@@ -188,6 +188,45 @@ module.exports = function setupReplays({
     }
   });
 
+  // The replay viewer page: one replay's details (title, players, map).
+  app.get('/replays/:id', requireWriteKey, proxyLimiter, async (req, res) => {
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Bad id' });
+      const doc = await Replay.findById(req.params.id).lean();
+      if (!doc || doc.status !== 'ready') return res.status(404).json({ error: 'No such replay' });
+      return res.json(publicReplay(doc));
+    } catch (err) {
+      console.error('/replays/:id error', err);
+      return res.status(500).json({ error: 'DB read error' });
+    }
+  });
+
+  // The replay viewer page: the file itself, passed through from B2. The
+  // bucket has no CORS rules, so the browser can't read B2's link directly;
+  // here the file streams through without being held in memory.
+  app.get('/replays/:id/file', requireWriteKey, proxyLimiter, async (req, res) => {
+    if (!config()) return res.status(503).json({ error: 'Replay storage is not set up on the server' });
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Bad id' });
+      const doc = await Replay.findById(req.params.id).lean();
+      if (!doc || doc.status !== 'ready') return res.status(404).json({ error: 'No such replay' });
+      const r = await http.get(link('GET', doc.key, 60), { responseType: 'stream', validateStatus: () => true, timeout: 20000 });
+      if (r.status !== 200) {
+        if (r.data && r.data.destroy) r.data.destroy();
+        return res.status(502).json({ error: `Storage answered ${r.status}` });
+      }
+      res.set('Content-Type', 'application/octet-stream');
+      res.set('Cache-Control', 'private, max-age=3600');
+      if (r.headers['content-length']) res.set('Content-Length', r.headers['content-length']);
+      r.data.on('error', (err) => { console.warn('/replays file stream error', err.message); res.destroy(err); });
+      req.on('close', () => { if (!res.writableEnded && r.data.destroy) r.data.destroy(); });
+      r.data.pipe(res);
+    } catch (err) {
+      console.error('/replays file error', err.message);
+      if (!res.headersSent) return res.status(500).json({ error: 'Couldn\'t load the file' });
+    }
+  });
+
   // Milo can remove a replay (its file and its row).
   app.delete('/replays/:id', requireWriteKey, requireFullAccess, writeLimiter, async (req, res) => {
     if (!config()) return res.status(503).json({ error: 'Replay storage is not set up on the server' });
