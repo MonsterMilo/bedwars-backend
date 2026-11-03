@@ -97,6 +97,16 @@ test('the resolved nicks export and replay uploads are full-access only', async 
   assert.equal((await call('POST', '/replays', { key: 'potat-key', body })).status, 403);
 });
 
+test('the replay viewer routes need a key', async () => {
+  const id = '0123456789abcdef01234567';
+  assert.equal((await call('GET', `/replays/${id}`)).status, 401);
+  assert.equal((await call('GET', `/replays/${id}/file`)).status, 401);
+  assert.equal((await call('GET', '/replays/nope', { key: 'potat-key' })).status, 400);
+  assert.equal((await call('GET', `/replays/${id}`, { key: 'potat-key' })).status, 404);
+  // No B2 settings in the test server.
+  assert.equal((await call('GET', `/replays/${id}/file`, { key: 'potat-key' })).status, 503);
+});
+
 test('health reports the database', async () => {
   const h = await call('GET', '/health');
   assert.equal(h.status, 200);
