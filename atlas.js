@@ -29,7 +29,8 @@ const SOURCE_ID_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
 
 module.exports = function setupAtlas({
   app, mongoose, Replay, requireWriteKey, writeLimiter, proxyLimiter,
-  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now, inProcess = process.env.ATLAS_IN_PROCESS === '1'
+  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now, inProcess = process.env.ATLAS_IN_PROCESS === '1',
+  waitTurn = async () => {} // resolves when no other replay is being unzipped (Render has 512 MB)
 }) {
   const config = () => b2Config(env);
 
@@ -145,6 +146,7 @@ module.exports = function setupAtlas({
     const todo = replays.filter(r => !done.has(String(r._id))).slice(0, BATCH);
     let read = 0;
     for (const r of todo) {
+      await waitTurn();
       const source = { id: String(r._id), playedAt: r.playedAt ? new Date(r.playedAt).toISOString() : null };
       let slug = null; let error = null;
       try {

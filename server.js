@@ -1094,12 +1094,18 @@ const status = require('./status')({
   denickerOn: () => !!DENICKER_API_KEY,
   bedlifyOn: () => !!BEDLIFY_API_KEY,
   replays: () => replays,
+  clips: () => clips,
   backups: () => backups
 });
 // Recorded games for tracked players (see replays.js): stored in Backblaze B2.
-const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, hasFullAccess, UUID_RE, NAME_RE, onReady: () => atlas.kick() });
+const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, hasFullAccess, UUID_RE, NAME_RE });
+// Clips of the moments tracked players were beaten (see clips.js), cut from
+// each replay once it's uploaded.
+const clips = require('./clips')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
 // Prism Atlas (see atlas.js): every map, rebuilt from the replays' pre-game chunks.
-const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
+const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess, waitTurn: () => clips.idle() });
+// After an upload: its clips are cut, and the Atlas reads its map.
+replays.onReady = (id) => { clips.enqueue(id); atlas.kick(); };
 // A copy of the whole database every day, in the same B2 bucket (see backup.js).
 const backups = require('./backup')({ mongoose });
 

@@ -64,7 +64,7 @@ function b2Config(env) {
 
 module.exports = function setupReplays({
   app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, UUID_RE, NAME_RE,
-  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now, onReady = () => {}
+  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now
 }) {
   const config = () => b2Config(env);
   const link = (method, key, expires, extra) => presign({ method, key, expires, extra, ...config() });
@@ -78,9 +78,16 @@ module.exports = function setupReplays({
     mode: String,
     map: String,
     // The tracked players it's for (uuid without dashes, lower case).
-    players: [{ uuid: { type: String, index: true }, username: String }],
+    // nick: the name they played under, when the plugin knows it (clips
+    // find them in the game by it).
+    players: [{ uuid: { type: String, index: true }, username: String, nick: String }],
     uploadedBy: String,
-    status: { type: String, default: 'pending' } // 'pending' until the file is in B2, then 'ready'
+    status: { type: String, default: 'pending' }, // 'pending' until the file is in B2, then 'ready'
+    // /clip in game: ms into the recording where Milo typed it (clips.js
+    // cuts the 20 s before each).
+    manualClips: { type: [Number], default: undefined },
+    // What clipping found (clips.js): { version, at, clips, moments, error }.
+    clips: { type: mongoose.Schema.Types.Mixed, default: undefined }
   }, { timestamps: true }));
 
   const plainUuid = (u) => String(u || '').replace(/-/g, '').toLowerCase();
@@ -109,9 +116,13 @@ module.exports = function setupReplays({
     const sizeBytes = Number(b.sizeBytes);
     if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_BYTES) return res.status(400).json({ error: 'Bad file size' });
     const players = (Array.isArray(b.players) ? b.players : []).slice(0, PLAYERS_MAX)
-      .map(p => ({ uuid: plainUuid(p?.uuid), username: String(p?.username || '') }))
+      .map(p => ({ uuid: plainUuid(p?.uuid), username: String(p?.username || ''), ...(NAME_RE.test(String(p?.nick || '')) ? { nick: String(p.nick) } : {}) }))
       .filter(p => UUID_RE.test(p.uuid) && NAME_RE.test(p.username));
-    if (!players.length) return res.status(400).json({ error: 'Which tracked players is it for?' });
+    // /clip moments: a game with one goes up even with nobody tracked in it.
+    const manualClips = (Array.isArray(b.clips) ? b.clips : []).slice(0, 10)
+      .map(c => Math.round(Number(c && typeof c === 'object' ? c.at : c)))
+      .filter(n => Number.isFinite(n) && n >= 0 && n < 6 * 60 * 60 * 1000);
+    if (!players.length && !manualClips.length) return res.status(400).json({ error: 'Which tracked players is it for?' });
     const text = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
     const playedAt = new Date(b.playedAt);
     try {
@@ -119,7 +130,8 @@ module.exports = function setupReplays({
         key: 'pending',
         name: text(b.name, 80), sizeBytes, durationMs: Number(b.durationMs) || 0,
         playedAt: isNaN(playedAt) ? new Date() : playedAt,
-        mode: text(b.mode, 30), map: text(b.map, 40), players, uploadedBy: req.keyOwner
+        mode: text(b.mode, 30), map: text(b.map, 40), players, uploadedBy: req.keyOwner,
+        ...(manualClips.length ? { manualClips } : {})
       });
       doc.key = `replays/${doc._id}.mcpr`;
       await doc.save();
@@ -152,7 +164,8 @@ module.exports = function setupReplays({
       doc.status = 'ready';
       doc.sizeBytes = actual || doc.sizeBytes;
       await doc.save();
-      try { onReady(doc); } catch (err) { console.warn('/replays done: onReady failed', err.message); }
+      // Cut its clips in the background (clips.js).
+      if (api.onReady) Promise.resolve().then(() => api.onReady(doc._id)).catch(err => console.warn('Replays: after-upload step failed', err.message));
       return res.json(publicReplay(doc));
     } catch (err) {
       console.error('/replays done error', err.message);
@@ -271,7 +284,8 @@ module.exports = function setupReplays({
     return { count: row ? row.count : 0, bytes: row ? row.bytes : 0, freeBytes: FREE_BYTES };
   }
 
-  return { Replay, configured: () => !!config(), sweepPending, usage };
+  const api = { Replay, configured: () => !!config(), sweepPending, usage, onReady: null };
+  return api;
 };
 
 module.exports.presign = presign;
