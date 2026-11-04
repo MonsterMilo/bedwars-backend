@@ -107,6 +107,27 @@ test('the backfill clips replays uploaded before clips existed', async () => {
   assert.equal(await clips.backfill(), 0);
 });
 
+test('/clip: a game with no tracked player goes up, and its clip shows on whoever was in it', async () => {
+  const file = Buffer.from(game());
+  const made = await call('POST', '/replays', { body: { sizeBytes: file.length, players: [], clips: [{ at: 34000 }], map: 'Aquarium' } });
+  assert.equal(made.status, 201);
+  assert.equal((await call('POST', '/replays', { body: { sizeBytes: file.length, players: [] } })).status, 400);
+  store.set(keyOf(made.json.uploadUrl), file);
+  await call('POST', `/replays/${made.json.id}/done`);
+  await new Promise(r => setTimeout(r, 50));
+  await clips.enqueue(made.json.id);
+  const note = (await call('GET', `/replays/${made.json.id}/clips`)).json;
+  assert.equal(note.clips.length, 1);
+  assert.deepEqual(note.clips[0].people.map(p => p.name), ['Sweaty', 'Mate']);
+  // By uuid, or by the name they had (tracked later under a real name).
+  const byUuid = (await call('GET', `/clips?uuid=${SWEAT}`)).json.clips.filter(c => c.kind === 'manual');
+  assert.equal(byUuid.length, 1);
+  assert.equal(byUuid[0].durationMs, 21000);
+  const byName = (await call('GET', `/clips?uuid=${'f'.repeat(32)}&name=sweaty`)).json.clips;
+  assert.deepEqual(byName.map(c => c.kind), ['manual']);
+  assert.equal((await call('GET', `/clips?uuid=${FAR}`)).json.clips.filter(c => c.kind === 'manual').length, 0);
+});
+
 test('a broken replay is noted, not retried forever', async () => {
   const doc = await replays.Replay.create({ key: 'replays/broken.mcpr', status: 'ready', sizeBytes: 10, players: [{ uuid: SWEAT, username: 'Sweaty' }] });
   store.set('replays/broken.mcpr', Buffer.from('not a zip'));

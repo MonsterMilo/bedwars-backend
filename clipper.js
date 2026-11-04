@@ -48,7 +48,11 @@ const DEFAULTS = {
   lookBackMs: 6000, minInView: 0.6, maxDistance: 40, closeMs: 3000,
   // How much map goes in a clip: chunk columns this many chunks around
   // where it happened (16 blocks each).
-  radiusChunks: 7
+  radiusChunks: 7,
+  // /clip: the 20 seconds before you typed it (and a moment after), and
+  // who counts as in it.
+  manualBeforeMs: 20000, manualAfterMs: 1000, nearBlocks: 24,
+  manual: []
 };
 
 // --- Reading ---
@@ -426,6 +430,31 @@ function findMoments(recording, tracked, options = {}) {
     return s;
   }
 
+  // /clip in game: the last 20 seconds before the moment you typed it,
+  // with everyone who came near you in them (they're who it's about).
+  for (const atMs of o.manual || []) {
+    const t = Math.round(Number(atMs));
+    if (!Number.isFinite(t) || t < 0) continue;
+    const from = t - o.manualBeforeMs;
+    const people = [];
+    if (selfSeen) {
+      for (const [u, nm] of names) {
+        if (u === selfUuid || !samples.has(u)) continue;
+        let near = false;
+        for (let tt = Math.max(0, from); tt <= t && !near; tt += 250) {
+          const a = at(selfUuid, tt); const b = at(u, tt);
+          if (a && b && flat(a, b) <= o.nearBlocks) near = true;
+        }
+        if (near) people.push({ uuid: u, name: nm, team: teamOf.get(lc(nm)) || null });
+      }
+    }
+    const me = selfSeen ? at(selfUuid, t) || lastSeen(selfUuid, t) : serverPlaced(t);
+    // Opponents first: they're who a clip is usually about.
+    people.sort((a, b) => (a.team === selfTeam) - (b.team === selfTeam));
+    moments.push({ kind: 'manual', t, uuid: null, username: null, victim: null, team: null, by: selfName, people,
+      ok: true, reason: null, inView: null, distance: null, focus: me ? { x: me.x, y: me.y, z: me.z } : null, follow: selfName });
+  }
+
   return { self: { name: selfName, team: selfTeam, uuid: selfUuid }, moments };
 }
 
@@ -769,11 +798,11 @@ function cutClips(recording, windows, options = {}) {
 /** Windows for the moments that passed, ready for cutClips. */
 function windowsFor(moments, options = {}) {
   const o = { ...DEFAULTS, ...options };
-  return moments.filter(m => m.ok).map(m => ({
-    from: m.t - (m.kind === 'final' ? o.finalBeforeMs : o.bedBeforeMs),
-    to: m.t + (m.kind === 'final' ? o.finalAfterMs : o.bedAfterMs),
-    focus: m.focus, markAt: m.t, marker: m.kind === 'final' ? 'Final kill' : 'Bed break'
-  }));
+  return moments.filter(m => m.ok).map(m => {
+    const [before, after, marker] = m.kind === 'final' ? [o.finalBeforeMs, o.finalAfterMs, 'Final kill']
+      : m.kind === 'bed' ? [o.bedBeforeMs, o.bedAfterMs, 'Bed break'] : [o.manualBeforeMs, o.manualAfterMs, 'Clip'];
+    return { from: m.t - before, to: m.t + after, focus: m.focus, markAt: m.t, marker };
+  });
 }
 
 module.exports = { readRecording, findMoments, cutClips, windowsFor, chatText, DEFAULTS, P, packet, writeRecording, zipFiles };

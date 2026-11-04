@@ -91,3 +91,17 @@ test('a tracked player who played under a nick is found by it', () => {
   assert.equal(final.victim, 'Sweaty');
   assert.equal(final.ok, true);
 });
+
+test('/clip: the 20 s before, with everyone who came near you', () => {
+  const rec = readRecording(game());
+  const { moments } = findMoments(rec, [], { manual: [34000] });
+  assert.equal(moments.length, 1);
+  const m = moments[0];
+  assert.equal(m.kind, 'manual');
+  assert.equal(m.ok, true);
+  assert.equal(m.follow, 'Milo');
+  // Opponents first; the far player wasn't near.
+  assert.deepEqual(m.people.map(p => p.name), ['Sweaty', 'Mate']);
+  const [w] = windowsFor(moments);
+  assert.deepEqual([w.from, w.to, w.marker], [14000, 35000, 'Clip']);
+});

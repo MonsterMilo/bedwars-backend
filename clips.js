@@ -41,7 +41,11 @@ module.exports = function setupClips({
     victim: String,
     by: String,
     team: String,
-    kind: String,              // 'final' | 'bed' (later: 'manual')
+    kind: String,              // 'final' | 'bed' | 'manual' (/clip in game)
+    // A /clip: everyone who came near you in it. It shows on any of their
+    // entries, by uuid or by the name they had (a nick, say).
+    people: [{ _id: false, uuid: String, name: String, team: String }],
+    peopleKeys: { type: [String], index: true },
     at: Number,                // ms into the full replay
     markAt: Number,            // ms into the clip where it happens
     durationMs: Number,
@@ -57,7 +61,8 @@ module.exports = function setupClips({
   const publicClip = (c) => ({
     id: c._id, replayId: c.replayId, uuid: c.uuid, username: c.username, victim: c.victim, by: c.by, team: c.team,
     kind: c.kind, at: c.at, markAt: c.markAt, durationMs: c.durationMs, sizeBytes: c.sizeBytes, distance: c.distance,
-    follow: c.follow, playedAt: c.playedAt, map: c.map || null, mode: c.mode || null
+    follow: c.follow, playedAt: c.playedAt, map: c.map || null, mode: c.mode || null,
+    ...(c.kind === 'manual' ? { people: (c.people || []).map(p => ({ uuid: p.uuid, name: p.name, team: p.team || null })) } : {})
   });
 
   async function removeFile(key) {
@@ -78,26 +83,27 @@ module.exports = function setupClips({
       const r = await http.get(link('GET', rep.key, 60), { responseType: 'arraybuffer', timeout: 120000, validateStatus: () => true, maxContentLength: MAX_REPLAY_BYTES + 1 });
       if (r.status !== 200) throw new Error(`Storage answered ${r.status}`);
       let rec = clipper.readRecording(new Uint8Array(r.data));
-      const found = clipper.findMoments(rec, rep.players || []);
-      note.moments = found.moments.map(m => ({ kind: m.kind, username: m.username, victim: m.victim, by: m.by, t: m.t, ok: m.ok, reason: m.reason, inView: m.inView, distance: m.distance }));
+      const found = clipper.findMoments(rec, rep.players || [], { manual: rep.manualClips || [] });
+      note.moments = found.moments.map(m => ({ kind: m.kind, username: m.username, victim: m.victim, by: m.by, t: m.t, ok: m.ok, reason: m.reason, inView: m.inView, distance: m.distance, ...(m.people ? { people: m.people.map(p => p.name) } : {}) }));
       const good = found.moments.filter(m => m.ok);
       const cut = good.length ? clipper.cutClips(rec, clipper.windowsFor(good)) : [];
       rec = null;
 
       // Replace this replay's earlier automatic clips.
-      const old = await Clip.find({ replayId: rep._id, kind: { $in: ['final', 'bed'] } }).lean();
+      const old = await Clip.find({ replayId: rep._id }).lean();
       for (const c of old) {
         await removeFile(c.key).catch(err => log.warn('Clips: removing an old clip failed', err.message));
         await Clip.deleteOne({ _id: c._id });
       }
       for (let i = 0; i < good.length; i++) {
         const m = good[i]; const { bytes, durationMs } = cut[i];
-        const before = m.kind === 'final' ? clipper.DEFAULTS.finalBeforeMs : clipper.DEFAULTS.bedBeforeMs;
+        const before = m.kind === 'final' ? clipper.DEFAULTS.finalBeforeMs : m.kind === 'bed' ? clipper.DEFAULTS.bedBeforeMs : clipper.DEFAULTS.manualBeforeMs;
         const doc = new Clip({
           key: 'pending', replayId: rep._id, uuid: m.uuid, username: m.username, victim: m.victim, by: m.by, team: m.team,
           kind: m.kind, at: m.t, markAt: Math.min(before, m.t), durationMs, sizeBytes: bytes.length, distance: m.distance,
           follow: m.follow, playedAt: rep.playedAt ? new Date(rep.playedAt.getTime() + Math.max(0, m.t - before)) : null,
-          map: rep.map, mode: rep.mode
+          map: rep.map, mode: rep.mode,
+          ...(m.kind === 'manual' ? { people: m.people, peopleKeys: [...m.people.map(p => p.uuid), ...m.people.map(p => 'n:' + p.name.toLowerCase())] } : {})
         });
         doc.key = `clips/${doc._id}.mcpr`;
         await doc.save();
@@ -155,11 +161,14 @@ module.exports = function setupClips({
   const badId = (id) => !mongoose.isValidObjectId(id);
 
   // The site: a player's clips, newest first (keys only, like replays).
+  // ?name= also finds /clip clips they're in under that name.
   app.get('/clips', requireWriteKey, proxyLimiter, async (req, res) => {
     const uuid = String(req.query.uuid || '').replace(/-/g, '').toLowerCase();
     if (!/^[0-9a-f]{32}$/.test(uuid)) return res.status(400).json({ error: 'Invalid uuid' });
+    const name = /^\w{1,16}$/.test(String(req.query.name || '')) ? String(req.query.name).toLowerCase() : null;
     try {
-      const docs = await Clip.find({ uuid, status: 'ready' }).sort({ playedAt: -1, at: -1 }).limit(LIST_MAX).lean();
+      const keys = name ? [uuid, 'n:' + name] : [uuid];
+      const docs = await Clip.find({ status: 'ready', $or: [{ uuid }, { peopleKeys: { $in: keys } }] }).sort({ playedAt: -1, at: -1 }).limit(LIST_MAX).lean();
       return res.json({ clips: docs.map(publicClip) });
     } catch (err) {
       log.error('/clips GET error', err);
@@ -203,8 +212,8 @@ module.exports = function setupClips({
     try {
       const doc = await Clip.findById(req.params.id).lean();
       if (!doc || doc.status !== 'ready') return res.status(404).json({ error: 'No such clip' });
-      const what = doc.kind === 'bed' ? 'bed' : 'final';
-      const name = `${doc.victim || doc.username || 'clip'}-${what}-${String(doc._id).slice(-6)}.mcpr`.replace(/[^A-Za-z0-9_.-]/g, '_');
+      const what = doc.kind === 'bed' ? 'bed' : doc.kind === 'manual' ? 'clip' : 'final';
+      const name = `${doc.victim || doc.username || doc.map || 'clip'}-${what}-${String(doc._id).slice(-6)}.mcpr`.replace(/[^A-Za-z0-9_.-]/g, '_');
       return res.json({ url: link('GET', doc.key, DOWNLOAD_LINK_SECONDS, { 'response-content-disposition': `attachment; filename="${name}"` }), name });
     } catch (err) {
       return res.status(500).json({ error: 'DB read error' });

@@ -83,6 +83,9 @@ module.exports = function setupReplays({
     players: [{ uuid: { type: String, index: true }, username: String, nick: String }],
     uploadedBy: String,
     status: { type: String, default: 'pending' }, // 'pending' until the file is in B2, then 'ready'
+    // /clip in game: ms into the recording where Milo typed it (clips.js
+    // cuts the 20 s before each).
+    manualClips: { type: [Number], default: undefined },
     // What clipping found (clips.js): { version, at, clips, moments, error }.
     clips: { type: mongoose.Schema.Types.Mixed, default: undefined }
   }, { timestamps: true }));
@@ -115,7 +118,11 @@ module.exports = function setupReplays({
     const players = (Array.isArray(b.players) ? b.players : []).slice(0, PLAYERS_MAX)
       .map(p => ({ uuid: plainUuid(p?.uuid), username: String(p?.username || ''), ...(NAME_RE.test(String(p?.nick || '')) ? { nick: String(p.nick) } : {}) }))
       .filter(p => UUID_RE.test(p.uuid) && NAME_RE.test(p.username));
-    if (!players.length) return res.status(400).json({ error: 'Which tracked players is it for?' });
+    // /clip moments: a game with one goes up even with nobody tracked in it.
+    const manualClips = (Array.isArray(b.clips) ? b.clips : []).slice(0, 10)
+      .map(c => Math.round(Number(c && typeof c === 'object' ? c.at : c)))
+      .filter(n => Number.isFinite(n) && n >= 0 && n < 6 * 60 * 60 * 1000);
+    if (!players.length && !manualClips.length) return res.status(400).json({ error: 'Which tracked players is it for?' });
     const text = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
     const playedAt = new Date(b.playedAt);
     try {
@@ -123,7 +130,8 @@ module.exports = function setupReplays({
         key: 'pending',
         name: text(b.name, 80), sizeBytes, durationMs: Number(b.durationMs) || 0,
         playedAt: isNaN(playedAt) ? new Date() : playedAt,
-        mode: text(b.mode, 30), map: text(b.map, 40), players, uploadedBy: req.keyOwner
+        mode: text(b.mode, 30), map: text(b.map, 40), players, uploadedBy: req.keyOwner,
+        ...(manualClips.length ? { manualClips } : {})
       });
       doc.key = `replays/${doc._id}.mcpr`;
       await doc.save();
