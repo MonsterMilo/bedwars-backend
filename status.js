@@ -39,7 +39,7 @@ const timed = (ms, detail) => (ms > SLOW_MS
 
 module.exports = function setupStatus({
   mongoose, Sweat, LIVE, bordicGet, coralGet, denickerGet, bedlifyPing, denick,
-  hypixelKey, urchinOn, denickerOn, bedlifyOn, describeAxiosError, replays = () => null, backups = () => null, http = axios
+  hypixelKey, urchinOn, denickerOn, bedlifyOn, describeAxiosError, replays = () => null, clips = () => null, backups = () => null, http = axios
 }) {
   const CHECKS = [
     {
@@ -139,9 +139,11 @@ module.exports = function setupStatus({
         if (!r || !r.configured()) return { state: 'off', detail: 'Not set up' };
         if (mongoose.connection.readyState !== 1) return { state: 'down', detail: 'Database not connected' };
         const u = await r.usage();
+        const c = clips() ? await clips().usage().catch(() => null) : null;
         const gb = b => (b / 1e9).toFixed(b >= 1e10 ? 0 : 1);
-        const share = u.bytes / u.freeBytes;
-        const detail = `${u.count.toLocaleString('en-US')} replays, ${gb(u.bytes)} GB of ${gb(u.freeBytes)} GB free`;
+        const bytes = u.bytes + (c ? c.bytes : 0);
+        const share = bytes / u.freeBytes;
+        const detail = `${u.count.toLocaleString('en-US')} replays${c ? `, ${c.count.toLocaleString('en-US')} clips` : ''}, ${gb(bytes)} GB of ${gb(u.freeBytes)} GB free`;
         return { state: share >= 0.8 ? 'warn' : 'ok', detail: share >= 0.8 ? `Nearly full: ${detail}` : detail };
       }
     },

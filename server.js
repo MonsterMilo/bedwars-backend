@@ -1094,10 +1094,15 @@ const status = require('./status')({
   denickerOn: () => !!DENICKER_API_KEY,
   bedlifyOn: () => !!BEDLIFY_API_KEY,
   replays: () => replays,
+  clips: () => clips,
   backups: () => backups
 });
 // Recorded games for tracked players (see replays.js): stored in Backblaze B2.
 const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, hasFullAccess, UUID_RE, NAME_RE });
+// Clips of the moments tracked players were beaten (see clips.js), cut from
+// each replay once it's uploaded.
+const clips = require('./clips')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
+replays.onReady = (id) => clips.enqueue(id);
 // A copy of the whole database every day, in the same B2 bucket (see backup.js).
 const backups = require('./backup')({ mongoose });
 

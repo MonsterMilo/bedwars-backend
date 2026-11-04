@@ -80,7 +80,9 @@ module.exports = function setupReplays({
     // The tracked players it's for (uuid without dashes, lower case).
     players: [{ uuid: { type: String, index: true }, username: String }],
     uploadedBy: String,
-    status: { type: String, default: 'pending' } // 'pending' until the file is in B2, then 'ready'
+    status: { type: String, default: 'pending' }, // 'pending' until the file is in B2, then 'ready'
+    // What clipping found (clips.js): { version, at, clips, moments, error }.
+    clips: { type: mongoose.Schema.Types.Mixed, default: undefined }
   }, { timestamps: true }));
 
   const plainUuid = (u) => String(u || '').replace(/-/g, '').toLowerCase();
@@ -152,6 +154,8 @@ module.exports = function setupReplays({
       doc.status = 'ready';
       doc.sizeBytes = actual || doc.sizeBytes;
       await doc.save();
+      // Cut its clips in the background (clips.js).
+      if (api.onReady) Promise.resolve().then(() => api.onReady(doc._id)).catch(err => console.warn('Replays: after-upload step failed', err.message));
       return res.json(publicReplay(doc));
     } catch (err) {
       console.error('/replays done error', err.message);
@@ -270,7 +274,8 @@ module.exports = function setupReplays({
     return { count: row ? row.count : 0, bytes: row ? row.bytes : 0, freeBytes: FREE_BYTES };
   }
 
-  return { Replay, configured: () => !!config(), sweepPending, usage };
+  const api = { Replay, configured: () => !!config(), sweepPending, usage, onReady: null };
+  return api;
 };
 
 module.exports.presign = presign;
