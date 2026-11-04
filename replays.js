@@ -64,7 +64,7 @@ function b2Config(env) {
 
 module.exports = function setupReplays({
   app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, UUID_RE, NAME_RE,
-  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now
+  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now, onReady = () => {}
 }) {
   const config = () => b2Config(env);
   const link = (method, key, expires, extra) => presign({ method, key, expires, extra, ...config() });
@@ -152,6 +152,7 @@ module.exports = function setupReplays({
       doc.status = 'ready';
       doc.sizeBytes = actual || doc.sizeBytes;
       await doc.save();
+      try { onReady(doc); } catch (err) { console.warn('/replays done: onReady failed', err.message); }
       return res.json(publicReplay(doc));
     } catch (err) {
       console.error('/replays done error', err.message);

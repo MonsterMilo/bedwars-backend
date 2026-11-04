@@ -1097,7 +1097,9 @@ const status = require('./status')({
   backups: () => backups
 });
 // Recorded games for tracked players (see replays.js): stored in Backblaze B2.
-const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, hasFullAccess, UUID_RE, NAME_RE });
+const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, keyOwner, hasFullAccess, UUID_RE, NAME_RE, onReady: () => atlas.kick() });
+// Prism Atlas (see atlas.js): every map, rebuilt from the replays' pre-game chunks.
+const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
 // A copy of the whole database every day, in the same B2 bucket (see backup.js).
 const backups = require('./backup')({ mongoose });
 
