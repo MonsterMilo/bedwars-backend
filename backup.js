@@ -15,6 +15,7 @@
 const zlib = require('zlib');
 const axios = require('axios');
 const { presign, b2Config } = require('./replays');
+const jobs = require('./replay-jobs');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHECK_MS = 60 * 60 * 1000;     // look every hour whether today's copy is done
@@ -112,7 +113,8 @@ module.exports = function setupBackups({ mongoose, env = process.env, http = axi
     running = (async () => {
       const t0 = Date.now();
       try {
-        const r = await backupNow(day);
+        // Not while a replay is being read (replay-jobs.js): memory is tight.
+        const r = await jobs.exclusive(() => backupNow(day));
         await runs().updateOne({ _id: day }, { $set: { status: 'done', at: new Date(now()), files: r.files, collections: r.collections, bytes: r.bytes } });
         console.log(`Backup: ${day} saved, ${r.collections.length} collections, ${(r.bytes / 1e6).toFixed(1)} MB in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
         await prune();

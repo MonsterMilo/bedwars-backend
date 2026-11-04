@@ -683,7 +683,13 @@ function statusCard(themeId, data) {
 // holds up the main thread. If the worker can't start or dies, it's started
 // again on the next card; CARDS_IN_PROCESS=1 draws on the main thread
 // instead (the old way).
+// The worker holds the fonts and the drawing libraries: ~130 MB, a quarter
+// of what Render's free plan has. So it's stopped after a while with nothing
+// to draw (and right away when a replay is about to be read, see
+// replay-jobs.js), and started again for the next card (~1 s).
 const DRAW_TIMEOUT_MS = 30 * 1000;
+const IDLE_STOP_MS = 2 * 60 * 1000;
+let idleTimer = null;
 let worker = null;
 let nextJob = 1;
 const jobs = new Map(); // id -> { resolve, reject, timer }
@@ -699,20 +705,37 @@ function getWorker() {
     jobs.delete(id);
     clearTimeout(job.timer);
     if (error) job.reject(new Error(error)); else job.resolve(Buffer.from(png.buffer, png.byteOffset, png.byteLength));
+    if (!jobs.size) armIdleStop();
   });
-  w.on('error', err => { console.error('Card worker failed', err); if (worker === w) worker = null; failAll(err); });
-  w.on('exit', code => { if (worker === w) worker = null; if (jobs.size) failAll(new Error(`Card worker stopped (${code})`)); });
+  w.on('error', err => { console.error('Card worker failed', err); if (worker !== w) return; worker = null; failAll(err); });
+  w.on('exit', code => { if (worker !== w) return; worker = null; if (jobs.size) failAll(new Error(`Card worker stopped (${code})`)); });
   w.unref(); // never keeps the process alive on shutdown
   worker = w;
   return w;
+}
+function armIdleStop() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(stopIdleWorker, IDLE_STOP_MS);
+  if (idleTimer.unref) idleTimer.unref();
+}
+/** Stops the drawing worker if it has nothing to draw. Returns whether it did. */
+function stopIdleWorker() {
+  clearTimeout(idleTimer); idleTimer = null;
+  if (!worker || jobs.size) return false;
+  const w = worker;
+  worker = null;
+  w.terminate().catch(() => {});
+  return true;
 }
 function draw(tree) {
   if (process.env.CARDS_IN_PROCESS === '1') return drawHere(tree, W, OUT_W);
   return new Promise((resolve, reject) => {
     const id = nextJob++;
+    clearTimeout(idleTimer);
     const timer = setTimeout(() => {
       jobs.delete(id);
       reject(new Error('Drawing the card took too long'));
+      if (!jobs.size) armIdleStop();
     }, DRAW_TIMEOUT_MS);
     jobs.set(id, { resolve, reject, timer });
     try {
@@ -753,7 +776,7 @@ async function render(tree, timing = {}) {
 }
 
 module.exports = {
-  THEMES, THEME_IDS, render, sweatCard, listCard, statsCard, leaderboardCard, denickCard, recapCard, statusCard,
+  THEMES, THEME_IDS, render, stopIdleWorker, sweatCard, listCard, statsCard, leaderboardCard, denickCard, recapCard, statusCard,
   fmtIndex,
   indexColor: (themeId, v) => indexColor(theme(themeId), v),
   ratioColor: (themeId, v, kind) => ratioColor(theme(themeId), v, kind === 'wlr' ? WLR_STEPS : FKDR_STEPS)

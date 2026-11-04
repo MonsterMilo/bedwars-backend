@@ -1103,7 +1103,10 @@ const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimi
 // each replay once it's uploaded.
 const clips = require('./clips')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
 // Prism Atlas (see atlas.js): every map, rebuilt from the replays' pre-game chunks.
-const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess, waitTurn: () => clips.idle() });
+const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
+// Clips and the Atlas read replays one at a time (replay-jobs.js); the card
+// drawing worker lets go of its memory first when it has nothing to draw.
+require('./replay-jobs').beforeEach(() => require('./cards').stopIdleWorker());
 // After an upload: its clips are cut, and the Atlas reads its map.
 replays.onReady = (id) => { clips.enqueue(id); atlas.kick(); };
 // A copy of the whole database every day, in the same B2 bucket (see backup.js).
