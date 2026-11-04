@@ -18,7 +18,8 @@ test('findMoments keeps close final kills and bed breaks by your team', () => {
   assert.equal(byKey['bed:Sweaty'].by, 'Mate');
   assert.equal(byKey['final:Sweaty'].ok, true);
   assert.equal(byKey['final:Sweaty'].by, 'Milo');
-  assert.equal(byKey['final:Sweaty'].distance, 34);
+  // Closest across the ground in the 3 s before (they were walking away).
+  assert.equal(byKey['final:Sweaty'].distance, 30);
   assert.equal(byKey['final:Sweaty'].inView, 1);
   // You broke the far player's bed yourself: that one counts.
   assert.equal(byKey['bed:Faraway'].ok, true);
@@ -31,9 +32,13 @@ test('moments that are not your team\'s, or not tracked, are not clipped', () =>
   const rec = readRecording(game());
   const { moments } = findMoments(rec, [{ uuid: MATE, username: 'Mate' }]);
   assert.equal(moments.length, 0);
-  const other = findMoments(rec, tracked, { maxDistance: 1 }).moments.find(m => m.kind === 'final' && m.username === 'Sweaty');
-  assert.equal(other.ok, false);
-  assert.equal(other.reason, 'too far');
+  // A teammate's break counts only close to you; your own kills only need
+  // the player in view.
+  const strict = findMoments(rec, tracked, { maxDistance: 1 }).moments;
+  const bed = strict.find(m => m.kind === 'bed' && m.username === 'Sweaty');
+  assert.equal(bed.ok, false);
+  assert.equal(bed.reason, 'too far');
+  assert.equal(strict.find(m => m.kind === 'final' && m.username === 'Sweaty').ok, true);
 });
 
 test('cutClips writes a clip that starts with the world as it stood', () => {
@@ -76,4 +81,13 @@ test('a clip window before any packet still has a valid start', () => {
   const out = readRecording(clip.bytes);
   assert.equal(out.id[0], P.JOIN);
   assert.ok(out.n > 10);
+});
+
+test('a tracked player who played under a nick is found by it', () => {
+  const rec = readRecording(game());
+  const { moments } = findMoments(rec, [{ uuid: 'e'.repeat(32), username: 'RealName', nick: 'Sweaty' }]);
+  const final = moments.find(m => m.kind === 'final');
+  assert.equal(final.username, 'RealName');
+  assert.equal(final.victim, 'Sweaty');
+  assert.equal(final.ok, true);
 });

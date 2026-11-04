@@ -78,7 +78,9 @@ module.exports = function setupReplays({
     mode: String,
     map: String,
     // The tracked players it's for (uuid without dashes, lower case).
-    players: [{ uuid: { type: String, index: true }, username: String }],
+    // nick: the name they played under, when the plugin knows it (clips
+    // find them in the game by it).
+    players: [{ uuid: { type: String, index: true }, username: String, nick: String }],
     uploadedBy: String,
     status: { type: String, default: 'pending' }, // 'pending' until the file is in B2, then 'ready'
     // What clipping found (clips.js): { version, at, clips, moments, error }.
@@ -111,7 +113,7 @@ module.exports = function setupReplays({
     const sizeBytes = Number(b.sizeBytes);
     if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_BYTES) return res.status(400).json({ error: 'Bad file size' });
     const players = (Array.isArray(b.players) ? b.players : []).slice(0, PLAYERS_MAX)
-      .map(p => ({ uuid: plainUuid(p?.uuid), username: String(p?.username || '') }))
+      .map(p => ({ uuid: plainUuid(p?.uuid), username: String(p?.username || ''), ...(NAME_RE.test(String(p?.nick || '')) ? { nick: String(p.nick) } : {}) }))
       .filter(p => UUID_RE.test(p.uuid) && NAME_RE.test(p.username));
     if (!players.length) return res.status(400).json({ error: 'Which tracked players is it for?' });
     const text = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);

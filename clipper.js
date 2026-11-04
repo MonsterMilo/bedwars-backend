@@ -17,7 +17,8 @@
 // Minecraft 1.8 (protocol 47) clientbound play packets, as the Prism Proxy
 // replay saver writes them.
 
-const { unzipSync, zipSync } = require('fflate');
+const zlib = require('zlib');
+const { unzipSync } = require('fflate');
 
 const P = {
   KEEPALIVE: 0x00, JOIN: 0x01, CHAT: 0x02, TIME: 0x03, EQUIP: 0x04, SPAWN_POS: 0x05, HEALTH: 0x06,
@@ -44,7 +45,7 @@ const DEFAULTS = {
   bedBeforeMs: 10000, bedAfterMs: 3000,
   // "Close enough": the subject was in view for this share of the last
   // few seconds, and this near you when it happened.
-  lookBackMs: 6000, minInView: 0.6, maxDistance: 40,
+  lookBackMs: 6000, minInView: 0.6, maxDistance: 40, closeMs: 3000,
   // How much map goes in a clip: chunk columns this many chunks around
   // where it happened (16 blocks each).
   radiusChunks: 7
@@ -57,8 +58,10 @@ class Reader {
     this.b = buf; this.pos = pos; this.end = end;
     this.dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   }
-  varint() { let r = 0; let s = 0; let x; do { x = this.b[this.pos++]; r |= (x & 0x7f) << s; s += 7; } while ((x & 0x80) && s < 35); return r; }
-  u8() { return this.b[this.pos++]; }
+  // Reading past the packet's end throws, so a packet we misread can't
+  // run a loop forever.
+  varint() { let r = 0; let s = 0; let x; do { if (this.pos >= this.end) throw new Error('past end'); x = this.b[this.pos++]; r |= (x & 0x7f) << s; s += 7; } while ((x & 0x80) && s < 35); return r; }
+  u8() { if (this.pos >= this.end) throw new Error('past end'); return this.b[this.pos++]; }
   i8() { const v = this.dv.getInt8(this.pos); this.pos += 1; return v; }
   bool() { return this.b[this.pos++] !== 0; }
   i16() { const v = this.dv.getInt16(this.pos); this.pos += 2; return v; }
@@ -66,7 +69,7 @@ class Reader {
   i32() { const v = this.dv.getInt32(this.pos); this.pos += 4; return v; }
   f32() { const v = this.dv.getFloat32(this.pos); this.pos += 4; return v; }
   f64() { const v = this.dv.getFloat64(this.pos); this.pos += 8; return v; }
-  skip(n) { this.pos += n; }
+  skip(n) { this.pos += n; if (this.pos > this.end) throw new Error('past end'); }
   blockPos() {
     const hi = this.dv.getInt32(this.pos); const lo = this.dv.getUint32(this.pos + 4); this.pos += 8;
     return [hi >> 6, ((hi & 0x3f) << 6) | (lo >>> 26), (lo << 6) >> 6];
@@ -84,7 +87,7 @@ class Reader {
       case 7: { const n = this.i32(); this.pos += n; break; }
       case 8: { const n = this.u16(); this.pos += n; break; }
       case 9: { const t = this.u8(); const n = this.i32(); for (let k = 0; k < n; k++) this.skipNbt(t); break; }
-      case 10: for (;;) { const t = this.u8(); if (t === 0) break; this.pos += this.u16(); this.skipNbt(t); } break;
+      case 10: for (;;) { const t = this.u8(); if (t === 0) break; const n = this.u16(); this.pos += n; this.skipNbt(t); } break;
       case 11: { const n = this.i32(); this.pos += n * 4; break; }
       default: throw new Error('bad nbt');
     }
@@ -94,7 +97,7 @@ class Reader {
     if (id < 0) return;
     this.pos += 3;
     const t = this.u8();
-    if (t !== 0) { this.pos += this.u16(); this.skipNbt(t); }
+    if (t !== 0) { const n = this.u16(); this.pos += n; this.skipNbt(t); }
   }
   // Entity metadata -> [[index, startByte, endByte]] (the raw entry bytes).
   metadataSpans() {
@@ -178,7 +181,7 @@ class Pos { constructor(x, y, z) { this.x = x; this.y = y; this.z = z; } }
 /**
  * Every final kill and bed break in the game, with who was involved and
  * where people were, then which of them are clips for the tracked players.
- * tracked: [{ uuid, username }] (uuid without dashes).
+ * tracked: [{ uuid, username, nick? }] (uuid without dashes).
  * Returns { self: { name, team }, moments: [...] }, each moment
  * { kind: 'final'|'bed', t, uuid, username, victim, team, by, ok, reason,
  *   inView, distance, focus: {x,y,z}, follow }.
@@ -194,6 +197,8 @@ function findMoments(recording, tracked, options = {}) {
   const events = [];
   let selfId = meta && meta.selfId != null ? meta.selfId : null;
   let dimension = 0;
+  let sidebarTeam = null;
+  const selfMoves = [];           // where the server put you (0x08), for old recordings
 
   const sample = (uuid, t, pos, gone = false) => {
     let list = samples.get(uuid);
@@ -205,13 +210,18 @@ function findMoments(recording, tracked, options = {}) {
 
   for (let k = 0; k < n; k++) {
     const id = ID[k];
-    if (id !== P.CHAT && id !== P.JOIN && id !== P.SPAWN_PLAYER && id !== P.REL_MOVE && id !== P.LOOK_MOVE &&
+    if (id !== P.CHAT && id !== P.JOIN && id !== P.POSITION && id !== P.SPAWN_PLAYER && id !== P.REL_MOVE && id !== P.LOOK_MOVE &&
         id !== P.TELEPORT && id !== P.DESTROY && id !== P.PLAYER_LIST && id !== P.TEAMS && id !== P.RESPAWN) continue;
     const t = T[k];
     const r = new Reader(rec, B[k], E[k]);
     try {
       switch (id) {
         case P.JOIN: { const eid = r.i32(); r.u8(); dimension = r.i8(); if (selfId == null) selfId = eid; break; }
+        case P.POSITION: {
+          const x = r.f64(); const y = r.f64(); const z = r.f64(); r.f32(); r.f32(); const rel = r.i8();
+          if (!rel) selfMoves.push({ t, x, y, z });
+          break;
+        }
         case P.RESPAWN: {
           // A new dimension is a new world: everyone seen so far is gone.
           const dim = r.i32();
@@ -259,7 +269,13 @@ function findMoments(recording, tracked, options = {}) {
         }
         case P.TEAMS: {
           const name = r.str(); const mode = r.i8();
-          if (mode === 0 || mode === 2) { r.skipStr(); r.skipStr(); r.skipStr(); r.i8(); r.skipStr(); r.i8(); }
+          if (mode === 0 || mode === 2) {
+            // The sidebar marks your team: "R Red: ✓ YOU".
+            r.skipStr(); const line = (r.str() + r.str()).replace(/§[0-9a-fk-or]/gi, '');
+            const you = line.match(/\b(Red|Blue|Green|Yellow|Aqua|White|Pink|Gr[ae]y)\b.*\bYOU\b/i);
+            if (you) sidebarTeam = teamLabel(you[1]);
+            r.i8(); r.skipStr(); r.i8();
+          }
           if ((mode === 0 || mode === 3) && teamLabel(name)) {
             const cnt = r.varint();
             for (let q = 0; q < cnt; q++) { const p = r.str(); if (!teamOf.has(lc(p))) teamOf.set(lc(p), teamLabel(name)); }
@@ -283,8 +299,16 @@ function findMoments(recording, tracked, options = {}) {
   // the tab entry whose name the metadata lists.
   let selfUuid = null;
   for (const [u, eid] of uuidEid) if (eid === selfId) selfUuid = u;
-  const selfName = selfUuid ? names.get(selfUuid) || null : null;
-  const selfTeam = selfName ? teamOf.get(lc(selfName)) || null : null;
+  let selfName = selfUuid ? names.get(selfUuid) || null : null;
+  const selfTeam = (selfName && teamOf.get(lc(selfName))) || sidebarTeam || null;
+  // Older recordings don't have you as an entity: you're the one on your
+  // team who never shows up (you never see yourself).
+  if (!selfName && selfTeam) {
+    const spawned = new Set(uuidEid.keys());
+    const unseen = [...names].filter(([u, nm]) => teamOf.get(lc(nm)) === selfTeam && !spawned.has(u));
+    if (unseen.length === 1) { selfUuid = unseen[0][0]; selfName = unseen[0][1]; }
+  }
+  const selfSeen = selfUuid && samples.has(selfUuid);
   const allNames = [...new Set(names.values())].sort((a, b) => b.length - a.length);
 
   // A name mentioned in a chat line (longest names first, whole words).
@@ -317,7 +341,18 @@ function findMoments(recording, tracked, options = {}) {
     if (since != null) seen += to - Math.max(from, since);
     return Math.max(0, Math.min(1, seen / Math.max(1, to - from)));
   };
-  const dist = (a, b) => (a && b ? Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) : null);
+  // Across the ground only: someone knocked into the void falls a long way
+  // straight down from where the fight was.
+  const flat = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
+  // How close you got to someone in the few seconds before t.
+  const closest = (uuid, time) => {
+    let best = null;
+    for (let tt = time - o.closeMs; tt <= time; tt += 250) {
+      const a = at(selfUuid, tt) || lastSeen(selfUuid, tt); const b = at(uuid, tt);
+      if (a && b) { const d = flat(a, b); if (best == null || d < best) best = d; }
+    }
+    return best;
+  };
 
   // Tracked players by name, as they showed in this game (a nicked player
   // is listed under the name they had, or matched by their uuid).
@@ -327,11 +362,12 @@ function findMoments(recording, tracked, options = {}) {
     const inGame = names.get(u);
     if (inGame) want.set(lc(inGame), { uuid: u, username: p.username, name: inGame });
     if (p.username && !want.has(lc(p.username))) want.set(lc(p.username), { uuid: u, username: p.username, name: p.username });
+    if (p.nick && !want.has(lc(p.nick))) want.set(lc(p.nick), { uuid: u, username: p.username, name: p.nick });
   }
 
-  // Older recordings don't have you as an entity, so your team is unknown:
-  // then any named killer counts and only the in-view rule applies.
-  const ours = (who) => !!who && (!selfName || lc(who) === lc(selfName) || (!!selfTeam && teamOf.get(lc(who)) === selfTeam));
+  // With no idea who you are, any named killer counts and only the in-view
+  // rule applies.
+  const ours = (who) => !!who && ((!selfName && !selfTeam) || lc(who) === lc(selfName) || (!!selfTeam && teamOf.get(lc(who)) === selfTeam));
   const moments = [];
   for (const ev of events) {
     if (ev.kind === 'final') {
@@ -361,18 +397,25 @@ function findMoments(recording, tracked, options = {}) {
   // kill or break has to be your team's.
   function judge(m, subjectUuid) {
     const lookFrom = m.t - o.lookBackMs;
-    const selfAt = selfUuid ? at(selfUuid, m.t) || lastSeen(selfUuid, m.t) : null;
+    const selfAt = selfSeen ? at(selfUuid, m.t) || lastSeen(selfUuid, m.t) : serverPlaced(m.t);
     const subj = subjectUuid ? lastSeen(subjectUuid, m.t) : null;
     const share = subjectUuid ? inView(subjectUuid, lookFrom, m.t) : 0;
-    const d = subjectUuid === selfUuid && subjectUuid ? 0 : dist(selfAt, subj);
+    const d = subjectUuid === selfUuid && subjectUuid ? 0 : selfSeen && subjectUuid ? closest(subjectUuid, m.t) : null;
     const out = { ...m, inView: Math.round(share * 100) / 100, distance: d == null ? null : Math.round(d), focus: subj ? { x: subj.x, y: subj.y, z: subj.z } : (selfAt ? { x: selfAt.x, y: selfAt.y, z: selfAt.z } : null), follow: m.kind === 'final' ? m.victim : (m.by || null) };
     if (selfTeam && m.team === selfTeam) return { ...out, ok: false, reason: 'teammate' };
     if (!ours(m.by)) return { ...out, ok: false, reason: m.by ? 'not your team' : 'no killer' };
     if (subjectUuid && subjectUuid === selfUuid) return { ...out, ok: true, reason: null };
     if (!subjectUuid || share < o.minInView) return { ...out, ok: false, reason: 'not in view' };
-    if (d != null && d > o.maxDistance) return { ...out, ok: false, reason: 'too far' };
+    // Your own kills only need the player in view (a bow shot from afar).
+    if (d != null && d > o.maxDistance && lc(m.by) !== lc(selfName)) return { ...out, ok: false, reason: 'too far' };
     if (!out.focus) return { ...out, ok: false, reason: 'not in view' };
     return { ...out, ok: true, reason: null };
+  }
+  // Old recordings: where the server last put you (spawns, respawns).
+  function serverPlaced(time) {
+    let s = null;
+    for (const x of selfMoves) { if (x.t > time) break; s = x; }
+    return s && time - s.t < 10000 ? s : null;
   }
   // Last place someone was seen at or before t (even if they then went out
   // of view, e.g. dying).
@@ -538,15 +581,21 @@ class WorldState {
         return;
       }
       case P.TEAMS: {
+        // Kept as: the creating packet, the newest settings change, and who
+        // is in it now (Hypixel re-adds the same player every second).
         const name = r.str(); const mode = r.i8();
-        if (mode === 0) this.teams.set(name, [raw]);
-        else if (mode === 1) this.teams.delete(name);
-        else {
-          const list = this.teams.get(name); if (!list) return;
-          if (mode === 2) { const i = list.findIndex((b, k) => k > 0 && b._update); if (i > 0) list.splice(i, 1); raw._update = true; }
-          list.push(raw);
-          if (list.length > 400) this.teams.set(name, compactTeam(list));
+        if (mode === 1) { this.teams.delete(name); return; }
+        if (mode === 0) {
+          r.skipStr(); r.skipStr(); r.skipStr(); r.i8(); r.skipStr(); r.i8();
+          const first = new Set(); const cnt = r.varint();
+          for (let q = 0; q < cnt; q++) first.add(r.str());
+          this.teams.set(name, { create: raw, update: null, first, members: new Set(first) });
+          return;
         }
+        const team = this.teams.get(name); if (!team) return;
+        if (mode === 2) { team.update = raw; return; }
+        const cnt = r.varint();
+        for (let q = 0; q < cnt; q++) { const p = r.str(); if (mode === 3) team.members.add(p); else if (mode === 4) team.members.delete(p); }
         return;
       }
       case P.OBJECTIVE: {
@@ -596,7 +645,16 @@ class WorldState {
     if (modes.length) out.push(packet(P.PLAYER_LIST, w => { w.varint(1); w.varint(modes.length); for (const [, row] of modes) w.raw(row.mode); }));
     const shown = rows.filter(([, row]) => row.display && row.present);
     if (shown.length) out.push(packet(P.PLAYER_LIST, w => { w.varint(3); w.varint(shown.length); for (const [, row] of shown) w.raw(row.display); }));
-    for (const list of this.teams.values()) out.push(...list);
+    for (const [name, team] of this.teams) {
+      out.push(team.create);
+      if (team.update) out.push(team.update);
+      const gone = [...team.first].filter(p => !team.members.has(p));
+      const added = [...team.members].filter(p => !team.first.has(p));
+      const names = (w, list) => { w.varint(list.length); for (const p of list) { const b = Buffer.from(p, 'utf8'); w.varint(b.length); w.raw(b); } };
+      const str = (w, v) => { const b = Buffer.from(v, 'utf8'); w.varint(b.length); w.raw(b); };
+      if (gone.length) out.push(packet(P.TEAMS, w => { str(w, name); w.i8(4); names(w, gone); }));
+      if (added.length) out.push(packet(P.TEAMS, w => { str(w, name); w.i8(3); names(w, added); }));
+    }
     for (const b of this.objectives.values()) out.push(b);
     for (const b of this.displays.values()) out.push(b);
     for (const b of this.scores.values()) out.push(b);
@@ -618,15 +676,6 @@ class WorldState {
   }
 }
 
-// A team's packets with its member list replayed: creation, the newest
-// settings change, then the adds and removes.
-function compactTeam(list) {
-  const create = list[0];
-  const update = list.find((b, k) => k > 0 && b._update);
-  const rest = list.filter((b, k) => k > 0 && !b._update);
-  return update ? [create, update, ...rest] : [create, ...rest];
-}
-
 function isPrivateChat(rec, bodyAt, end) {
   try {
     const r = new Reader(rec, bodyAt, end);
@@ -634,6 +683,36 @@ function isPrivateChat(rec, bodyAt, end) {
     if (pos === 2) return false;
     return PRIVATE_CHAT.test(chatText(json).trim());
   } catch { return false; }
+}
+
+/**
+ * A zip (what .mcpr files are) of { name: bytes }, deflated by Node's zlib.
+ * (fflate's zip deflate stalls on big runs of chunk data.)
+ */
+function zipFiles(files) {
+  const locals = []; const central = []; let offset = 0;
+  for (const [name, data] of Object.entries(files)) {
+    const nameBytes = Buffer.from(name, 'utf8');
+    const raw = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    const packed = zlib.deflateRawSync(raw, { level: 9 });
+    const crc = zlib.crc32(raw) >>> 0;
+    const head = Buffer.alloc(30);
+    head.writeUInt32LE(0x04034b50, 0); head.writeUInt16LE(20, 4); head.writeUInt16LE(0x0800, 6); head.writeUInt16LE(8, 8);
+    head.writeUInt32LE(0, 10); head.writeUInt32LE(crc, 14); head.writeUInt32LE(packed.length, 18); head.writeUInt32LE(raw.length, 22);
+    head.writeUInt16LE(nameBytes.length, 26); head.writeUInt16LE(0, 28);
+    const dir = Buffer.alloc(46);
+    dir.writeUInt32LE(0x02014b50, 0); dir.writeUInt16LE(20, 4); dir.writeUInt16LE(20, 6); dir.writeUInt16LE(0x0800, 8); dir.writeUInt16LE(8, 10);
+    dir.writeUInt32LE(0, 12); dir.writeUInt32LE(crc, 16); dir.writeUInt32LE(packed.length, 20); dir.writeUInt32LE(raw.length, 24);
+    dir.writeUInt16LE(nameBytes.length, 28); dir.writeUInt32LE(offset, 42);
+    locals.push(head, nameBytes, packed);
+    central.push(dir, nameBytes);
+    offset += 30 + nameBytes.length + packed.length;
+  }
+  const dirSize = central.reduce((n, b) => n + b.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(central.length / 2, 8); end.writeUInt16LE(central.length / 2, 10);
+  end.writeUInt32LE(dirSize, 12); end.writeUInt32LE(offset, 16);
+  return new Uint8Array(Buffer.concat([...locals, ...central, end]));
 }
 
 /** Packets -> recording.tmcpr bytes. items: [[t, Uint8Array]] */
@@ -669,7 +748,7 @@ function cutClips(recording, windows, options = {}) {
     m.generator = 'Prism Proxy (clip)';
     const files = { 'recording.tmcpr': tmcpr, 'metaData.json': Buffer.from(JSON.stringify(m)) };
     if (x.w.marker) files['markers.json'] = Buffer.from(JSON.stringify([{ realTimestamp: Math.max(0, Math.round(x.w.markAt - x.w.from)), value: { name: x.w.marker } }]));
-    results[x.w.i] = { bytes: zipSync(files, { level: 9 }), durationMs };
+    results[x.w.i] = { bytes: zipFiles(files), durationMs };
   };
   for (let k = 0; k < n; k++) {
     const t = T[k]; const id = ID[k];
@@ -697,4 +776,4 @@ function windowsFor(moments, options = {}) {
   }));
 }
 
-module.exports = { readRecording, findMoments, cutClips, windowsFor, chatText, DEFAULTS, P, packet, writeRecording };
+module.exports = { readRecording, findMoments, cutClips, windowsFor, chatText, DEFAULTS, P, packet, writeRecording, zipFiles };
