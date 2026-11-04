@@ -1102,7 +1102,10 @@ const replays = require('./replays')({ app, mongoose, requireWriteKey, writeLimi
 // Clips of the moments tracked players were beaten (see clips.js), cut from
 // each replay once it's uploaded.
 const clips = require('./clips')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
-replays.onReady = (id) => clips.enqueue(id);
+// Prism Atlas (see atlas.js): every map, rebuilt from the replays' pre-game chunks.
+const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess, waitTurn: () => clips.idle() });
+// After an upload: its clips are cut, and the Atlas reads its map.
+replays.onReady = (id) => { clips.enqueue(id); atlas.kick(); };
 // A copy of the whole database every day, in the same B2 bucket (see backup.js).
 const backups = require('./backup')({ mongoose });
 

@@ -270,5 +270,7 @@ module.exports = function setupClips({
     return { count: row ? row.count : 0, bytes: row ? row.bytes : 0 };
   }
 
-  return { Clip, clipReplay, enqueue, backfill, usage, CLIP_VERSION };
+  // Waits until no clip is being cut (the Atlas waits its turn: one replay in memory at a time).
+  const idle = async () => { while (busy) await busy; };
+  return { Clip, clipReplay, enqueue, backfill, usage, idle, CLIP_VERSION };
 };
