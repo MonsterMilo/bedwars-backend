@@ -22,49 +22,17 @@
 // rebuilds a map).
 
 const zlib = require('zlib');
+const stream = require('./tmcpr-stream');
 
 const FORMAT = 1;           // the map file layout below
 const MAGIC = 'PATL';
 const SECTION = 4096;       // blocks in a 16x16x16 section
-// Biggest recording unpacked (~45 minutes of game); bigger ones are skipped.
-const MAX_RECORDING = 300 * 1024 * 1024;
 // Biggest map file unpacked (a whole map is ~1-3 MB).
 const MAX_MAP = 64 * 1024 * 1024;
 const START_WINDOW_MS = { before: 1000, after: 1500 };
 // Column kinds, best first.
 const KIND = { pregame: 0, start: 1, midgame: 2 };
 const KIND_NAMES = ['pregame', 'start', 'midgame'];
-
-// --- .mcpr (a zip) ---
-/** The files of a zip: { name: Buffer }. Only stored and deflated entries. */
-function unzip(buf, wanted) {
-  let eocd = -1;
-  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 22 - 65535); i--) {
-    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
-  }
-  if (eocd < 0) throw new Error('Not a zip file');
-  const count = buf.readUInt16LE(eocd + 10);
-  let p = buf.readUInt32LE(eocd + 16);
-  const out = {};
-  for (let k = 0; k < count; k++) {
-    if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error('Broken zip directory');
-    const method = buf.readUInt16LE(p + 10);
-    const size = buf.readUInt32LE(p + 20);
-    const nameLen = buf.readUInt16LE(p + 28);
-    const extraLen = buf.readUInt16LE(p + 30);
-    const commentLen = buf.readUInt16LE(p + 32);
-    const local = buf.readUInt32LE(p + 42);
-    const name = buf.toString('utf8', p + 46, p + 46 + nameLen);
-    p += 46 + nameLen + extraLen + commentLen;
-    if (wanted && !wanted.includes(name)) continue;
-    const dataAt = local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
-    const raw = buf.subarray(dataAt, dataAt + size);
-    if (method === 0) out[name] = raw;
-    else if (method === 8) out[name] = zlib.inflateRawSync(raw, { maxOutputLength: MAX_RECORDING });
-    else throw new Error(`Unsupported zip compression (${method})`);
-  }
-  return out;
-}
 
 // --- Protocol 47 reading ---
 function varint(b, pos) {
@@ -107,20 +75,17 @@ const colKey = (x, z) => x + ',' + z;
  * sections are Uint16Array(4096) of (block id << 4 | meta), or null.
  */
 function extractCapture(mcprBytes) {
-  const files = unzip(Buffer.isBuffer(mcprBytes) ? mcprBytes : Buffer.from(mcprBytes), ['recording.tmcpr', 'metaData.json']);
-  const rec = files['recording.tmcpr'];
-  if (!rec) throw new Error('No recording in this file');
-  let meta = {};
-  try { meta = JSON.parse(files['metaData.json'].toString('utf8')); } catch { /* optional */ }
+  const zip = Buffer.isBuffer(mcprBytes) ? mcprBytes : Buffer.from(mcprBytes);
+  // Read piece by piece (tmcpr-stream.js): the recording is never unpacked
+  // whole, so a long game takes no more memory than a short one.
+  if (!stream.hasRecording(zip)) throw new Error('No recording in this file');
+  const meta = stream.readMeta(zip);
 
   // First pass: when the game started, and which map it is.
   let start = null; let info = {}; let boardMap = null;
-  for (let i = 0; i + 8 <= rec.length;) {
-    const t = rec.readInt32BE(i); const len = rec.readInt32BE(i + 4);
-    const pos = { i: i + 8 };
-    const end = i + 8 + len;
-    i = end;
-    if (len <= 0 || end > rec.length) break;
+  stream.eachRecord(zip, (t, rec) => {
+    if (!rec.length) return false;
+    const pos = { i: 0 };
     const id = varint(rec, pos);
     try {
       if (id === 0x02) {
@@ -137,7 +102,7 @@ function extractCapture(mcprBytes) {
         }
       }
     } catch { /* one odd packet doesn't matter */ }
-  }
+  });
 
   const columns = new Map(); // key -> { x, z, kind, sections }
   const live = new Map();    // pre-game: the columns as they are now
@@ -187,12 +152,9 @@ function extractCapture(mcprBytes) {
     columns.set(key, { x: cx, z: cz, kind: phase === 'start' ? KIND.start : KIND.midgame, sections: readSections(mask, b, at) });
   };
 
-  for (let i = 0; i + 8 <= rec.length;) {
-    const t = rec.readInt32BE(i); const len = rec.readInt32BE(i + 4);
-    const pos = { i: i + 8 };
-    const end = i + 8 + len;
-    i = end;
-    if (len <= 0 || end > rec.length) break;
+  stream.eachRecord(zip, (t, rec) => {
+    if (!rec.length) return false;
+    const pos = { i: 0 };
     const phase = phaseAt(t);
     if (phase !== 'pregame') takeSnapshot();
     const id = varint(rec, pos);
@@ -233,7 +195,7 @@ function extractCapture(mcprBytes) {
         }
       }
     } catch { /* one odd packet doesn't stop the capture */ }
-  }
+  });
   takeSnapshot();
 
   // Drop empty sections and empty columns.
@@ -395,4 +357,4 @@ function readCapture(gz) {
   return { map: cleanName(m.name), mode: (m.modes && m.modes[0]) || null, server: null, startedAt: s.playedAt || null, started: !!s.started, columns: m.columns };
 }
 
-module.exports = { extractCapture, readCapture, mergeCapture, previewOf, encodeMap, decodeMap, slugOf, unzip, chatText, FORMAT, KIND, KIND_NAMES };
+module.exports = { extractCapture, readCapture, mergeCapture, previewOf, encodeMap, decodeMap, slugOf, chatText, FORMAT, KIND, KIND_NAMES };

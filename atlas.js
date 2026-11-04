@@ -1,7 +1,7 @@
 // --- Prism Atlas: every Bed Wars map, rebuilt from recorded games ---
 // The website's Atlas shows each map in 3D. Maps come from the replays in
 // B2: each finished replay is read once (in a worker thread, see
-// atlas-worker.js and atlas-core.js), and its untouched pre-game map is
+// replay-jobs.js, replay-worker.js and atlas-core.js), and its untouched pre-game map is
 // merged into that map's file. A map file is small (20-60 KB for a 4s map),
 // so it's kept in MongoDB with its details, not in B2.
 //
@@ -11,26 +11,25 @@
 // Bumping EXTRACT_VERSION (when the way maps are read changes) rebuilds every
 // map from all the replays again, by itself.
 
-const path = require('path');
-const { Worker } = require('worker_threads');
 const axios = require('axios');
 const express = require('express');
 const { presign, b2Config } = require('./replays');
 const { slugOf } = require('./atlas-core');
+const jobs = require('./replay-jobs');
 
 const EXTRACT_VERSION = 1;
 const FIRST_RUN_MS = 2 * 60 * 1000;
 const CHECK_MS = 10 * 60 * 1000;
 const BATCH = 25;                     // replays per run
-const JOB_TIMEOUT_MS = 2 * 60 * 1000; // one replay in the worker
 const CAPTURE_MAX_BYTES = 4 * 1024 * 1024;
+const REPLAY_MAX_BYTES = 30 * 1024 * 1024; // packed; the unpacked cap is in replay-jobs.js
 const SLUG_RE = /^[a-z0-9-]{1,40}$/;
 const SOURCE_ID_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
 
 module.exports = function setupAtlas({
   app, mongoose, Replay, requireWriteKey, writeLimiter, proxyLimiter,
-  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now, inProcess = process.env.ATLAS_IN_PROCESS === '1',
-  waitTurn = async () => {} // resolves when no other replay is being unzipped (Render has 512 MB)
+  hasFullAccess = () => true, env = process.env, http = axios, now = Date.now,
+  inProcess = process.env.ATLAS_IN_PROCESS === '1' || process.env.REPLAY_JOBS_IN_PROCESS === '1'
 }) {
   const config = () => b2Config(env);
 
@@ -65,44 +64,12 @@ module.exports = function setupAtlas({
     at: Date
   }));
 
-  // --- The worker ---
-  let worker = null;
-  let nextJob = 1;
-  const jobs = new Map();
-  function failAll(err) { for (const [id, j] of jobs) { clearTimeout(j.timer); j.reject(err); jobs.delete(id); } }
-  function getWorker() {
-    if (worker) return worker;
-    const w = new Worker(path.join(__dirname, 'atlas-worker.js'));
-    w.on('message', ({ id, file, preview, summary, error }) => {
-      const j = jobs.get(id); if (!j) return;
-      jobs.delete(id); clearTimeout(j.timer);
-      const buf = (b) => (b ? Buffer.from(b.buffer, b.byteOffset, b.byteLength) : null);
-      if (error) j.reject(new Error(error)); else j.resolve({ file: buf(file), preview: buf(preview), summary });
-    });
-    w.on('error', err => { console.error('Atlas worker failed', err); if (worker === w) worker = null; failAll(err); });
-    w.on('exit', code => { if (worker === w) worker = null; if (jobs.size) failAll(new Error(`Atlas worker stopped (${code})`)); });
-    w.unref();
-    worker = w;
-    return w;
-  }
-  function runJob(msg) {
-    if (inProcess) {
-      // Tests: same work, on this thread.
-      const { extractCapture, readCapture, mergeCapture, encodeMap, decodeMap, previewOf } = require('./atlas-core');
-      const capture = msg.kind === 'capture' ? readCapture(Buffer.from(msg.bytes)) : extractCapture(Buffer.from(msg.bytes));
-      if (!capture.map) capture.map = msg.fallbackName || null;
-      if (!capture.map) return Promise.reject(new Error('Which map this is isn\'t in the recording'));
-      if (!capture.columns.size) return Promise.reject(new Error('No map blocks in the recording'));
-      const merged = mergeCapture(msg.map ? decodeMap(msg.map) : null, capture, msg.source);
-      return Promise.resolve({ file: encodeMap(merged), preview: previewOf(merged), summary: { name: merged.name, slug: merged.slug, modes: merged.modes, stats: merged.stats, sources: merged.sources } });
-    }
-    return new Promise((resolve, reject) => {
-      const id = nextJob++;
-      const timer = setTimeout(() => { jobs.delete(id); reject(new Error('Reading the game took too long')); }, JOB_TIMEOUT_MS);
-      jobs.set(id, { resolve, reject, timer });
-      try { getWorker().postMessage({ id, ...msg }); } catch (err) { jobs.delete(id); clearTimeout(timer); reject(err); }
-    });
-  }
+  // --- Reading a game: in a worker of its own, one replay at a time (replay-jobs.js) ---
+  const buf = (b) => (b ? Buffer.from(b.buffer, b.byteOffset, b.byteLength) : null);
+  const runJob = async (msg) => {
+    const out = await jobs.run(msg, { inProcess });
+    return { file: buf(out.file), preview: buf(out.preview), summary: out.summary };
+  };
 
   /** Merges one game (a replay file or a capture) into its map. */
   async function addGame({ kind, bytes, source, fallbackName }) {
@@ -146,15 +113,19 @@ module.exports = function setupAtlas({
     const todo = replays.filter(r => !done.has(String(r._id))).slice(0, BATCH);
     let read = 0;
     for (const r of todo) {
-      await waitTurn();
       const source = { id: String(r._id), playedAt: r.playedAt ? new Date(r.playedAt).toISOString() : null };
       let slug = null; let error = null;
       try {
-        const res = await http.get(presign({ method: 'GET', key: r.key, expires: 120, ...config() }), {
-          responseType: 'arraybuffer', timeout: 60000, maxContentLength: 400 * 1024 * 1024, validateStatus: () => true
+        // Its turn: no other replay (a clip being cut) is in memory meanwhile.
+        slug = await jobs.exclusive(async () => {
+          const res = await http.get(presign({ method: 'GET', key: r.key, expires: 120, ...config() }), {
+            responseType: 'arraybuffer', timeout: 60000, maxContentLength: REPLAY_MAX_BYTES, validateStatus: () => true
+          });
+          if (res.status !== 200) throw new Error(`Storage answered ${res.status}`);
+          const bytes = Buffer.isBuffer(res.data) ? res.data : Buffer.from(res.data);
+          jobs.checkSize(bytes);
+          return (await addGame({ kind: 'replay', bytes, source, fallbackName: r.map })).slug;
         });
-        if (res.status !== 200) throw new Error(`Storage answered ${res.status}`);
-        slug = (await addGame({ kind: 'replay', bytes: Buffer.from(res.data), source, fallbackName: r.map })).slug;
         read++;
       } catch (err) {
         error = String(err && err.message ? err.message : err).slice(0, 200);
@@ -167,7 +138,7 @@ module.exports = function setupAtlas({
     for (const c of caps) {
       let slug = null; let error = null;
       try {
-        slug = (await addGame({ kind: 'capture', bytes: Buffer.from(c.file.buffer || c.file), source: { id: c.source, playedAt: null } })).slug;
+        slug = (await jobs.exclusive(() => addGame({ kind: 'capture', bytes: Buffer.from(c.file.buffer || c.file), source: { id: c.source, playedAt: null } }))).slug;
         read++;
       } catch (err) {
         error = String(err && err.message ? err.message : err).slice(0, 200);
@@ -257,7 +228,7 @@ module.exports = function setupAtlas({
       try {
         if (await AtlasCapture.exists({ source: source.id })) return res.json({ ok: true, duplicate: true });
         if (running) await running; // not while a run is changing the maps
-        const s = await addGame({ kind: 'capture', bytes: req.body, source });
+        const s = await jobs.exclusive(() => addGame({ kind: 'capture', bytes: req.body, source }));
         await AtlasCapture.create({ source: source.id, file: req.body, at: new Date(now()) });
         await AtlasRead.updateOne({ source: source.id }, { $set: { version: EXTRACT_VERSION, slug: s.slug, error: null, at: new Date(now()) } }, { upsert: true });
         return res.status(201).json({ ok: true, map: s.name, slug: s.slug, games: s.sources.length, complete: !!(s.stats && s.stats.complete) });

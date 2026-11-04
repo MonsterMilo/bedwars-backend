@@ -13,20 +13,22 @@
 const axios = require('axios');
 const { presign, b2Config } = require('./replays');
 const clipper = require('./clipper');
+const jobs = require('./replay-jobs');
 
 // Bump to clip every replay again (e.g. after changing the rules).
 const CLIP_VERSION = 1;
 const LINK_SECONDS = 10 * 60;
 const DOWNLOAD_LINK_SECONDS = 10 * 60;
-// Replays over this are left alone: Render's free plan has 512 MB of memory.
-const MAX_REPLAY_BYTES = 60 * 1024 * 1024;
+// Replays over this (packed) are left alone (a real one is 1-3 MB); see also
+// replay-jobs.js MAX_RECORDING.
+const MAX_REPLAY_BYTES = 30 * 1024 * 1024;
 const BACKFILL_MS = 10 * 60 * 1000;
 const FIRST_BACKFILL_MS = 3 * 60 * 1000;
 const LIST_MAX = 60;
 
 module.exports = function setupClips({
   app, mongoose, Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess = () => true,
-  env = process.env, http = axios, log = console
+  env = process.env, http = axios, log = console, inProcess = process.env.REPLAY_JOBS_IN_PROCESS === '1'
 }) {
   const config = () => b2Config(env);
   const link = (method, key, expires = LINK_SECONDS, extra) => presign({ method, key, expires, extra, ...config() });
@@ -80,14 +82,18 @@ module.exports = function setupClips({
     const note = { version: CLIP_VERSION, at: new Date(), clips: 0, moments: [], error: null };
     try {
       if ((rep.sizeBytes || 0) > MAX_REPLAY_BYTES) throw new Error('Replay too big to clip on the server');
-      const r = await http.get(link('GET', rep.key, 60), { responseType: 'arraybuffer', timeout: 120000, validateStatus: () => true, maxContentLength: MAX_REPLAY_BYTES + 1 });
-      if (r.status !== 200) throw new Error(`Storage answered ${r.status}`);
-      let rec = clipper.readRecording(new Uint8Array(r.data));
-      const found = clipper.findMoments(rec, rep.players || [], { manual: rep.manualClips || [] });
+      // Read piece by piece in the replay worker (replay-jobs.js), one
+      // replay at a time across clips, the Atlas and the daily backup.
+      const found = await jobs.exclusive(async () => {
+        const r = await http.get(link('GET', rep.key, 60), { responseType: 'arraybuffer', timeout: 120000, validateStatus: () => true, maxContentLength: MAX_REPLAY_BYTES + 1 });
+        if (r.status !== 200) throw new Error(`Storage answered ${r.status}`);
+        const bytes = Buffer.isBuffer(r.data) ? r.data : Buffer.from(r.data);
+        jobs.checkSize(bytes);
+        return jobs.run({ kind: 'clips', bytes, players: (rep.players || []).map(p => ({ uuid: p.uuid, username: p.username, nick: p.nick })), manual: Array.from(rep.manualClips || [], Number) }, { inProcess });
+      });
       note.moments = found.moments.map(m => ({ kind: m.kind, username: m.username, victim: m.victim, by: m.by, t: m.t, ok: m.ok, reason: m.reason, inView: m.inView, distance: m.distance, ...(m.people ? { people: m.people.map(p => p.name) } : {}) }));
       const good = found.moments.filter(m => m.ok);
-      const cut = good.length ? clipper.cutClips(rec, clipper.windowsFor(good)) : [];
-      rec = null;
+      const cut = found.cuts;
 
       // Replace this replay's earlier automatic clips.
       const old = await Clip.find({ replayId: rep._id }).lean();
@@ -107,7 +113,7 @@ module.exports = function setupClips({
         });
         doc.key = `clips/${doc._id}.mcpr`;
         await doc.save();
-        await http.put(link('PUT', doc.key), Buffer.from(bytes), {
+        await http.put(link('PUT', doc.key), Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength), {
           headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length },
           maxBodyLength: Infinity, timeout: 60000
         });
@@ -123,7 +129,8 @@ module.exports = function setupClips({
     return note;
   }
 
-  // One replay at a time: each one is unzipped in memory.
+  // One replay at a time here; replay-jobs.js also keeps clips and the Atlas
+  // from reading two replays at once.
   const queue = [];
   let busy = null;
   function enqueue(id) {
@@ -270,7 +277,7 @@ module.exports = function setupClips({
     return { count: row ? row.count : 0, bytes: row ? row.bytes : 0 };
   }
 
-  // Waits until no clip is being cut (the Atlas waits its turn: one replay in memory at a time).
+  // Waits until no clip is being cut.
   const idle = async () => { while (busy) await busy; };
   return { Clip, clipReplay, enqueue, backfill, usage, idle, CLIP_VERSION };
 };

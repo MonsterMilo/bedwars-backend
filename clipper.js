@@ -19,6 +19,7 @@
 
 const zlib = require('zlib');
 const { unzipSync } = require('fflate');
+const stream = require('./tmcpr-stream');
 
 const P = {
   KEEPALIVE: 0x00, JOIN: 0x01, CHAT: 0x02, TIME: 0x03, EQUIP: 0x04, SPAWN_POS: 0x05, HEALTH: 0x06,
@@ -36,6 +37,14 @@ const P = {
 const DROP_IN_WINDOW = new Set([P.KEEPALIVE, P.CUSTOM_PAYLOAD, P.DISCONNECT, P.COMPRESSION, P.RESOURCE_PACK]);
 // Settings where only the newest one before the window matters.
 const LATEST = [P.TIME, P.SPAWN_POS, P.DIFFICULTY, P.ABILITIES, P.HEALTH, P.XP, P.HELD, P.HEADER_FOOTER, P.POSITION];
+
+// Packets the world state may keep a part of (WorldState.apply).
+const KEPT = new Set([
+  P.JOIN, P.RESPAWN, P.GAME_STATE, P.BORDER, P.WINDOW_ITEMS, P.SET_SLOT, P.CHUNK, P.CHUNK_BULK, P.MULTI_BLOCK, P.BLOCK,
+  P.TILE, P.SIGN, P.SPAWN_PLAYER, P.SPAWN_OBJECT, P.SPAWN_MOB, P.SPAWN_PAINTING, P.SPAWN_XP, P.HEAD_LOOK, P.VELOCITY,
+  P.PROPERTIES, P.ATTACH, P.EQUIP, P.EFFECT_ADD, P.METADATA, P.PLAYER_LIST, P.TEAMS, P.OBJECTIVE, P.DISPLAY, P.SCORE,
+  ...LATEST
+]);
 
 // Private, party and guild chat never goes in a clip (same rule as the viewer).
 const PRIVATE_CHAT = /^\s*(From |To |Party >|P >|Guild >|G >|Officer >|O >|Friend >|F >|\[Party\]|-{5,}|You'll be partying with|.* has (invited you|joined the party|left the party)|Party (Leader|Moderators|Members))/;
@@ -168,6 +177,35 @@ function readRecording(bytes) {
   return { meta, rec, n, t, id, at, body, end };
 }
 
+/**
+ * Raw .mcpr bytes -> a recording read piece by piece (tmcpr-stream.js),
+ * for findMoments and cutClips: { meta, stream }. Uses a few MB however long
+ * the game was, where readRecording holds all of it (~6 MB a minute).
+ */
+function openRecording(bytes) {
+  const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer || bytes, bytes.byteOffset || 0, bytes.byteLength);
+  if (!stream.hasRecording(buf)) throw new Error('No recording.tmcpr in the file');
+  return { meta: stream.readMeta(buf), stream: buf };
+}
+
+/**
+ * Each packet of a recording, in order: fn(t, id, bytes, at, bodyAt, end),
+ * where the packet (its id first) is bytes[at..end) and its body starts at
+ * bodyAt. fn can return false to stop.
+ */
+function forEachPacket(recording, fn) {
+  if (recording.stream) {
+    stream.eachRecord(recording.stream, (t, b) => {
+      const r = new Reader(b, 0, b.length);
+      const id = r.varint();
+      return fn(t, id, b, 0, r.pos, b.length);
+    });
+    return;
+  }
+  const { rec, n, t: T, id: ID, at: A, body: B, end: E } = recording;
+  for (let k = 0; k < n; k++) if (fn(T[k], ID[k], rec, A[k], B[k], E[k]) === false) return;
+}
+
 // --- Bed Wars bits ---
 
 // Teams are named like "Red8"; eliminated players get moved to other teams
@@ -192,7 +230,7 @@ class Pos { constructor(x, y, z) { this.x = x; this.y = y; this.z = z; } }
  */
 function findMoments(recording, tracked, options = {}) {
   const o = { ...DEFAULTS, ...options };
-  const { rec, n, t: T, id: ID, body: B, end: E, meta } = recording;
+  const { meta } = recording;
   const names = new Map();        // tab uuid -> name
   const teamOf = new Map();       // name -> 'Red'
   const live = new Map();         // eid -> { uuid, pos }
@@ -212,12 +250,10 @@ function findMoments(recording, tracked, options = {}) {
     list.push({ t, x: pos ? pos.x / 32 : 0, y: pos ? pos.y / 32 : 0, z: pos ? pos.z / 32 : 0, gone });
   };
 
-  for (let k = 0; k < n; k++) {
-    const id = ID[k];
+  forEachPacket(recording, (t, id, bytes, at, bodyAt, end) => {
     if (id !== P.CHAT && id !== P.JOIN && id !== P.POSITION && id !== P.SPAWN_PLAYER && id !== P.REL_MOVE && id !== P.LOOK_MOVE &&
-        id !== P.TELEPORT && id !== P.DESTROY && id !== P.PLAYER_LIST && id !== P.TEAMS && id !== P.RESPAWN) continue;
-    const t = T[k];
-    const r = new Reader(rec, B[k], E[k]);
+        id !== P.TELEPORT && id !== P.DESTROY && id !== P.PLAYER_LIST && id !== P.TEAMS && id !== P.RESPAWN) return;
+    const r = new Reader(bytes, bodyAt, end);
     try {
       switch (id) {
         case P.JOIN: { const eid = r.i32(); r.u8(); dimension = r.i8(); if (selfId == null) selfId = eid; break; }
@@ -297,7 +333,7 @@ function findMoments(recording, tracked, options = {}) {
         }
       }
     } catch { /* one odd packet doesn't stop the rest */ }
-  }
+  });
 
   // Who the recording player is: the spawned entity with the join's id, or
   // the tab entry whose name the metadata lists.
@@ -481,8 +517,8 @@ function packet(id, fn) {
 
 /** The world as it stands, kept as raw packets so it can be written out. */
 class WorldState {
-  constructor(rec) {
-    this.rec = rec;
+  constructor({ copy = false } = {}) {
+    this.copy = copy;
     this.join = null; this.respawn = null; this.dimension = 0;
     this.latest = new Map();       // packet id -> bytes
     this.gameState = new Map();    // reason -> bytes
@@ -497,10 +533,11 @@ class WorldState {
     this.inventory = null; this.slots = [];
   }
 
-  slice(a, b) { return this.rec.subarray(a, b); }
-
-  apply(id, at, bodyAt, end) {
-    const rec = this.rec;
+  // The packet is rec[at..end): kept parts are views into it. A recording
+  // read piece by piece hands over views that are only good for the call, so
+  // a packet that may be kept is copied first.
+  apply(id, rec, at, bodyAt, end) {
+    if (this.copy && KEPT.has(id)) { rec = rec.slice(at, end); bodyAt -= at; end -= at; at = 0; }
     const raw = rec.subarray(at, end);
     const r = new Reader(rec, bodyAt, end);
     switch (id) {
@@ -760,10 +797,10 @@ function writeRecording(items) {
  */
 function cutClips(recording, windows, options = {}) {
   const o = { ...DEFAULTS, ...options };
-  const { rec, n, t: T, id: ID, at: A, body: B, end: E, meta } = recording;
+  const { meta } = recording;
   const order = windows.map((w, i) => ({ ...w, i, from: Math.max(0, Math.round(w.from)), to: Math.round(w.to) })).sort((a, b) => a.from - b.from);
   const results = new Array(windows.length);
-  const state = new WorldState(rec);
+  const state = new WorldState({ copy: !!recording.stream });
   const open = [];
   let next = 0;
   const startWindow = (w) => {
@@ -779,17 +816,16 @@ function cutClips(recording, windows, options = {}) {
     if (x.w.marker) files['markers.json'] = Buffer.from(JSON.stringify([{ realTimestamp: Math.max(0, Math.round(x.w.markAt - x.w.from)), value: { name: x.w.marker } }]));
     results[x.w.i] = { bytes: zipFiles(files), durationMs };
   };
-  for (let k = 0; k < n; k++) {
-    const t = T[k]; const id = ID[k];
+  forEachPacket(recording, (t, id, rec, at, bodyAt, end) => {
     while (next < order.length && order[next].from <= t) startWindow(order[next++]);
     for (let q = open.length - 1; q >= 0; q--) if (t > open[q].w.to) { finish(open[q]); open.splice(q, 1); }
-    if (open.length && !DROP_IN_WINDOW.has(id) && !(id === P.CHAT && isPrivateChat(rec, B[k], E[k]))) {
-      const raw = rec.subarray(A[k], E[k]);
+    if (open.length && !DROP_IN_WINDOW.has(id) && !(id === P.CHAT && isPrivateChat(rec, bodyAt, end))) {
+      const raw = recording.stream ? rec.slice(at, end) : rec.subarray(at, end);
       for (const x of open) x.items.push([t - x.w.from, raw]);
     }
-    try { state.apply(id, A[k], B[k], E[k]); } catch { /* skip an odd packet */ }
-    if (next >= order.length && !open.length) break;
-  }
+    try { state.apply(id, rec, at, bodyAt, end); } catch { /* skip an odd packet */ }
+    if (next >= order.length && !open.length) return false;
+  });
   while (next < order.length) startWindow(order[next++]);
   for (const x of open) finish(x);
   return results;
@@ -805,4 +841,4 @@ function windowsFor(moments, options = {}) {
   });
 }
 
-module.exports = { readRecording, findMoments, cutClips, windowsFor, chatText, DEFAULTS, P, packet, writeRecording, zipFiles };
+module.exports = { readRecording, openRecording, forEachPacket, findMoments, cutClips, windowsFor, chatText, DEFAULTS, P, packet, writeRecording, zipFiles };
