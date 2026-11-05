@@ -1,16 +1,24 @@
-// --- Tracked list: one short line per tracked player, in its own channel ---
-// Next to the Sweat Log's big cards, the bot posts every new sweat to a
-// second channel (TRACKED_LIST_CHANNEL_ID) as a single line (Milo, Nov 2026):
-//   **Name** · 312✫ · 8.42 FKDR · 3.10 WLR · 🎭 Nick1, Nick2 · ⚔️ @Milo @Potat
-// - stats are the ones saved on the sweat
-// - 🎭 lists the nicks the player has now, from the resolved nicks list
-//   (resolved.js); when a nick of theirs resolves later, the line is edited
-// - ⚔️ pings everyone on the roster who beat them, by their linked Discord
-//   account (DISCORD_ROSTER); someone with no link is just named
-// - an edit on the site or in the bot redraws the line (a removed sweat is
-//   struck through). Edits never ping again; only the first post does.
-// Each sweat remembers its line ({ channelId, messageId, line }) in
-// sweat.trackedPost, so only lines that really changed are edited.
+// --- Tracked list: tracked players as short lines, in their own channel ---
+// Next to the Sweat Log's big cards, the bot posts new sweats to a second
+// channel (TRACKED_LIST_CHANNEL_ID) as one short message (Milo, Nov 2026).
+// Players tracked close together (a party: within GROUP_MS of the first)
+// share one message:
+//   **Frost_Byte** · 642✫ · 9.87 FKDR · 4.12 WLR · 23.40 monthly FKDR
+//   **PixelReaper** · 1103✫ · 14.20 FKDR · 6.55 WLR · ⚠️ cheating
+//   🎭 xXShadowXx (Frost_Byte) · Lunar_Wolf (PixelReaper)
+//   ⚔️ @Milo
+// - stats are the ones saved on the sweat; Urchin's monthly FKDR is added
+//   when it's MONTHLY_MIN or more (fetched once, when posted)
+// - 🎭 the nicks each player has now, from the resolved nicks list
+//   (resolved.js); when a nick of theirs resolves later, the message is
+//   edited
+// - ⚔️ pings everyone on the roster who beat any of them, by their linked
+//   Discord account (DISCORD_ROSTER); someone with no link is just named
+// - an edit on the site or in the bot redraws the message (a removed sweat
+//   is struck through). Edits never ping again; only the first post does.
+// Each sweat remembers its message in sweat.trackedPost ({ channelId,
+// messageId, slot, monthly, content }); content is the message as last sent,
+// so only real changes are edited.
 // Unset TRACKED_LIST_CHANNEL_ID uses Milo's channel; "off" turns it off.
 
 const axios = require('axios');
@@ -18,6 +26,8 @@ const axios = require('axios');
 const API = 'https://discord.com/api/v10';
 const DEFAULT_CHANNEL_ID = '1056338648703975474';
 const GAP_MS = 1200; // Discord allows 5 messages per 5 seconds in a channel
+const GROUP_MS = 60 * 1000;
+const MONTHLY_MIN = 20;
 const NICKS_SHOWN = 5;
 
 const LABELS = {
@@ -35,25 +45,35 @@ function uuidForms(uuid) {
   return [bare, bare.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5')];
 }
 
-// The line for a sweat. nicks: the player's nicks now, newest first.
-// idOf(rosterId) -> their Discord user id, or null.
-function lineOf(sweat, nicks, idOf, rosterFields) {
+// One player's line (without nicks or pings).
+function lineOf(sweat, monthly) {
   const parts = [`**${esc(sweat.username)}**`, `${Math.floor(Number(sweat.star) || 0)}✫`, `${fixed(sweat.fkdr, 2)} FKDR`, `${fixed(sweat.wlr, 2)} WLR`];
+  if (Number.isFinite(monthly) && monthly >= MONTHLY_MIN) parts.push(`${fixed(monthly, 2)} monthly FKDR`);
   if (sweat.cheating) parts.push('⚠️ cheating');
   if (sweat.boosting) parts.push('⚠️ boosting');
-  if (nicks && nicks.length) {
-    const more = nicks.length > NICKS_SHOWN ? ` +${nicks.length - NICKS_SHOWN}` : '';
-    parts.push(`🎭 ${nicks.slice(0, NICKS_SHOWN).map(esc).join(', ')}${more}`);
-  }
-  const beat = rosterFields.filter(f => sweat[f]);
-  if (beat.length) parts.push(`⚔️ ${beat.map(f => (idOf(f) ? `<@${idOf(f)}>` : (LABELS[f] || f))).join(' ')}`);
   const line = parts.join(' · ');
   return sweat.deletedAt ? `~~${line}~~ (removed)` : line;
 }
 
+// The whole message. players: [{ sweat, nicks, monthly }] in order.
+// idOf(rosterId) -> their Discord user id, or null.
+function messageOf(players, idOf, rosterFields) {
+  const lines = players.map(p => lineOf(p.sweat, p.monthly));
+  const nickParts = players.filter(p => p.nicks && p.nicks.length && !p.sweat.deletedAt).map(p => {
+    const more = p.nicks.length > NICKS_SHOWN ? ` +${p.nicks.length - NICKS_SHOWN}` : '';
+    const list = `${p.nicks.slice(0, NICKS_SHOWN).map(esc).join(', ')}${more}`;
+    return players.length > 1 ? `${list} (${esc(p.sweat.username)})` : list;
+  });
+  if (nickParts.length) lines.push(`🎭 ${nickParts.join(' · ')}`);
+  const beat = beatersOf(players.filter(p => !p.sweat.deletedAt).map(p => p.sweat), rosterFields);
+  if (beat.length) lines.push(`⚔️ ${beat.map(f => (idOf(f) ? `<@${idOf(f)}>` : (LABELS[f] || f))).join(' ')}`);
+  return lines.join('\n');
+}
+const beatersOf = (sweats, rosterFields) => rosterFields.filter(f => sweats.some(s => s[f]));
+
 module.exports = function setupTrackedList({
-  Sweat, ROSTER_FIELDS, roster = new Map(), resolved = null, http = axios,
-  describeAxiosError = err => err.message, gapMs = GAP_MS
+  Sweat, ROSTER_FIELDS, roster = new Map(), resolved = null, monthlyFkdr = null, http = axios,
+  describeAxiosError = err => err.message, gapMs = GAP_MS, groupMs = GROUP_MS
 }) {
   const TOKEN = process.env.DISCORD_BOT_TOKEN;
   const setting = process.env.TRACKED_LIST_CHANNEL_ID;
@@ -64,6 +84,8 @@ module.exports = function setupTrackedList({
 
   const idOf = who => [...roster].find(([, w]) => w === who)?.[0] || null;
   const nicksFor = s => (resolved ? resolved.nicksOf({ uuid: s.uuid, username: s.username }).catch(() => []) : Promise.resolve([]));
+  const monthlyFor = s => (monthlyFkdr && uuidForms(s.uuid)[0]
+    ? Promise.resolve().then(() => monthlyFkdr(uuidForms(s.uuid)[0])).catch(() => null) : Promise.resolve(null));
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const remember = (id, post) => Sweat.updateOne({ _id: id }, { $set: { trackedPost: post } }, { timestamps: false })
     .catch(err => console.error('Tracked list: saving the message id failed', err.message));
@@ -84,37 +106,79 @@ module.exports = function setupTrackedList({
     }
   }
 
-  // A new sweat: its line, pinging who beat them. Fire-and-forget.
+  // --- New sweats ---
+  // The first one starts a GROUP_MS wait; everyone tracked before it ends
+  // goes in the same message, pinging who beat any of them.
+  let waiting = null; // { sweats: [], timer, monthly: Map }
+  let flushed = Promise.resolve();
   function post(sweat) {
-    if (!on || !sweat) return Promise.resolve();
-    return queued(async () => {
-      const line = lineOf(sweat, await nicksFor(sweat), idOf, ROSTER_FIELDS);
-      const users = ROSTER_FIELDS.filter(f => sweat[f]).map(idOf).filter(Boolean);
-      const r = await send('post', `/channels/${CHANNEL_ID}/messages`, { content: line, allowed_mentions: { users } });
-      await remember(sweat._id, { channelId: CHANNEL_ID, messageId: r.data.id, line });
+    if (!on || !sweat) return;
+    if (!waiting) {
+      waiting = { sweats: [], monthly: new Map() };
+      waiting.timer = setTimeout(flush, groupMs);
+      if (waiting.timer.unref) waiting.timer.unref();
+    }
+    waiting.sweats.push(sweat);
+    // Fetched now, while the group waits.
+    waiting.monthly.set(String(sweat._id), monthlyFor(sweat));
+  }
+  function flush() {
+    const group = waiting;
+    waiting = null;
+    if (!group || !group.sweats.length) return flushed;
+    flushed = queued(async () => {
+      // As they are now (edited or removed while the group waited).
+      const now = new Map((await Sweat.find({ _id: { $in: group.sweats.map(s => s._id) } }).lean()).map(s => [String(s._id), s]));
+      group.sweats = group.sweats.map(s => now.get(String(s._id)) || s).filter(s => !s.deletedAt);
+      if (!group.sweats.length) return;
+      const players = await Promise.all(group.sweats.map(async s => ({
+        sweat: s, nicks: await nicksFor(s), monthly: await group.monthly.get(String(s._id))
+      })));
+      const content = messageOf(players, idOf, ROSTER_FIELDS);
+      const users = beatersOf(group.sweats, ROSTER_FIELDS).map(idOf).filter(Boolean);
+      const r = await send('post', `/channels/${CHANNEL_ID}/messages`, { content, allowed_mentions: { users } });
+      await Promise.all(players.map((p, slot) => remember(p.sweat._id, {
+        channelId: CHANNEL_ID, messageId: r.data.id, slot, monthly: Number.isFinite(p.monthly) ? p.monthly : null, content
+      })));
     }).catch(err => console.error('Tracked list: posting failed', describeAxiosError(err)));
+    return flushed;
   }
 
-  // Redraws a sweat's line if it changed (edits, removal, a new nick).
-  // Fire-and-forget.
+  // --- Keeping messages up to date ---
+  // Redraws the message a sweat is in, from every sweat in it, if it changed
+  // (edits, removal, a new nick). Fire-and-forget.
   function refresh(sweat) {
     const was = on && sweat && sweat.trackedPost;
     if (!was || !was.messageId) return Promise.resolve();
+    return redraw(was.channelId, was.messageId);
+  }
+  const redrawing = new Set(); // messages with a redraw already queued
+  function redraw(channelId, messageId) {
+    if (redrawing.has(messageId)) return Promise.resolve();
+    redrawing.add(messageId);
     return queued(async () => {
-      const line = lineOf(sweat, await nicksFor(sweat), idOf, ROSTER_FIELDS);
-      if (line === was.line) return;
+      redrawing.delete(messageId);
+      const sweats = (await Sweat.find({ 'trackedPost.messageId': messageId }).lean())
+        .sort((a, b) => (a.trackedPost.slot || 0) - (b.trackedPost.slot || 0));
+      if (!sweats.length) return;
+      const players = await Promise.all(sweats.map(async s => ({ sweat: s, nicks: await nicksFor(s), monthly: s.trackedPost.monthly })));
+      const content = messageOf(players, idOf, ROSTER_FIELDS);
+      if (sweats.every(s => (s.trackedPost.content || s.trackedPost.line) === content)) return;
       try {
-        await send('patch', `/channels/${was.channelId}/messages/${was.messageId}`, { content: line, allowed_mentions: { parse: [] } });
-        await remember(sweat._id, { ...was, line });
+        await send('patch', `/channels/${channelId}/messages/${messageId}`, { content, allowed_mentions: { parse: [] } });
+        await Promise.all(sweats.map(s => remember(s._id, { ...s.trackedPost, content })));
       } catch (err) {
         // Deleted in Discord: stop editing it.
-        if (err.response && err.response.status === 404) return remember(sweat._id, null);
+        if (err.response && err.response.status === 404) return Promise.all(sweats.map(s => remember(s._id, null)));
         throw err;
       }
-    }).catch(err => console.error('Tracked list: editing failed', describeAxiosError(err)));
+    }).catch(err => {
+      redrawing.delete(messageId);
+      console.error('Tracked list: editing failed', describeAxiosError(err));
+    });
   }
 
-  // Players whose nicks changed: redraw their lines. [{ player, uuid }]
+  // Players whose nicks changed: redraw their messages. [{ player, uuid }]
   async function nicksChanged(players) {
     if (!on || !players.length) return;
     for (let i = 0; i < players.length; i += 500) {
@@ -132,7 +196,9 @@ module.exports = function setupTrackedList({
     resolved.onChange(players => nicksChanged(players).catch(err => console.error('Tracked list: nick update failed', err.message)));
   }
 
-  return { post, refresh, nicksChanged, on, channelId: CHANNEL_ID, _idle: () => chain };
+  return { post, flush, refresh, nicksChanged, on, channelId: CHANNEL_ID, _idle: () => chain };
 };
 
 module.exports.lineOf = lineOf;
+module.exports.messageOf = messageOf;
+module.exports.MONTHLY_MIN = MONTHLY_MIN;
