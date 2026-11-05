@@ -109,6 +109,12 @@ test('the map name comes from the sidebar when /locraw is missing, and stored zi
   assert.equal(c.columns.size, 1);
 });
 
+test('a lobby\'s /locraw ("map":"Base") never names the map', () => {
+  const lobby = '{"server":"dynamiclobby5","gametype":"BEDWARS","lobbyname":"bedwarslobby23","map":"Base"}'
+  const c = A.extractCapture(mcpr([[0, chat(lobby)], [10, team('team_9', 'Map: §aLight', 'house')], [20, chunk(0, 0, [[0, 64, 0, STONE]])], [3000, chat('Protect your bed and destroy the enemy beds.')]]))
+  assert.equal(c.map, 'Lighthouse')
+})
+
 test('chunks first seen mid-game are kept but marked; pre-game chunks win when merging', () => {
   const lateChunk = [[60000, chunk(5, 5, [[80, 70, 80, WOOL]])]];
   const a = A.extractCapture(game({ late: lateChunk }));
@@ -236,4 +242,20 @@ test('the proxy can send a game\'s map on its own (Milo\'s key only); rebuilds k
   const doc = await atlas.AtlasMap.findOne({ slug: 'test-isle' }).lean();
   assert.equal(doc.games, 2);
   assert.equal(at(A.decodeMap(Buffer.from(doc.file.buffer)), 50, 70, 50), GOLD);
+});
+
+test('a replay that began mid-game is not used, and a removed map goes with its games', async () => {
+  const late = await Replay.create({ key: 'replays/late.mcpr', map: 'Late Isle', playedAt: new Date('2026-11-04T00:00:00Z'), status: 'ready' });
+  files.set('replays/late.mcpr', mcpr([[0, chat(LOCRAW.replace('Test Isle', 'Late Isle'))], [10, chunk(0, 0, [[1, 64, 1, GOLD]])]]));
+  await atlas.runOnce();
+  assert.equal(await atlas.AtlasMap.exists({ slug: 'late-isle' }), null);
+  const read = await atlas.AtlasRead.findOne({ source: String(late._id) }).lean();
+  assert.match(read.error, /joined late/);
+
+  // A "Base" map from before the fix: removed, and its game read again.
+  const one = A.encodeMap(A.mergeCapture(null, A.extractCapture(game()), { id: String(late._id) }));
+  await atlas.AtlasMap.create({ slug: 'base', name: 'Base', version: atlas.EXTRACT_VERSION, file: one, sources: [{ id: String(late._id) }] });
+  await atlas.runOnce();
+  assert.equal(await atlas.AtlasMap.exists({ slug: 'base' }), null);
+  assert.match((await atlas.AtlasRead.findOne({ source: String(late._id) }).lean()).error, /joined late/);
 });

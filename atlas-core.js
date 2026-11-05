@@ -91,7 +91,8 @@ function extractCapture(mcprBytes) {
       if (id === 0x02) {
         const text = chatText(str(rec, pos));
         if (start == null && START_RE.test(text)) start = t;
-        if (/^\{"server"/.test(text)) { try { const j = JSON.parse(text); if (j.map) info = j; } catch { /* not /locraw */ } }
+        // (A lobby's /locraw says "map":"Base": only a game's counts.)
+        if (/^\{"server"/.test(text)) { try { const j = JSON.parse(text); if (j.map && !j.lobbyname) info = j; } catch { /* not /locraw */ } }
       } else if (id === 0x3e && boardMap == null) {
         // Pre-game sidebar line "Map: <name>", split over a team's prefix and suffix.
         str(rec, pos); const mode = rec[pos.i++];
