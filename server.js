@@ -813,15 +813,48 @@ app.get('/health', (req, res) => {
 
 // Who the presented key belongs to, so the site can say "Writing as Milo"
 // and check a key when it's entered. { who: null } for no/unknown key.
-app.get('/whoami', proxyLimiter, (req, res) => {
+// Also carries that person's saved website settings (prefs), so the site
+// can put their last theme back on any device they use the key on.
+app.get('/whoami', proxyLimiter, async (req, res) => {
   const who = keyOwner(req);
   const full = hasFullAccess(who);
+  let prefs = {};
+  if (who && mongoose.connection.readyState === 1) {
+    try {
+      const doc = await Pref.findOne({ owner: who }).lean();
+      if (doc) prefs = { theme: doc.theme || null, themeAt: doc.updatedAt ? new Date(doc.updatedAt).getTime() : null };
+    } catch (err) {
+      console.error('/whoami prefs error', err.message);
+    }
+  }
   return res.json({
     who,
     admin: full,
     editWindowDays: full ? null : CHANGE_WINDOW_DAYS.edit,
-    deleteWindowDays: full ? null : CHANGE_WINDOW_DAYS.delete
+    deleteWindowDays: full ? null : CHANGE_WINDOW_DAYS.delete,
+    prefs
   });
+});
+
+// Website settings per key owner. Only the theme for now: the tracker saves
+// the theme someone picks here, and /whoami hands it back with when it was
+// saved (themeAt, ms), so a device can tell whether its own pick is newer.
+// One small document per person, so it can't grow.
+const Pref = mongoose.model('Pref', new mongoose.Schema({
+  owner: { type: String, required: true, unique: true },
+  theme: { type: String, default: null }
+}, { timestamps: true }));
+const THEME_ID = /^[a-z]{2,24}$/;
+app.put('/prefs', requireWriteKey, writeLimiter, async (req, res) => {
+  const theme = req.body && req.body.theme;
+  if (typeof theme !== 'string' || !THEME_ID.test(theme)) return res.status(400).json({ error: 'theme must be a theme id' });
+  try {
+    const doc = await Pref.findOneAndUpdate({ owner: req.keyOwner }, { $set: { theme } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean();
+    return res.json({ prefs: { theme: doc.theme, themeAt: new Date(doc.updatedAt).getTime() } });
+  } catch (err) {
+    console.error('/prefs error', err.message);
+    return res.status(500).json({ error: 'Could not save' });
+  }
 });
 
 // --- Mojang proxy: get UUID and corrected name (via Bordic, falling back to Mojang) ---
