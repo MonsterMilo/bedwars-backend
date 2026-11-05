@@ -95,6 +95,25 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
   let chain = Promise.resolve();
   const queued = work => (chain = chain.then(work, work));
 
+  // Who else wants to know when a player's nicks change (the tracked list
+  // channel, see tracked-list.js): each listener gets [{ player, uuid }],
+  // everyone who gained or lost a nick. Never awaited, never throws back.
+  const listeners = [];
+  const onChange = fn => { listeners.push(fn); };
+  function tell(players) {
+    if (!players.length || !listeners.length) return;
+    const seen = new Set();
+    const list = players.filter(p => {
+      const k = `${p.uuid || ''}|${String(p.player || '').toLowerCase()}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    for (const fn of listeners) {
+      try { Promise.resolve(fn(list)).catch(err => console.warn('Resolved nicks: a listener failed', err.message)); } catch (err) { console.warn('Resolved nicks: a listener failed', err.message); }
+    }
+  }
+
   // --- Discord ---
   // The channel shows each player once, with their newest nick (Milo, Oct
   // 2026): only the newest of a player's nicks is shown. Players are matched
@@ -324,6 +343,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     return queued(async () => {
       await load();
       const changed = new Map(); // nickLower -> row
+      const moved = []; // players whose own nicks changed: { player, uuid }
       for (const e of clean) {
         const key = e.nick.toLowerCase();
         const playerLower = e.player.toLowerCase();
@@ -334,6 +354,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
           if (e.uuid) nameUuid.set(playerLower, e.uuid);
           rows.set(key, row);
           changed.set(key, row);
+          moved.push({ player: e.player, uuid: e.uuid });
           continue;
         }
         // The same player: the same uuid (even under a new name), or the
@@ -363,6 +384,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
         }
         if (e.seenAt > row.seenAt) {
           // Someone else has it now.
+          moved.push({ player: row.player, uuid: row.uuid || null }, { player: e.player, uuid: e.uuid });
           row.history = [{ player: row.player, source: row.source, seenAt: row.seenAt },
             ...row.history.filter(h => h.player.toLowerCase() !== playerLower && h.player.toLowerCase() !== row.playerLower)].slice(0, HISTORY_MAX);
           Object.assign(row, { player: e.player, playerLower, source: e.source, alsoIn: [], seenAt: e.seenAt, uuid: e.uuid, uuidTried: false });
@@ -377,6 +399,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
         }
       }
       if (!changed.size) return 0;
+      tell(moved);
       const list = [...changed.values()];
       for (let i = 0; i < list.length; i += 1000) {
         await ResolvedNick.bulkWrite(list.slice(i, i + 1000).map(r => ({
@@ -414,6 +437,8 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
       if (!row) return false;
       if (row.playerLower === who && row.source === source) {
         const oldMessage = row.messageId;
+        const back0 = !row.alsoIn.length && row.history[0];
+        tell([{ player: row.player, uuid: row.uuid || null }, ...(back0 ? [{ player: back0.player, uuid: null }] : [])]);
         if (row.alsoIn.length) {
           // Another source knows the same pair: it stays, under that source.
           row.source = row.alsoIn[0];
@@ -497,6 +522,19 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     return out;
   }
 
+  // The nicks a player has now (they're the newest to have used them),
+  // newest first, by uuid (any spelling) or, failing that, by name.
+  async function nicksOf({ uuid, username } = {}) {
+    await load();
+    const u = String(uuid || '').replace(/-/g, '').toLowerCase();
+    const id = UUID_RE.test(u) ? u : null;
+    const n = String(username || '').toLowerCase();
+    return [...rows.values()]
+      .filter(r => (id && keyOf(r) === id) || (n && r.playerLower === n && (!id || !r.uuid)))
+      .sort((a, b) => b.seenAt - a.seenAt)
+      .map(r => r.nick);
+  }
+
   // The whole list in the gists' format: [nick, [[player, count, first,
   // last, source, uuid], ...]] (times in seconds), current owner first.
   async function exportAll() {
@@ -534,7 +572,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     return { nicks: c.nicks, players: c.players, toPost: c.toPost.length, messages: Math.ceil(c.toPost.length / PER_MESSAGE), redraws: c.redraws.length, postingOn };
   };
 
-  return { record, retract, recordScraped, search, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
+  return { record, retract, recordScraped, search, nicksOf, onChange, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
 };
 
 module.exports.toMs = toMs;

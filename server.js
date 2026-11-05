@@ -606,6 +606,9 @@ const sweatSchemaFields = {
   // The Sweat Log message for this sweat ({ channelId, messageId, author,
   // footer }), so the bot can edit it when the sweat changes on the site.
   discordPost: { type: mongoose.Schema.Types.Mixed, default: null },
+  // Its one-line message in the tracked list channel ({ channelId,
+  // messageId, line }), see tracked-list.js.
+  trackedPost: { type: mongoose.Schema.Types.Mixed, default: null },
   createdAt: { type: Date, default: Date.now, index: true },
   // Soft delete: removing a sweat hides it (and records who did it) instead
   // of erasing it, so the admin key can restore it with everything intact.
@@ -710,7 +713,10 @@ function logActivity(req, action, sweat, extra = {}) {
   if (!sweat) return;
   // Keep its Sweat Log card in Discord matching. req.discordMessageId is
   // the card a bot click came from, which the click redraws itself.
-  if (action !== 'sweat.add') discord.refreshCard(sweat, req.discordMessageId);
+  if (action !== 'sweat.add') {
+    discord.refreshCard(sweat, req.discordMessageId);
+    trackedList.refresh(sweat);
+  }
   Activity.create({
     who: req.keyOwner,
     action,
@@ -921,6 +927,7 @@ async function createSweat(fields, who, noteText) {
   const saved = await new Sweat(fields).save();
   logActivity({ keyOwner: who }, 'sweat.add', saved, noteText ? { noteId: saved.notes[0]._id, noteText } : {});
   discord.postNewSweat(saved, who);
+  trackedList.post(saved);
   return saved;
 }
 
@@ -1124,6 +1131,13 @@ app.get('/status', proxyLimiter, async (req, res) => {
     console.error('/status error', err);
     return res.status(500).json({ error: 'Status check failed' });
   }
+});
+
+// Every tracked player as one short line in its own channel, with their
+// nicks kept up to date (see tracked-list.js).
+const trackedList = require('./tracked-list')({
+  Sweat, ROSTER_FIELDS, resolved, describeAxiosError,
+  roster: require('./discord').parseRoster(process.env.DISCORD_ROSTER, ROSTER_FIELDS)
 });
 
 const discord = require('./discord')({

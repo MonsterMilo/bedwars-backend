@@ -43,6 +43,9 @@
 //   DISCORD_ROSTER      who's who: "milo:<discord user id>,potat:<id>,..."
 //   RESOLVED_NICKS_CHANNEL_ID  optional: the channel every resolved nick is
 //                       posted to once (see resolved.js)
+//   TRACKED_LIST_CHANNEL_ID  optional: the channel every new sweat is posted
+//                       to as one short line (see tracked-list.js); defaults
+//                       to Milo's channel, "off" turns it off
 // Missing any of the first four just turns the bot off.
 
 const crypto = require('crypto');
@@ -1892,6 +1895,7 @@ module.exports = function setupDiscord({
   return { postNewSweat, refreshCard, sendDenickRequest, requestsOn };
 };
 
+module.exports.parseRoster = parseRoster;
 // For the tests.
 module.exports.recapSlot = recapSlot;
 module.exports.previousSlot = previousSlot;
