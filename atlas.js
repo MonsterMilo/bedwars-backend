@@ -189,7 +189,16 @@ module.exports = function setupAtlas({
     newestGame: (m.sources || []).reduce((a, s) => (s.playedAt && (!a || s.playedAt > a) ? s.playedAt : a), null)
   });
 
-  // --- Routes (keys only: the maps are Hypixel's builds, so they stay private) ---
+  // --- Routes (keys only, apart from the count: the maps are Hypixel's builds, so they stay private) ---
+  // Just how many maps the Atlas holds, for the public home page. No map data.
+  app.get('/maps/count', proxyLimiter, async (req, res) => {
+    try {
+      return res.json({ maps: await AtlasMap.countDocuments({ version: EXTRACT_VERSION }) });
+    } catch (err) {
+      console.error('/maps/count error', err);
+      return res.status(500).json({ error: 'DB read error' });
+    }
+  });
   app.get('/maps', requireWriteKey, proxyLimiter, async (req, res) => {
     try {
       const maps = await AtlasMap.find({ version: EXTRACT_VERSION }, { file: 0, preview: 0 }).sort({ name: 1 }).lean();

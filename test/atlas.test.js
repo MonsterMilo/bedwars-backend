@@ -198,6 +198,7 @@ test('replays in B2 become maps, each read once; the routes need a key', async (
   assert.equal((await atlas.runOnce()).read, 0); // nothing new
 
   assert.equal((await fetch(base + '/maps')).status, 401);
+  assert.deepEqual(await (await fetch(base + '/maps/count')).json(), { maps: 1 }); // the count alone is public
   const list = await (await fetch(base + '/maps', { headers: { 'x-admin-key': 'potat-key' } })).json();
   assert.equal(list.maps.length, 1);
   assert.equal(list.maps[0].name, 'Test Isle');
