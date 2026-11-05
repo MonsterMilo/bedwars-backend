@@ -921,13 +921,15 @@ app.get('/bedlify/player/:player', validName('player'), requireKeyForDenicker, b
 
 // Saves a new sweat with its optional first note, logs it and posts it to
 // the Sweat Log channel. Shared by POST /sweats and the bot's /add.
-async function createSweat(fields, who, noteText) {
+async function createSweat(fields, who, noteText, { announce = false, trackedNick = null } = {}) {
   fields.addedBy = who;
   fields.notes = noteText ? [{ text: noteText, author: who }] : [];
   const saved = await new Sweat(fields).save();
   logActivity({ keyOwner: who }, 'sweat.add', saved, noteText ? { noteId: saved.notes[0]._id, noteText } : {});
   discord.postNewSweat(saved, who);
-  trackedList.post(saved);
+  // Only in-game tracks go to the tracked list channel (Milo: he types the
+  // others into Discord himself and adds them on the site later).
+  if (announce) trackedList.post(saved, { nick: trackedNick });
   return saved;
 }
 
@@ -1159,8 +1161,22 @@ async function urchinMonthlyFkdr(uuid) {
 }
 
 const trackedList = require('./tracked-list')({
-  Sweat, ROSTER_FIELDS, resolved, describeAxiosError, monthlyFkdr: urchinMonthlyFkdr,
+  mongoose, Sweat, ROSTER_FIELDS, resolved, describeAxiosError, monthlyFkdr: urchinMonthlyFkdr,
   roster: require('./discord').parseRoster(process.env.DISCORD_ROSTER, ROSTER_FIELDS)
+});
+
+// The proxy's /player track sends the nicks it couldn't resolve, for the
+// tracked list channel. Body { nicks: [nick], beaten: [roster id] }.
+app.post('/tracked-nicks', requireWriteKey, writeLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!Array.isArray(b.nicks) || !b.nicks.length || b.nicks.length > 8) return res.status(400).json({ error: 'Send 1 to 8 nicks' });
+    const n = await trackedList.postNicks(b.nicks, Array.isArray(b.beaten) ? b.beaten : []);
+    return res.json({ ok: true, posted: n });
+  } catch (err) {
+    console.error('/tracked-nicks error', err);
+    return res.status(500).json({ error: 'Saving the nicks failed' });
+  }
 });
 
 const discord = require('./discord')({
@@ -1381,7 +1397,12 @@ app.post('/sweats', requireWriteKey, writeLimiter, async (req, res) => {
     // Optional first note, written alongside the sweat itself.
     const noteText = cleanNoteText(body.note);
     if (noteText === null) return res.status(400).json({ error: `Note must be ${NOTE_MAX_LENGTH} characters or fewer` });
-    const saved = await createSweat(fields, req.keyOwner, noteText);
+    // The proxy's /player track says announce (and trackedNick, the nick a
+    // resolved player was tracked as) for the tracked list channel.
+    const saved = await createSweat(fields, req.keyOwner, noteText, {
+      announce: body.announce === true,
+      trackedNick: typeof body.trackedNick === 'string' && NAME_RE.test(body.trackedNick) ? body.trackedNick : null
+    });
     return res.status(201).json(saved);
   } catch (err) {
     console.error('/sweats POST error', err);
