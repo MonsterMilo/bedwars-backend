@@ -74,7 +74,7 @@ test('a party with a nick shares one message; the nick resolves, then its player
   const s1 = await Sweat.create({ username: 'Victim', uuid, star: 500, fkdr: 10, milo: true });
   await list.post(s1.toObject());
   await list.postNicks(['NickerNicker', 'bad name!'], ['milo', 'nobody']);
-  await list.flush();
+  await list.flush({ force: true });
   assert.equal(http.calls.length, 1);
   assert.deepEqual(http.calls[0].body.allowed_mentions, { users: ['111111'] });
   assert.equal(http.calls[0].body.content, [
@@ -108,6 +108,21 @@ test('a party with a nick shares one message; the nick resolves, then its player
     'Nicks: NickerNicker (Sneaky)',
     'Beaten by <@111111>'
   ].join('\n'));
+
+  // Waiting things live in Mongo: a fresh instance (a restart) posts them;
+  // a sweat removed while waiting is left out.
+  const s3 = await Sweat.create({ username: 'Gone', star: 1, fkdr: 1 });
+  const s4 = await Sweat.create({ username: 'Kept', star: 2, fkdr: 2, potat: true });
+  await list.post(s3.toObject());
+  await list.post(s4.toObject());
+  await Sweat.updateOne({ _id: s3._id }, { $set: { deletedAt: new Date() } });
+  const restarted = setupTrackedList({ mongoose, Sweat, ROSTER_FIELDS: ROSTER, resolved, http, gapMs: 0, groupMs: 0, roster: new Map([['222222', 'potat']]) });
+  await restarted.flush();
+  assert.equal(http.calls.length, 4);
+  assert.equal(http.calls[3].body.content, '**Kept** · 2✫ · 2.00 FKDR\nBeaten by <@222222>');
+  assert.equal((await Sweat.findById(s3._id).lean()).trackedPost, null);
+  assert.equal((await Sweat.findById(s4._id).lean()).trackedPost.messageId, '102');
+  http.calls.splice(3, 1);
 
   // Removed: struck through.
   const removed = await Sweat.findByIdAndUpdate(s2._id, { $set: { deletedAt: new Date() } }, { new: true }).lean();

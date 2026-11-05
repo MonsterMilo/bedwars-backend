@@ -32,6 +32,7 @@ const DEFAULT_CHANNEL_ID = '1056338648703975474';
 const GAP_MS = 1200; // Discord allows 5 messages per 5 seconds in a channel
 const GROUP_MS = 60 * 1000;
 const MONTHLY_MIN = 20;
+const SWEEP_MS = 30 * 1000;
 const ATTACH_DAYS = 30; // a resolved nick's player joins its message within this
 const NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
 
@@ -132,18 +133,13 @@ module.exports = function setupTrackedList({
   }
 
   // --- New posts ---
-  // The first thing tracked starts a GROUP_MS wait; everything tracked
-  // before it ends goes in the same message.
-  let waiting = null; // { sweats: [{ sweat, nick, monthly: promise }], nicks: [TrackedNick ids] }
-  let flushed = Promise.resolve();
-  function group() {
-    if (!waiting) {
-      waiting = { sweats: [], nicks: [] };
-      waiting.timer = setTimeout(flush, groupMs);
-      if (waiting.timer.unref) waiting.timer.unref();
-    }
-    return waiting;
-  }
+  // What's waiting is kept in Mongo, not memory, so a restart (a deploy, or
+  // Render running out of memory mid-game) can't lose it: a waiting sweat
+  // has trackedPost { pending: true, at, nick }, a waiting nick has no
+  // channelId yet. Every SWEEP_MS a check posts everything waiting once the
+  // oldest of it is GROUP_MS old, as one message.
+  const PENDING_NICK = { channelId: null, sweatId: null };
+  const since = () => new Date(Date.now() - 2 * 24 * 60 * 60 * 1000); // older waiting ones are let go
 
   // A new sweat. nick: the nick it was tracked as, if any. Fire-and-forget.
   async function post(sweat, { nick = null } = {}) {
@@ -152,26 +148,21 @@ module.exports = function setupTrackedList({
     try {
       if (nick) {
         const lower = nick.toLowerCase();
-        // Still waiting in this group: its line takes the nick's place.
-        if (waiting) {
-          const docs = await TrackedNick.find({ _id: { $in: waiting.nicks }, nickLower: lower }).lean();
-          if (docs.length) {
-            const gone = new Set(docs.map(d => String(d._id)));
-            waiting.nicks = waiting.nicks.filter(id => !gone.has(String(id)));
-            await TrackedNick.updateMany({ _id: { $in: docs.map(d => d._id) } }, { $set: { sweatId: sweat._id, player: sweat.username } });
-            waiting.sweats.push({ sweat, nick, monthly: monthlyFor(sweat) });
-            return;
-          }
+        // Still waiting: its line takes the nick's place.
+        const waitingNick = await TrackedNick.findOneAndUpdate({ nickLower: lower, ...PENDING_NICK, at: { $gte: since() } },
+          { $set: { sweatId: sweat._id, player: sweat.username } }, { sort: { at: -1 } }).lean();
+        if (!waitingNick) {
+          // Posted already: the line joins that message.
+          const days = new Date(Date.now() - ATTACH_DAYS * 24 * 60 * 60 * 1000);
+          const doc = await TrackedNick.findOne({ nickLower: lower, sweatId: null, messageId: { $type: 'string' }, at: { $gte: days } }).sort({ at: -1 }).lean();
+          if (doc) return attach(sweat, nick, doc);
         }
-        // Posted already: the line joins that message.
-        const since = new Date(Date.now() - ATTACH_DAYS * 24 * 60 * 60 * 1000);
-        const doc = await TrackedNick.findOne({ nickLower: lower, sweatId: null, messageId: { $type: 'string' }, at: { $gte: since } }).sort({ at: -1 }).lean();
-        if (doc) return attach(sweat, nick, doc);
       }
     } catch (err) {
       console.error('Tracked list: matching a tracked nick failed', err.message);
     }
-    group().sweats.push({ sweat, nick, monthly: monthlyFor(sweat) });
+    await remember(sweat._id, { pending: true, at: Date.now(), nick });
+    schedule();
   }
   function attach(sweat, nick, doc) {
     return queued(async () => {
@@ -190,27 +181,40 @@ module.exports = function setupTrackedList({
     const list = [...new Set((Array.isArray(nicks) ? nicks : []).map(String).filter(n => NAME_RE.test(n)))].slice(0, 8);
     const who = (Array.isArray(beaten) ? beaten : []).filter(f => ROSTER_FIELDS.includes(f));
     if (!list.length) return 0;
-    const docs = [];
     for (const nick of list) {
       const owner = await ownerOf(nick);
-      docs.push(await TrackedNick.create({ nick, nickLower: nick.toLowerCase(), beaten: who, player: owner ? owner.player : null }));
+      await TrackedNick.create({ nick, nickLower: nick.toLowerCase(), beaten: who, player: owner ? owner.player : null });
     }
-    group().nicks.push(...docs.map(d => d._id));
-    return docs.length;
+    schedule();
+    return list.length;
   }
 
-  function flush() {
-    const g = waiting;
-    waiting = null;
-    if (g && g.timer) clearTimeout(g.timer);
-    if (!g || (!g.sweats.length && !g.nicks.length)) return flushed;
+  // A check soon after something new waits, and every SWEEP_MS anyway.
+  let timer = null;
+  function schedule() {
+    if (timer) return;
+    timer = setTimeout(() => { timer = null; flush(); }, groupMs + 500);
+    if (timer.unref) timer.unref();
+  }
+  let flushed = Promise.resolve();
+  // force: post whatever waits now (tests).
+  function flush({ force = false } = {}) {
+    if (!on) return flushed;
     flushed = queued(async () => {
-      // As they are now (edited or removed while the group waited).
-      const now = new Map((await Sweat.find({ _id: { $in: g.sweats.map(e => e.sweat._id) } }).lean()).map(s => [String(s._id), s]));
-      const entries = g.sweats.map(e => ({ ...e, sweat: now.get(String(e.sweat._id)) || e.sweat })).filter(e => !e.sweat.deletedAt);
-      const nickDocs = await TrackedNick.find({ _id: { $in: g.nicks }, sweatId: null }).lean();
-      if (!entries.length && !nickDocs.length) return;
-      const players = await Promise.all(entries.map(async e => ({ sweat: e.sweat, nick: e.nick, monthly: await e.monthly })));
+      const [sweats, nickDocs] = await Promise.all([
+        Sweat.find({ 'trackedPost.pending': true }).lean(),
+        TrackedNick.find({ ...PENDING_NICK, at: { $gte: since() } }).sort({ at: 1 }).lean()
+      ]);
+      const ats = [...sweats.map(s => Number(s.trackedPost.at) || 0), ...nickDocs.map(d => +new Date(d.at))];
+      if (!ats.length) return;
+      const oldest = Math.min(...ats);
+      if (!force && Date.now() - oldest < groupMs) { schedule(); return; }
+      // Removed while waiting: not posted.
+      const gone = sweats.filter(s => s.deletedAt);
+      await Promise.all(gone.map(s => remember(s._id, null)));
+      const live = sweats.filter(s => !s.deletedAt).sort((a, b) => (a.trackedPost.at || 0) - (b.trackedPost.at || 0));
+      if (!live.length && !nickDocs.length) return;
+      const players = await Promise.all(live.map(async s => ({ sweat: s, nick: s.trackedPost.nick || null, monthly: await monthlyFor(s) })));
       const content = messageOf(players, nickDocs, idOf, ROSTER_FIELDS);
       const users = beatersOf(players.map(p => p.sweat), nickDocs, ROSTER_FIELDS).map(idOf).filter(Boolean);
       const r = await send('post', `/channels/${CHANNEL_ID}/messages`, { content, allowed_mentions: { users } });
@@ -220,15 +224,23 @@ module.exports = function setupTrackedList({
         channelId: CHANNEL_ID, messageId, slot, monthly: Number.isFinite(p.monthly) ? p.monthly : null, nick: p.nick || null
       })));
       await Promise.all(nickDocs.map((d, slot) => TrackedNick.updateOne({ _id: d._id }, { $set: { channelId: CHANNEL_ID, messageId, slot } })));
+      console.log(`Tracked list: posted ${players.length} player(s) and ${nickDocs.length} nick(s)`);
     }).catch(err => console.error('Tracked list: posting failed', describeAxiosError(err)));
     return flushed;
+  }
+  // After a restart, anything left waiting goes out.
+  function start() {
+    if (!on) return;
+    const t = setInterval(() => flush(), SWEEP_MS);
+    if (t.unref) t.unref();
+    flush();
   }
 
   // --- Keeping messages up to date ---
   // Redraws the message a sweat is in, if it changed. Fire-and-forget.
   function refresh(sweat) {
     const was = on && sweat && sweat.trackedPost;
-    if (!was || !was.messageId) return Promise.resolve();
+    if (!was || !was.messageId || was.pending) return Promise.resolve();
     return redraw(was.channelId, was.messageId);
   }
   const redrawing = new Set(); // messages with a redraw already queued
@@ -284,7 +296,7 @@ module.exports = function setupTrackedList({
     resolved.onChange(players => nicksChanged(players).catch(err => console.error('Tracked list: nick update failed', err.message)));
   }
 
-  return { post, postNicks, flush, refresh, nicksChanged, on, channelId: CHANNEL_ID, _idle: () => chain };
+  return { post, postNicks, flush, start, refresh, nicksChanged, on, channelId: CHANNEL_ID, _idle: () => chain };
 };
 
 module.exports.lineOf = lineOf;

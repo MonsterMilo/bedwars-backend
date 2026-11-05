@@ -1197,6 +1197,8 @@ const trackedList = require('./tracked-list')({
   mongoose, Sweat, ROSTER_FIELDS, resolved, describeAxiosError, monthlyFkdr: urchinMonthlyFkdr,
   roster: require('./discord').parseRoster(process.env.DISCORD_ROSTER, ROSTER_FIELDS)
 });
+if (mongoose.connection.readyState === 1) trackedList.start();
+else mongoose.connection.once('open', () => trackedList.start());
 
 // The proxy's /player track sends the nicks it couldn't resolve, for the
 // tracked list channel. Body { nicks: [nick], beaten: [roster id] }.
