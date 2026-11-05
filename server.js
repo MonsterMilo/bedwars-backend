@@ -1135,8 +1135,31 @@ app.get('/status', proxyLimiter, async (req, res) => {
 
 // Every tracked player as one short line in its own channel, with their
 // nicks kept up to date (see tracked-list.js).
+// Urchin's monthly FKDR for a uuid (null if it can't say), for the tracked
+// list. Our key may lack the permission this needs; that's said once.
+let monthlyRefused = false;
+async function urchinMonthlyFkdr(uuid) {
+  if (!URCHIN_KEY || monthlyRefused) return null;
+  try {
+    const data = await coralGet('/player/sessions/monthly', { player: uuid });
+    const bw = data && data.delta && data.delta.stats && data.delta.stats.Bedwars;
+    if (!bw) return null;
+    const fk = Number(bw.final_kills_bedwars) || 0, fd = Number(bw.final_deaths_bedwars) || 0;
+    return fd > 0 ? fk / fd : fk;
+  } catch (err) {
+    const code = err.response && err.response.status;
+    if (code === 401 || code === 403) {
+      monthlyRefused = true;
+      console.warn('Tracked list: URCHIN_KEY can\'t read monthly sessions, so monthly FKDR is left out');
+    } else if (code !== 404) {
+      console.warn('Tracked list: Urchin monthly failed', describeAxiosError(err));
+    }
+    return null;
+  }
+}
+
 const trackedList = require('./tracked-list')({
-  Sweat, ROSTER_FIELDS, resolved, describeAxiosError,
+  Sweat, ROSTER_FIELDS, resolved, describeAxiosError, monthlyFkdr: urchinMonthlyFkdr,
   roster: require('./discord').parseRoster(process.env.DISCORD_ROSTER, ROSTER_FIELDS)
 });
 
