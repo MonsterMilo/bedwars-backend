@@ -69,6 +69,12 @@ test('a finished upload is clipped, and the clips are listed and served', async 
   const list = await call('GET', `/clips?uuid=${SWEAT}`);
   assert.equal(list.status, 200);
   assert.deepEqual(list.json.clips.map(c => c.kind).sort(), ['bed', 'final']);
+  // The far player's bed break is from the same game: it shows here too,
+  // and the sweat's clips show on the far player.
+  assert.deepEqual(list.json.sameGame.map(c => [c.kind, c.username]), [['bed', 'Faraway']]);
+  const far = (await call('GET', `/clips?uuid=${FAR}`)).json;
+  assert.deepEqual(far.clips.map(c => c.kind), ['bed']);
+  assert.deepEqual(far.sameGame.map(c => c.kind).sort(), ['bed', 'final']);
   const final = list.json.clips.find(c => c.kind === 'final');
   assert.equal(final.by, 'Milo');
   assert.equal(final.markAt, 12000);

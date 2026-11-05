@@ -177,7 +177,23 @@ module.exports = function setupClips({
     try {
       const keys = name ? [uuid, 'n:' + name] : [uuid];
       const docs = await Clip.find({ status: 'ready', $or: [{ uuid }, { peopleKeys: { $in: keys } }] }).sort({ playedAt: -1, at: -1 }).limit(LIST_MAX).lean();
-      return res.json({ clips: docs.map(publicClip) });
+      // The other clips from the same games (Milo 2026-11-05): with a whole
+      // team tracked, each of them shows every final kill of that game. A
+      // bed break is cut once per tracked player of that team: shown once.
+      const moment = (c) => `${c.replayId}:${c.kind}:${c.at}`;
+      const seen = new Set(docs.map(moment));
+      const games = [...new Set(docs.map(c => String(c.replayId || '')).filter(Boolean))];
+      const others = games.length
+        ? await Clip.find({ status: 'ready', replayId: { $in: games }, _id: { $nin: docs.map(c => c._id) } }).sort({ playedAt: -1, at: -1 }).limit(LIST_MAX).lean()
+        : [];
+      const sameGame = [];
+      for (const c of others) {
+        const k = moment(c);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        sameGame.push(publicClip(c));
+      }
+      return res.json({ clips: docs.map(publicClip), sameGame });
     } catch (err) {
       log.error('/clips GET error', err);
       return res.status(500).json({ error: 'DB read error' });
