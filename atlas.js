@@ -25,6 +25,11 @@ const CAPTURE_MAX_BYTES = 4 * 1024 * 1024;
 const REPLAY_MAX_BYTES = 30 * 1024 * 1024; // packed; the unpacked cap is in replay-jobs.js
 const SLUG_RE = /^[a-z0-9-]{1,40}$/;
 const SOURCE_ID_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
+// Maps taken out by hand (Milo 2026-11-05: "Base" was Lighthouse, named after
+// a lobby's /locraw, from a replay that began mid-game, toppers and all). Their
+// games are read again with today's rules, so they land where they belong or
+// nowhere.
+const REMOVED_SLUGS = ['base'];
 
 module.exports = function setupAtlas({
   app, mongoose, Replay, requireWriteKey, writeLimiter, proxyLimiter,
@@ -107,6 +112,13 @@ module.exports = function setupAtlas({
     if (stale.length) {
       await AtlasMap.deleteMany({ version: { $ne: EXTRACT_VERSION } });
       console.log(`Atlas: rebuilding ${stale.length} map(s) with the new reader`);
+    }
+    for (const slug of REMOVED_SLUGS) {
+      const gone = await AtlasMap.findOne({ slug }, { sources: 1 }).lean();
+      if (!gone) continue;
+      await AtlasRead.deleteMany({ source: { $in: (gone.sources || []).map(x => x.id) } });
+      await AtlasMap.deleteOne({ slug });
+      console.log(`Atlas: removed the map "${slug}"`);
     }
     const done = new Set((await AtlasRead.find({ version: EXTRACT_VERSION }, { source: 1 }).lean()).map(r => r.source));
     const replays = await Replay.find({ status: 'ready' }, { key: 1, map: 1, playedAt: 1 }).sort({ playedAt: 1 }).lean();

@@ -28,7 +28,10 @@ function atlas(msg) {
   const capture = msg.kind === 'capture' ? readCapture(bytes) : extractCapture(bytes);
   if (!capture.map) capture.map = msg.fallbackName || null;
   if (!capture.map) throw new Error('Which map this is isn\'t in the recording');
-  if (!capture.columns.size) throw new Error('No map blocks in the recording');
+  if (!capture.columns.size) throw new Error('No map blocks in the recording')
+  // A replay that began after the start (a rejoin) only saw the map with
+  // toppers and player blocks on it: no use to the Atlas (Milo 2026-11-05).
+  if (msg.kind === 'replay' && !capture.started) throw new Error('The game\'s start isn\'t in this recording (joined late)');
   const merged = mergeCapture(msg.map ? decodeMap(asBuffer(msg.map)) : null, capture, msg.source);
   return {
     file: encodeMap(merged),
