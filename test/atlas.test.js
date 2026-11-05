@@ -259,3 +259,20 @@ test('a replay that began mid-game is not used, and a removed map goes with its 
   assert.equal(await atlas.AtlasMap.exists({ slug: 'base' }), null);
   assert.match((await atlas.AtlasRead.findOne({ source: String(late._id) }).lean()).error, /joined late/);
 });
+
+test('the proxy sets the rotation from Hypixel\'s map selector (Milo\'s key); anyone can read it', async () => {
+  const send = (key, body) => fetch(base + '/maps/rotation', { method: 'POST', headers: { 'x-admin-key': key, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const eight = ['Acropolis', 'Ambush', 'Beldam', 'Darkened', 'Lighthouse', 'Ambush'];
+  assert.equal((await fetch(base + '/maps/rotation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401);
+  assert.equal((await send('potat-key', { teams: 8, maps: eight })).status, 403);
+  assert.equal((await send('milo-key', { teams: 2, maps: eight })).status, 400);
+  assert.equal((await send('milo-key', { teams: 8, maps: ['Acropolis'] })).status, 400);
+  const ok = await send('milo-key', { teams: 8, maps: eight, title: 'Bed Wars Solo' });
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).maps, 5); // the repeat is dropped
+  await send('milo-key', { teams: 8, maps: ['Acropolis', 'Ambush', 'Beldam', 'Lighthouse', 'Orbit'] }); // the newest wins
+  const got = await (await fetch(base + '/maps/rotation')).json();
+  assert.equal(got.rotation.length, 1);
+  assert.equal(got.rotation[0].teams, 8);
+  assert.deepEqual(got.rotation[0].maps, ['Acropolis', 'Ambush', 'Beldam', 'Lighthouse', 'Orbit']);
+});

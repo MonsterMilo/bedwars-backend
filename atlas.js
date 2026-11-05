@@ -30,6 +30,9 @@ const SOURCE_ID_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
 // games are read again with today's rules, so they land where they belong or
 // nowhere.
 const REMOVED_SLUGS = ['base'];
+const ROTATION_MIN = 5;       // a map selector lists far more; fewer is a mistake
+const ROTATION_MAX = 150;
+const ROTATION_NAME_MAX = 40;
 
 module.exports = function setupAtlas({
   app, mongoose, Replay, requireWriteKey, writeLimiter, proxyLimiter,
@@ -66,6 +69,16 @@ module.exports = function setupAtlas({
   const AtlasCapture = mongoose.model('AtlasCapture', new mongoose.Schema({
     source: { type: String, required: true, unique: true },
     file: Buffer,
+    at: Date
+  }));
+
+  // Hypixel's own map selector, as the proxy last saw it (one per team size:
+  // 8 = Solos/Doubles, 4 = 3s/4s). The website's rotation, instead of a
+  // player-kept list that isn't always up to date (Milo 2026-11-05).
+  const AtlasRotation = mongoose.model('AtlasRotation', new mongoose.Schema({
+    teams: { type: Number, required: true, unique: true },
+    maps: [String],
+    title: String,
     at: Date
   }));
 
@@ -249,6 +262,36 @@ module.exports = function setupAtlas({
       }
     });
 
+  // The rotation (open to all: it's only map names). { rotation: [{ teams, maps, at }] }
+  app.get('/maps/rotation', proxyLimiter, async (req, res) => {
+    try {
+      const rows = await AtlasRotation.find({}, { _id: 0, teams: 1, maps: 1, at: 1 }).sort({ teams: -1 }).lean();
+      res.set('Cache-Control', 'public, max-age=60');
+      return res.json({ rotation: rows });
+    } catch (err) {
+      console.error('/maps/rotation error', err);
+      return res.status(500).json({ error: 'DB read error' });
+    }
+  });
+
+  // The proxy: every map in Hypixel's map selector for one team size. Milo's keys only.
+  app.post('/maps/rotation', requireWriteKey, writeLimiter, express.json({ limit: '32kb' }), async (req, res) => {
+    if (!hasFullAccess(req.keyOwner)) return res.status(403).json({ error: 'Only Milo\'s key can set the rotation' });
+    const b = req.body || {};
+    const teams = Number(b.teams);
+    if (teams !== 4 && teams !== 8) return res.status(400).json({ error: 'teams is 4 or 8' });
+    const maps = Array.isArray(b.maps) ? [...new Set(b.maps.map(m => String(m || '').trim()).filter(m => m && m.length <= ROTATION_NAME_MAX))] : [];
+    if (maps.length < ROTATION_MIN || maps.length > ROTATION_MAX) return res.status(400).json({ error: `Send ${ROTATION_MIN}-${ROTATION_MAX} map names` });
+    try {
+      const at = new Date(now());
+      await AtlasRotation.updateOne({ teams }, { $set: { maps: maps.sort(), title: String(b.title || '').slice(0, 64) || null, at } }, { upsert: true });
+      return res.json({ ok: true, teams, maps: maps.length });
+    } catch (err) {
+      console.error('/maps/rotation post error', err);
+      return res.status(500).json({ error: 'DB write error' });
+    }
+  });
+
   // Milo: read every replay again (after a fix to how maps are read).
   app.post('/maps/rebuild', requireWriteKey, writeLimiter, async (req, res) => {
     if (!hasFullAccess(req.keyOwner)) return res.status(403).json({ error: 'Only Milo\'s key can rebuild the maps' });
@@ -270,5 +313,5 @@ module.exports = function setupAtlas({
     return { maps, complete };
   }
 
-  return { AtlasMap, AtlasRead, AtlasCapture, kick, runOnce, addGame, usage, EXTRACT_VERSION };
+  return { AtlasMap, AtlasRead, AtlasCapture, AtlasRotation, kick, runOnce, addGame, usage, EXTRACT_VERSION };
 };
