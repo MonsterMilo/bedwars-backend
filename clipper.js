@@ -54,7 +54,7 @@ const DEFAULTS = {
   bedBeforeMs: 10000, bedAfterMs: 3000,
   // "Close enough": the subject was in view for this share of the last
   // few seconds, and this near you when it happened.
-  lookBackMs: 6000, minInView: 0.6, maxDistance: 40, closeMs: 3000,
+  lookBackMs: 6000, minInView: 0.6, maxDistance: 60, closeMs: 3000,
   // How much map goes in a clip: chunk columns this many chunks around
   // where it happened (16 blocks each).
   radiusChunks: 7,
@@ -212,6 +212,14 @@ function forEachPacket(recording, fn) {
 // later, so a player keeps the first Bed Wars team they're put in.
 const TEAM_RE = /^(Red|Blue|Green|Yellow|Aqua|White|Pink|Gr[ae]y)\d*$/i;
 const teamLabel = (name) => { const m = String(name || '').match(TEAM_RE); return m ? m[1][0].toUpperCase() + m[1].slice(1).toLowerCase().replace('grey', 'gray') : null; };
+// Hypixel's team names don't always say the team: a game can put the Yellow
+// players in teams called "Blue0".."Blue2". The prefix colour ("§e§lY ") is
+// what shows in game, so it wins. (§7 is the grey prefix of the dead.)
+const PREFIX_TEAM = { c: 'Red', 9: 'Blue', a: 'Green', e: 'Yellow', b: 'Aqua', f: 'White', d: 'Pink', 8: 'Gray' };
+const prefixTeam = (prefix) => {
+  const m = String(prefix || '').match(/§([0-9a-f])/i);
+  return m ? PREFIX_TEAM[m[1].toLowerCase()] || null : null;
+};
 // Hypixel's NPCs are player entities with version-2 uuids.
 const isNpc = (uuid) => uuid && uuid[12] === '2';
 
@@ -232,7 +240,9 @@ function findMoments(recording, tracked, options = {}) {
   const o = { ...DEFAULTS, ...options };
   const { meta } = recording;
   const names = new Map();        // tab uuid -> name
-  const teamOf = new Map();       // name -> 'Red'
+  const teamOf = new Map();       // name -> 'Red' (filled in after reading)
+  const memberOf = new Map();     // name -> scoreboard team it was first put in
+  const teamColour = new Map();   // scoreboard team -> 'Red', from its prefix
   const live = new Map();         // eid -> { uuid, pos }
   const uuidEid = new Map();      // uuid -> eid (newest)
   const samples = new Map();      // uuid -> [{ t, x, y, z, gone }]
@@ -311,14 +321,16 @@ function findMoments(recording, tracked, options = {}) {
           const name = r.str(); const mode = r.i8();
           if (mode === 0 || mode === 2) {
             // The sidebar marks your team: "R Red: ✓ YOU".
-            r.skipStr(); const line = (r.str() + r.str()).replace(/§[0-9a-fk-or]/gi, '');
+            r.skipStr(); const prefix = r.str(); const line = (prefix + r.str()).replace(/§[0-9a-fk-or]/gi, '');
             const you = line.match(/\b(Red|Blue|Green|Yellow|Aqua|White|Pink|Gr[ae]y)\b.*\bYOU\b/i);
             if (you) sidebarTeam = teamLabel(you[1]);
+            const colour = teamLabel(name) && prefixTeam(prefix);
+            if (colour && !teamColour.has(name)) teamColour.set(name, colour);
             r.i8(); r.skipStr(); r.i8();
           }
           if ((mode === 0 || mode === 3) && teamLabel(name)) {
             const cnt = r.varint();
-            for (let q = 0; q < cnt; q++) { const p = r.str(); if (!teamOf.has(lc(p))) teamOf.set(lc(p), teamLabel(name)); }
+            for (let q = 0; q < cnt; q++) { const p = r.str(); if (!memberOf.has(lc(p))) memberOf.set(lc(p), name); }
           }
           break;
         }
@@ -334,6 +346,8 @@ function findMoments(recording, tracked, options = {}) {
       }
     } catch { /* one odd packet doesn't stop the rest */ }
   });
+
+  for (const [p, team] of memberOf) teamOf.set(p, teamColour.get(team) || teamLabel(team));
 
   // Who the recording player is: the spawned entity with the join's id, or
   // the tab entry whose name the metadata lists.

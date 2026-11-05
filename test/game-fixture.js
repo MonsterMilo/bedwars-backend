@@ -12,10 +12,13 @@ const u16 = (w, v) => w.raw(Uint8Array.of(v >> 8, v & 0xff));
 const uuid = (w, u) => w.raw(Buffer.from(u, 'hex'));
 const i8 = (v) => Math.max(-128, Math.min(127, Math.round(v)));
 
+const PREFIX = { Red: '§c§lR §r§c', Blue: '§9§lB §r§9', Green: '§a§lG §r§a', Yellow: '§e§lY §r§e' };
+
 const pk = {
   join: (eid) => packet(P.JOIN, w => { w.i32(eid); w.i8(0); w.i8(0); w.i8(0); w.i8(16); str(w, 'default'); w.bool(false); }),
   tabAdd: (rows) => packet(P.PLAYER_LIST, w => { w.varint(0); w.varint(rows.length); for (const [u, name] of rows) { uuid(w, u); str(w, name); w.varint(0); w.varint(0); w.varint(1); w.bool(false); } }),
-  team: (name, members) => packet(P.TEAMS, w => { str(w, name); w.i8(0); str(w, name); str(w, '§c'); str(w, ''); w.i8(0); str(w, 'always'); w.i8(12); w.varint(members.length); for (const m of members) str(w, m); }),
+  // The prefix is what shows in game ("§c§lR "); Hypixel's team name may not match it.
+  team: (name, members, prefix = PREFIX[name.replace(/\d+$/, '')] || '') => packet(P.TEAMS, w => { str(w, name); w.i8(0); str(w, name); str(w, prefix); str(w, ''); w.i8(0); str(w, 'always'); w.i8(12); w.varint(members.length); for (const m of members) str(w, m); }),
   // One full chunk column: a floor of stone at y 64 (the players stand on it).
   chunk: (cx, cz) => packet(P.CHUNK, w => {
     w.i32(cx); w.i32(cz); w.bool(true); u16(w, 1 << 4);
@@ -33,15 +36,18 @@ const pk = {
 };
 
 /** A 40 s game: you (Blue) and a teammate fight a tracked sweat (Red) near
- *  you, and a second tracked player (Green) far away. */
-function game() {
+ *  you, and a second tracked player (Green) far away. `teamNames` renames
+ *  the scoreboard teams the way Hypixel sometimes does (the Red players in
+ *  "Blue7"), keeping each team's prefix. */
+function game({ teamNames = {} } = {}) {
   const items = [];
   const at = (t, b) => items.push([t, b]);
   at(0, pk.join(1));
   at(0, pk.tabAdd([[ME, 'Milo'], [MATE, 'Mate'], [SWEAT, 'Sweaty'], [FAR, 'Faraway']]));
-  at(0, pk.team('Blue1', ['Milo', 'Mate']));
-  at(0, pk.team('Red1', ['Sweaty']));
-  at(0, pk.team('Green1', ['Faraway']));
+  const team = (name, members) => pk.team(teamNames[name] || name, members, PREFIX[name.replace(/\d+$/, '')]);
+  at(0, team('Blue1', ['Milo', 'Mate']));
+  at(0, team('Red1', ['Sweaty']));
+  at(0, team('Green1', ['Faraway']));
   for (let cx = -12; cx <= 12; cx++) for (let cz = -2; cz <= 2; cz++) at(0, pk.chunk(cx, cz));
   at(0, pk.spawn(1, ME, 0, 65, 0));
   at(0, pk.spawn(2, MATE, 2, 65, 0));

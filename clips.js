@@ -16,7 +16,8 @@ const clipper = require('./clipper');
 const jobs = require('./replay-jobs');
 
 // Bump to clip every replay again (e.g. after changing the rules).
-const CLIP_VERSION = 1;
+// 2 (2026-11-05): teams from the prefix colour, 60 blocks instead of 40.
+const CLIP_VERSION = 2;
 const LINK_SECONDS = 10 * 60;
 const DOWNLOAD_LINK_SECONDS = 10 * 60;
 // Replays over this (packed) are left alone (a real one is 1-3 MB); see also
