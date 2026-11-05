@@ -105,3 +105,15 @@ test('/clip: the 20 s before, with everyone who came near you', () => {
   const [w] = windowsFor(moments);
   assert.deepEqual([w.from, w.to, w.marker], [14000, 35000, 'Clip']);
 });
+
+test('the team comes from the prefix colour, not Hypixel\'s team name', () => {
+  // Seen 2026-11-04: the Yellow players were in teams called "Blue0".."Blue2".
+  const rec = readRecording(game({ teamNames: { Red1: 'Blue7', Blue1: 'Green3' } }));
+  const { self, moments } = findMoments(rec, tracked);
+  assert.equal(self.team, 'Blue');
+  const bed = moments.find(m => m.kind === 'bed' && m.username === 'Sweaty');
+  assert.equal(bed.team, 'Red');
+  assert.equal(bed.ok, true);
+  assert.equal(moments.find(m => m.kind === 'final' && m.username === 'Sweaty').team, 'Red');
+});
+
