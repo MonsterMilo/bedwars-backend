@@ -36,16 +36,16 @@ test('the message: lines, then nicks, then one ping line', () => {
   const a = { username: 'Frost_Byte', star: 642.7, fkdr: 9.871, wlr: 4.12, milo: true };
   const b = { username: 'PixelReaper', star: 1103, fkdr: 14.2, wlr: 6.55, milo: true, potat: true, cheating: true };
   assert.equal(messageOf([{ sweat: a, nicks: ['xXShadowXx'], monthly: 23.4 }, { sweat: b, nicks: ['Lunar_Wolf'], monthly: 12 }], idOf, ROSTER), [
-    '**Frost\\_Byte** · 642✫ · 9.87 FKDR · 4.12 WLR · 23.40 monthly FKDR',
-    '**PixelReaper** · 1103✫ · 14.20 FKDR · 6.55 WLR · ⚠️ cheating',
-    '🎭 xXShadowXx (Frost\\_Byte) · Lunar\\_Wolf (PixelReaper)',
-    '⚔️ <@111111> Potat'
+    '**Frost\\_Byte** · 642✫ · 9.87 FKDR · 23.40 MFKDR',
+    '**PixelReaper** · 1103✫ · 14.20 FKDR · cheating',
+    'Nicks: xXShadowXx (Frost\\_Byte), Lunar\\_Wolf (PixelReaper)',
+    'Beaten by <@111111> Potat'
   ].join('\n'));
   // One player: nicks without the name; none: no nick line.
-  assert.equal(messageOf([{ sweat: a, nicks: ['N1', 'N2'] }], idOf, ROSTER), '**Frost\\_Byte** · 642✫ · 9.87 FKDR · 4.12 WLR\n🎭 N1, N2\n⚔️ <@111111>');
-  assert.equal(messageOf([{ sweat: { ...a, milo: false }, nicks: [] }], idOf, ROSTER), '**Frost\\_Byte** · 642✫ · 9.87 FKDR · 4.12 WLR');
-  assert.equal(lineOf({ ...a, deletedAt: new Date() }), '~~**Frost\\_Byte** · 642✫ · 9.87 FKDR · 4.12 WLR~~ (removed)');
-  assert.match(messageOf([{ sweat: a, nicks: ['a', 'b', 'c', 'd', 'e', 'f', 'g'] }], idOf, ROSTER), /🎭 a, b, c, d, e \+2/);
+  assert.equal(messageOf([{ sweat: a, nicks: ['N1', 'N2'] }], idOf, ROSTER), '**Frost\\_Byte** · 642✫ · 9.87 FKDR\nNicks: N1, N2\nBeaten by <@111111>');
+  assert.equal(messageOf([{ sweat: { ...a, milo: false }, nicks: [] }], idOf, ROSTER), '**Frost\\_Byte** · 642✫ · 9.87 FKDR');
+  assert.equal(lineOf({ ...a, deletedAt: new Date() }), '~~**Frost\\_Byte** · 642✫ · 9.87 FKDR~~ (removed)');
+  assert.match(messageOf([{ sweat: a, nicks: ['a', 'b', 'c', 'd', 'e', 'f', 'g'] }], idOf, ROSTER), /Nicks: a, b, c, d, e \+2/);
 });
 
 test('a party shares one message; edits and resolved nicks redraw it', async () => {
@@ -76,10 +76,10 @@ test('a party shares one message; edits and resolved nicks redraw it', async () 
   assert.equal(http.calls[0].url, '/channels/999999/messages');
   assert.deepEqual(http.calls[0].body.allowed_mentions, { users: ['111111', '222222'] });
   assert.equal(http.calls[0].body.content, [
-    '**Victim** · 500✫ · 10.00 FKDR · 4.00 WLR · 31.50 monthly FKDR',
-    '**Mate** · 300✫ · 5.00 FKDR · 2.00 WLR',
-    '🎭 OldNick (Victim)',
-    '⚔️ <@111111> <@222222>'
+    '**Victim** · 500✫ · 10.00 FKDR · 31.50 MFKDR',
+    '**Mate** · 300✫ · 5.00 FKDR',
+    'Nicks: OldNick (Victim)',
+    'Beaten by <@111111> <@222222>'
   ].join('\n'));
   const saved = await Sweat.findById(s1._id).lean();
   assert.equal(saved.trackedPost.messageId, '101');
@@ -98,12 +98,12 @@ test('a party shares one message; edits and resolved nicks redraw it', async () 
   assert.equal(http.calls[1].method, 'patch');
   assert.equal(http.calls[1].url, '/channels/999999/messages/101');
   assert.deepEqual(http.calls[1].body.allowed_mentions, { parse: [] });
-  assert.match(http.calls[1].body.content, /31\.50 monthly FKDR/);
-  assert.match(http.calls[1].body.content, /🎭 NewNick, OldNick \(Victim\)/);
+  assert.match(http.calls[1].body.content, /31\.50 MFKDR/);
+  assert.match(http.calls[1].body.content, /Nicks: NewNick, OldNick \(Victim\)/);
 
   // Mate removed: struck through, and their beater leaves the ping line.
   const removed = await Sweat.findByIdAndUpdate(s2._id, { $set: { deletedAt: new Date() } }, { new: true }).lean();
   await list.refresh(removed);
   assert.match(http.calls[2].body.content, /^~~\*\*Mate\*\*.*~~ \(removed\)$/m);
-  assert.match(http.calls[2].body.content, /⚔️ <@111111>$/);
+  assert.match(http.calls[2].body.content, /Beaten by <@111111>$/);
 });

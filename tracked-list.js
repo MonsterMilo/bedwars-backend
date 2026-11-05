@@ -3,16 +3,17 @@
 // channel (TRACKED_LIST_CHANNEL_ID) as one short message (Milo, Nov 2026).
 // Players tracked close together (a party: within GROUP_MS of the first)
 // share one message:
-//   **Frost_Byte** · 642✫ · 9.87 FKDR · 4.12 WLR · 23.40 monthly FKDR
-//   **PixelReaper** · 1103✫ · 14.20 FKDR · 6.55 WLR · ⚠️ cheating
-//   🎭 xXShadowXx (Frost_Byte) · Lunar_Wolf (PixelReaper)
-//   ⚔️ @Milo
-// - stats are the ones saved on the sweat; Urchin's monthly FKDR is added
-//   when it's MONTHLY_MIN or more (fetched once, when posted)
-// - 🎭 the nicks each player has now, from the resolved nicks list
+//   **Frost_Byte** · 642✫ · 9.87 FKDR · 23.40 MFKDR
+//   **PixelReaper** · 1103✫ · 14.20 FKDR · cheating
+//   Nicks: xXShadowXx (Frost_Byte), Lunar_Wolf (PixelReaper)
+//   Beaten by @Milo
+// Plain text, no emojis (Milo). Stars and FKDR are the ones saved on the
+// sweat; Urchin's monthly FKDR (MFKDR) is added when it's MONTHLY_MIN or
+// more (fetched once, when posted)
+// - Nicks: the nicks each player has now, from the resolved nicks list
 //   (resolved.js); when a nick of theirs resolves later, the message is
 //   edited
-// - ⚔️ pings everyone on the roster who beat any of them, by their linked
+// - Beaten by: pings everyone on the roster who beat any of them, by their linked
 //   Discord account (DISCORD_ROSTER); someone with no link is just named
 // - an edit on the site or in the bot redraws the message (a removed sweat
 //   is struck through). Edits never ping again; only the first post does.
@@ -47,10 +48,10 @@ function uuidForms(uuid) {
 
 // One player's line (without nicks or pings).
 function lineOf(sweat, monthly) {
-  const parts = [`**${esc(sweat.username)}**`, `${Math.floor(Number(sweat.star) || 0)}✫`, `${fixed(sweat.fkdr, 2)} FKDR`, `${fixed(sweat.wlr, 2)} WLR`];
-  if (Number.isFinite(monthly) && monthly >= MONTHLY_MIN) parts.push(`${fixed(monthly, 2)} monthly FKDR`);
-  if (sweat.cheating) parts.push('⚠️ cheating');
-  if (sweat.boosting) parts.push('⚠️ boosting');
+  const parts = [`**${esc(sweat.username)}**`, `${Math.floor(Number(sweat.star) || 0)}✫`, `${fixed(sweat.fkdr, 2)} FKDR`];
+  if (Number.isFinite(monthly) && monthly >= MONTHLY_MIN) parts.push(`${fixed(monthly, 2)} MFKDR`);
+  if (sweat.cheating) parts.push('cheating');
+  if (sweat.boosting) parts.push('boosting');
   const line = parts.join(' · ');
   return sweat.deletedAt ? `~~${line}~~ (removed)` : line;
 }
@@ -64,9 +65,9 @@ function messageOf(players, idOf, rosterFields) {
     const list = `${p.nicks.slice(0, NICKS_SHOWN).map(esc).join(', ')}${more}`;
     return players.length > 1 ? `${list} (${esc(p.sweat.username)})` : list;
   });
-  if (nickParts.length) lines.push(`🎭 ${nickParts.join(' · ')}`);
+  if (nickParts.length) lines.push(`Nicks: ${nickParts.join(', ')}`);
   const beat = beatersOf(players.filter(p => !p.sweat.deletedAt).map(p => p.sweat), rosterFields);
-  if (beat.length) lines.push(`⚔️ ${beat.map(f => (idOf(f) ? `<@${idOf(f)}>` : (LABELS[f] || f))).join(' ')}`);
+  if (beat.length) lines.push(`Beaten by ${beat.map(f => (idOf(f) ? `<@${idOf(f)}>` : (LABELS[f] || f))).join(' ')}`);
   return lines.join('\n');
 }
 const beatersOf = (sweats, rosterFields) => rosterFields.filter(f => sweats.some(s => s[f]));
