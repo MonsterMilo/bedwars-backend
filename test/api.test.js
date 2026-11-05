@@ -112,3 +112,17 @@ test('health reports the database', async () => {
   assert.equal(h.status, 200);
   assert.equal(h.json.db, 'connected');
 });
+
+test('the theme is saved per key and comes back from /whoami', async () => {
+  assert.equal((await call('PUT', '/prefs', { body: { theme: 'prism' } })).status, 401);
+  assert.equal((await call('PUT', '/prefs', { key: 'potat-key', body: { theme: '<b>' } })).status, 400);
+  assert.deepEqual((await call('GET', '/whoami', { key: 'potat-key' })).json.prefs, {});
+  const put = await call('PUT', '/prefs', { key: 'potat-key', body: { theme: 'prism' } });
+  assert.equal(put.status, 200);
+  assert.equal(put.json.prefs.theme, 'prism');
+  assert.ok(put.json.prefs.themeAt > Date.now() - 60000);
+  await call('PUT', '/prefs', { key: 'potat-key', body: { theme: 'harvest' } });
+  assert.equal((await call('GET', '/whoami', { key: 'potat-key' })).json.prefs.theme, 'harvest');
+  assert.deepEqual((await call('GET', '/whoami', { key: 'milo-key' })).json.prefs, {});
+  assert.deepEqual((await call('GET', '/whoami')).json.prefs, {});
+});
