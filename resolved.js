@@ -96,15 +96,15 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
   const queued = work => (chain = chain.then(work, work));
 
   // Who else wants to know when a player's nicks change (the tracked list
-  // channel, see tracked-list.js): each listener gets [{ player, uuid }],
-  // everyone who gained or lost a nick. Never awaited, never throws back.
+  // channel, see tracked-list.js): each listener gets [{ player, uuid, nick }],
+  // everyone who gained or lost a nick, and which nick. Never awaited, never throws back.
   const listeners = [];
   const onChange = fn => { listeners.push(fn); };
   function tell(players) {
     if (!players.length || !listeners.length) return;
     const seen = new Set();
     const list = players.filter(p => {
-      const k = `${p.uuid || ''}|${String(p.player || '').toLowerCase()}`;
+      const k = `${p.uuid || ''}|${String(p.player || '').toLowerCase()}|${String(p.nick || '').toLowerCase()}`;
       if (seen.has(k)) return false;
       seen.add(k);
       return true;
@@ -354,7 +354,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
           if (e.uuid) nameUuid.set(playerLower, e.uuid);
           rows.set(key, row);
           changed.set(key, row);
-          moved.push({ player: e.player, uuid: e.uuid });
+          moved.push({ player: e.player, uuid: e.uuid, nick: e.nick });
           continue;
         }
         // The same player: the same uuid (even under a new name), or the
@@ -384,7 +384,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
         }
         if (e.seenAt > row.seenAt) {
           // Someone else has it now.
-          moved.push({ player: row.player, uuid: row.uuid || null }, { player: e.player, uuid: e.uuid });
+          moved.push({ player: row.player, uuid: row.uuid || null, nick: row.nick }, { player: e.player, uuid: e.uuid, nick: row.nick });
           row.history = [{ player: row.player, source: row.source, seenAt: row.seenAt },
             ...row.history.filter(h => h.player.toLowerCase() !== playerLower && h.player.toLowerCase() !== row.playerLower)].slice(0, HISTORY_MAX);
           Object.assign(row, { player: e.player, playerLower, source: e.source, alsoIn: [], seenAt: e.seenAt, uuid: e.uuid, uuidTried: false });
@@ -438,7 +438,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
       if (row.playerLower === who && row.source === source) {
         const oldMessage = row.messageId;
         const back0 = !row.alsoIn.length && row.history[0];
-        tell([{ player: row.player, uuid: row.uuid || null }, ...(back0 ? [{ player: back0.player, uuid: null }] : [])]);
+        tell([{ player: row.player, uuid: row.uuid || null, nick: row.nick }, ...(back0 ? [{ player: back0.player, uuid: null, nick: row.nick }] : [])]);
         if (row.alsoIn.length) {
           // Another source knows the same pair: it stays, under that source.
           row.source = row.alsoIn[0];
@@ -522,6 +522,13 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     return out;
   }
 
+  // Who has a nick now ({ player, uuid } or null).
+  async function ownerOf(nick) {
+    await load();
+    const r = rows.get(String(nick || '').toLowerCase());
+    return r ? { player: r.player, uuid: r.uuid || nameUuid.get(r.playerLower) || null } : null;
+  }
+
   // The nicks a player has now (they're the newest to have used them),
   // newest first, by uuid (any spelling) or, failing that, by name.
   async function nicksOf({ uuid, username } = {}) {
@@ -572,7 +579,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     return { nicks: c.nicks, players: c.players, toPost: c.toPost.length, messages: Math.ceil(c.toPost.length / PER_MESSAGE), redraws: c.redraws.length, postingOn };
   };
 
-  return { record, retract, recordScraped, search, nicksOf, onChange, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
+  return { record, retract, recordScraped, search, nicksOf, ownerOf, onChange, exportAll, start, stats, messageOf, _rows: rows, _idle: () => chain };
 };
 
 module.exports.toMs = toMs;
