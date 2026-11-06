@@ -9,7 +9,7 @@ const { MongoMemoryServer } = require('mongodb-memory-server-core');
 const setupReplays = require('../replays');
 const setupClips = require('../clips');
 const { readRecording } = require('../clipper');
-const { game, SWEAT, FAR } = require('./game-fixture');
+const { game, SWEAT, FAR, MATE } = require('./game-fixture');
 
 const env = { B2_KEY_ID: 'k', B2_APP_KEY: 's', B2_BUCKET: 'b', B2_ENDPOINT: 's3.us-west-004.backblazeb2.com', CLIPS_BACKFILL: 'off' };
 const keyOf = url => decodeURIComponent(new URL(url).pathname.slice(1));
@@ -141,4 +141,31 @@ test('a broken replay is noted, not retried forever', async () => {
   const after = await replays.Replay.findById(doc._id).lean();
   assert.ok(after.clips.error);
   assert.equal(await clips.backfill(), 0);
+});
+
+test('a game uploaded twice (again for a player tracked later) is one game', async () => {
+  const file = Buffer.from(game());
+  const up = async (players) => {
+    const made = await call('POST', '/replays', { body: { name: '2026-11-04_19-14-33_game.mcpr', sizeBytes: file.length, players, map: 'Unturned', playedAt: '2026-11-04T19:14:33Z' } });
+    assert.equal(made.status, 201);
+    store.set(keyOf(made.json.uploadUrl), file);
+    await call('POST', `/replays/${made.json.id}/done`);
+    await new Promise(r => setTimeout(r, 50));
+    await clips.enqueue(made.json.id);
+    return made.json.id;
+  };
+  await up([{ uuid: SWEAT, username: 'Sweaty' }]);
+  // Mate has no clips of their own in it (a teammate), and the sweat's
+  // second upload cuts the same moments again.
+  await up([{ uuid: MATE, username: 'Mate' }, { uuid: SWEAT, username: 'Sweaty' }]);
+  const mate = (await call('GET', `/clips?uuid=${MATE}`)).json;
+  // (Mate is also in the earlier /clip test's game, on Aquarium.)
+  assert.equal(mate.clips.filter(c => c.map === 'Unturned').length, 0);
+  const seen = mate.sameGame.filter(c => c.map === 'Unturned');
+  assert.deepEqual(seen.map(c => c.kind).sort(), ['bed', 'final']);
+  assert.equal(new Set(seen.map(c => c.game)).size, 1);
+  // The sweat sees each moment once, not once per upload.
+  const sweat = (await call('GET', `/clips?uuid=${SWEAT}`)).json;
+  const unturned = [...sweat.clips, ...sweat.sameGame].filter(c => c.map === 'Unturned');
+  assert.deepEqual(unturned.map(c => c.kind).sort(), ['bed', 'final']);
 });
