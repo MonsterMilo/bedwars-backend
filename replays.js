@@ -71,7 +71,9 @@ module.exports = function setupReplays({
 
   const Replay = mongoose.model('Replay', new mongoose.Schema({
     key: { type: String, required: true },
-    name: String,
+    // The recording's file name: the same game uploaded again (for a player
+    // tracked later) has the same one.
+    name: { type: String, index: true },
     sizeBytes: Number,
     durationMs: Number,
     playedAt: Date,

@@ -178,22 +178,38 @@ module.exports = function setupClips({
       const keys = name ? [uuid, 'n:' + name] : [uuid];
       const docs = await Clip.find({ status: 'ready', $or: [{ uuid }, { peopleKeys: { $in: keys } }] }).sort({ playedAt: -1, at: -1 }).limit(LIST_MAX).lean();
       // The other clips from the same games (Milo 2026-11-05): with a whole
-      // team tracked, each of them shows every final kill of that game. A
-      // bed break is cut once per tracked player of that team: shown once.
-      const moment = (c) => `${c.replayId}:${c.kind}:${c.at}`;
-      const seen = new Set(docs.map(moment));
-      const games = [...new Set(docs.map(c => String(c.replayId || '')).filter(Boolean))];
-      const others = games.length
-        ? await Clip.find({ status: 'ready', replayId: { $in: games }, _id: { $nin: docs.map(c => c._id) } }).sort({ playedAt: -1, at: -1 }).limit(LIST_MAX).lean()
+      // team tracked, each of them shows every final kill of that game.
+      // One game can be uploaded more than once (again for a player tracked
+      // later, under the same file name): those uploads are one game. And a
+      // game they were tracked in counts even when none of the clips are theirs.
+      const theirs = await Replay.find({ 'players.uuid': uuid }, { _id: 1 }).sort({ playedAt: -1 }).limit(LIST_MAX).lean();
+      const ids = [...new Set([...docs.map(c => String(c.replayId || '')), ...theirs.map(r => String(r._id))].filter(Boolean))];
+      const reps = ids.length ? await Replay.find({ _id: { $in: ids } }, { name: 1, uploadedBy: 1 }).lean() : [];
+      const named = reps.filter(r => r.name);
+      const copies = named.length
+        ? await Replay.find({ $or: named.map(r => ({ name: r.name, uploadedBy: r.uploadedBy ?? null })) }, { name: 1, uploadedBy: 1 }).lean()
+        : [];
+      const gameOf = new Map();
+      for (const r of [...reps, ...copies]) gameOf.set(String(r._id), r.name ? `${r.uploadedBy || ''}/${r.name}` : String(r._id));
+      const game = (c) => gameOf.get(String(c.replayId || '')) || String(c.replayId || c._id);
+      const allIds = [...gameOf.keys()];
+      // A bed break is cut once per tracked player of that team (and again
+      // in each upload of the game): shown once.
+      const moment = (c) => `${game(c)}:${c.kind}:${c.at}`;
+      const seen = new Set();
+      const mine = [];
+      for (const c of docs) { if (!seen.has(moment(c))) { seen.add(moment(c)); mine.push(c); } }
+      const others = allIds.length
+        ? await Clip.find({ status: 'ready', replayId: { $in: allIds }, _id: { $nin: docs.map(c => c._id) } }).sort({ playedAt: -1, at: -1 }).limit(LIST_MAX).lean()
         : [];
       const sameGame = [];
       for (const c of others) {
         const k = moment(c);
         if (seen.has(k)) continue;
         seen.add(k);
-        sameGame.push(publicClip(c));
+        sameGame.push({ ...publicClip(c), game: game(c) });
       }
-      return res.json({ clips: docs.map(publicClip), sameGame });
+      return res.json({ clips: mine.map(c => ({ ...publicClip(c), game: game(c) })), sameGame });
     } catch (err) {
       log.error('/clips GET error', err);
       return res.status(500).json({ error: 'DB read error' });
