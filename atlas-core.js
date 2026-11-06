@@ -246,6 +246,13 @@ function mergeCapture(map, capture, source) {
 
 /** Recounts which games the columns come from, and the map's size. */
 function finish(map) {
+  // Hypixel sends the whole map before the start (and no empty chunks), so
+  // once a game has given it that way, a chunk first seen mid-game is one
+  // that was empty before the start: only player blocks (a bridge out past
+  // the edge). Those go, and with them the "edges unsure" (Milo 2026-11-06).
+  let pregame = false;
+  for (const c of map.columns.values()) if (c.kind === KIND.pregame) { pregame = true; break; }
+  if (pregame) for (const [key, c] of map.columns) if (c.kind === KIND.midgame) map.columns.delete(key);
   for (const s of map.sources) s.used = 0;
   let minX = Infinity; let maxX = -Infinity; let minZ = Infinity; let maxZ = -Infinity; let minY = 256; let maxY = -1;
   const kinds = [0, 0, 0];
@@ -358,4 +365,4 @@ function readCapture(gz) {
   return { map: cleanName(m.name), mode: (m.modes && m.modes[0]) || null, server: null, startedAt: s.playedAt || null, started: !!s.started, columns: m.columns };
 }
 
-module.exports = { extractCapture, readCapture, mergeCapture, previewOf, encodeMap, decodeMap, slugOf, chatText, FORMAT, KIND, KIND_NAMES };
+module.exports = { extractCapture, readCapture, mergeCapture, finish, previewOf, encodeMap, decodeMap, slugOf, chatText, FORMAT, KIND, KIND_NAMES };

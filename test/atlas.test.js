@@ -115,22 +115,29 @@ test('a lobby\'s /locraw ("map":"Base") never names the map', () => {
   assert.equal(c.map, 'Lighthouse')
 })
 
-test('chunks first seen mid-game are kept but marked; pre-game chunks win when merging', () => {
-  const lateChunk = [[60000, chunk(5, 5, [[80, 70, 80, WOOL]])]];
-  const a = A.extractCapture(game({ late: lateChunk }));
-  assert.equal(a.columns.get('5,5').kind, A.KIND.midgame);
-  let map = A.mergeCapture(null, a, { id: 'a', playedAt: '2026-11-01T00:00:00Z' });
+test('chunks first seen mid-game: unsure on their own, dropped once the pre-game map is there', () => {
+  // A recording that began mid-game (a rejoin): all it has, marked unsure.
+  const rejoin = A.extractCapture(mcpr([[0, chat(LOCRAW)], [10, chunk(0, 0, [[1, 64, 1, STONE]])], [10, chunk(5, 5, [[80, 70, 80, WOOL]])]]));
+  let map = A.mergeCapture(null, rejoin, { id: 'r', playedAt: '2026-11-01T00:00:00Z' });
   assert.equal(map.stats.complete, false);
-  assert.equal(map.stats.midgameColumns, 1);
-  // A later game that saw that corner before the start.
-  const b = A.extractCapture(game({ extraPregame: [[30, chunk(5, 5, [[81, 70, 81, STONE]])]] }));
+  assert.equal(map.stats.midgameColumns, 2);
+  // A game from before its start: the whole map. The rejoin's chunk out past
+  // it (5,5: empty before the start, so player blocks) goes.
+  const b = A.extractCapture(game());
   map = A.mergeCapture(map, b, { id: 'b', playedAt: '2026-11-02T00:00:00Z' });
   assert.equal(map.stats.complete, true);
-  assert.equal(at(map, 81, 70, 81), STONE);
-  assert.equal(at(map, 80, 70, 80), 0);
+  assert.equal(map.stats.midgameColumns, 0);
+  assert.equal(map.columns.has('5,5'), false);
+  assert.equal(at(map, 2, 64, 2), WOOL);
   assert.equal(map.sources.length, 2);
+  // A played game that loaded a chunk mid-game adds nothing there.
+  const late = A.extractCapture(game({ late: [[60000, chunk(6, 6, [[100, 70, 100, WOOL]])]] }));
+  assert.equal(late.columns.get('6,6').kind, A.KIND.midgame);
+  map = A.mergeCapture(map, late, { id: 'c', playedAt: '2026-11-03T00:00:00Z' });
+  assert.equal(map.columns.has('6,6'), false);
+  assert.equal(map.stats.complete, true);
   // The same game again changes nothing.
-  assert.equal(A.mergeCapture(map, b, { id: 'b' }).sources.length, 2);
+  assert.equal(A.mergeCapture(map, b, { id: 'b' }).sources.length, 3);
 });
 
 test('the newest game wins between equals (Hypixel rebuilt the map)', () => {
@@ -276,4 +283,20 @@ test('the proxy sets the rotation from Hypixel\'s map selector (Milo\'s key); an
   assert.equal(got.rotation.length, 1);
   assert.equal(got.rotation[0].teams, 8);
   assert.deepEqual(got.rotation[0].maps, ['Acropolis', 'Ambush', 'Beldam', 'Lighthouse', 'Orbit']);
+});
+
+test('maps built before the change lose their mid-game chunks on the next run', async () => {
+  const rejoin = A.extractCapture(mcpr([[0, chat(LOCRAW.replace('Test Isle', 'Old Isle'))], [10, chunk(5, 5, [[80, 70, 80, WOOL]])]]));
+  const good = A.extractCapture(game());
+  good.map = 'Old Isle';
+  // As the old code left it: both kinds side by side.
+  const map = A.mergeCapture(null, good, { id: 'g', playedAt: '2026-11-01T00:00:00Z' });
+  map.columns.set('5,5', { ...rejoin.columns.get('5,5'), src: 0 });
+  map.stats = { ...map.stats, midgameColumns: 1, complete: false };
+  await atlas.AtlasMap.create({ slug: 'old-isle', name: 'Old Isle', version: atlas.EXTRACT_VERSION, file: A.encodeMap(map), games: 1, sources: map.sources, stats: map.stats });
+  await atlas.runOnce();
+  const doc = await atlas.AtlasMap.findOne({ slug: 'old-isle' }).lean();
+  assert.equal(doc.stats.complete, true);
+  assert.equal(doc.stats.midgameColumns, 0);
+  assert.equal(A.decodeMap(Buffer.from(doc.file.buffer)).columns.has('5,5'), false);
 });
