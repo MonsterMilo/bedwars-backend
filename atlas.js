@@ -14,7 +14,7 @@
 const axios = require('axios');
 const express = require('express');
 const { presign, b2Config } = require('./replays');
-const { slugOf } = require('./atlas-core');
+const { slugOf, decodeMap, encodeMap, previewOf, finish } = require('./atlas-core');
 const jobs = require('./replay-jobs');
 
 const EXTRACT_VERSION = 1;
@@ -132,6 +132,19 @@ module.exports = function setupAtlas({
       await AtlasRead.deleteMany({ source: { $in: (gone.sources || []).map(x => x.id) } });
       await AtlasMap.deleteOne({ slug });
       console.log(`Atlas: removed the map "${slug}"`);
+    }
+    // Maps built before mid-game chunks were dropped when the pre-game map is
+    // there (atlas-core.js finish): drop them now. Small files, once each.
+    const tidy = await AtlasMap.find({ version: EXTRACT_VERSION, 'stats.pregameColumns': { $gt: 0 }, 'stats.midgameColumns': { $gt: 0 } }, { slug: 1, file: 1 }).lean();
+    for (const m of tidy) {
+      try {
+        const map = finish(decodeMap(Buffer.from(m.file.buffer || m.file)));
+        const file = encodeMap(map);
+        await AtlasMap.updateOne({ slug: m.slug }, { $set: { file, preview: previewOf(map), sizeBytes: file.length, sources: map.sources, stats: map.stats } });
+        console.log(`Atlas: ${m.slug}: dropped the chunks only seen mid-game`);
+      } catch (err) {
+        console.warn(`Atlas: ${m.slug} not tidied: ${err.message}`);
+      }
     }
     const done = new Set((await AtlasRead.find({ version: EXTRACT_VERSION }, { source: 1 }).lean()).map(r => r.source));
     const replays = await Replay.find({ status: 'ready' }, { key: 1, map: 1, playedAt: 1 }).sort({ playedAt: 1 }).lean();
