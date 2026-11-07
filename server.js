@@ -1147,7 +1147,9 @@ const clips = require('./clips')({ app, mongoose, Replay: replays.Replay, requir
 // Prism Atlas (see atlas.js): every map, rebuilt from the replays' pre-game chunks.
 const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
 // Our team's stats in games with tracked players (see match-stats.js), kept after replays go.
-require('./match-stats')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess, UUID_RE, NAME_RE });
+const matchStats = require('./match-stats')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess, UUID_RE, NAME_RE });
+// The website's Games page (games.js).
+require('./games')({ app, mongoose, Replay: replays.Replay, Clip: clips.Clip, MatchStat: matchStats.MatchStat, requireWriteKey, proxyLimiter });
 // Clips and the Atlas read replays one at a time (replay-jobs.js); the card
 // drawing worker lets go of its memory first when it has nothing to draw.
 require('./replay-jobs').beforeEach(() => require('./cards').stopIdleWorker());

@@ -3,6 +3,9 @@
 //
 //   { kind: 'clips', bytes, players, manual }
 //     -> { moments, cuts: [{ bytes, durationMs }] }   (clipper.js)
+//   { kind: 'summary', bytes } -> { summary }           (game-summary.js)
+//   { kind: 'cut', bytes, from, to, follow, title }
+//     -> { bytes, durationMs, people }                  (one clip, clipper.js)
 //   { kind: 'replay' | 'capture', bytes, map, source, fallbackName }
 //     -> { file, preview, summary }                   (atlas-core.js)
 //
@@ -18,7 +21,27 @@ function clips(msg) {
   const found = clipper.findMoments(rec, msg.players || [], { manual: msg.manual || [] });
   const good = found.moments.filter(m => m.ok);
   const cuts = good.length ? clipper.cutClips(rec, clipper.windowsFor(good)) : [];
-  return { moments: found.moments, cuts };
+  return { moments: found.moments, cuts, summary: found.summary };
+}
+
+// Only the game summary (game-summary.js), for replays clipped before it
+// existed.
+function summary(msg) {
+  const clipper = require('./clipper');
+  const rec = clipper.openRecording(asBuffer(msg.bytes));
+  return { summary: clipper.findMoments(rec, []).summary };
+}
+
+// One window cut on request (a clip made on the website): who was near the
+// followed player in it, and the clip file.
+function cut(msg) {
+  const clipper = require('./clipper');
+  const rec = clipper.openRecording(asBuffer(msg.bytes));
+  const from = Math.max(0, Math.round(msg.from)); const to = Math.round(msg.to);
+  const found = clipper.findMoments(rec, [], { manual: [to], manualBeforeMs: to - from, manualAfterMs: 0, focusName: msg.follow || null });
+  const m = found.moments.find(x => x.kind === 'manual');
+  const [clip] = clipper.cutClips(rec, [{ from, to, focus: (m && m.focus) || msg.focus || null, markAt: from, marker: msg.title || 'Clip' }]);
+  return { people: m ? m.people : [], followUuid: m ? m.followUuid : null, self: found.self, ...clip };
 }
 
 function atlas(msg) {
@@ -42,6 +65,8 @@ function atlas(msg) {
 
 function handle(msg) {
   if (msg.kind === 'clips') return clips(msg);
+  if (msg.kind === 'summary') return summary(msg);
+  if (msg.kind === 'cut') return cut(msg);
   if (msg.kind === 'replay' || msg.kind === 'capture') return atlas(msg);
   throw new Error(`Unknown replay job (${msg.kind})`);
 }

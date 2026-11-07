@@ -20,6 +20,7 @@
 const zlib = require('zlib');
 const { unzipSync } = require('fflate');
 const stream = require('./tmcpr-stream');
+const { summarizeGame } = require('./game-summary');
 
 const P = {
   KEEPALIVE: 0x00, JOIN: 0x01, CHAT: 0x02, TIME: 0x03, EQUIP: 0x04, SPAWN_POS: 0x05, HEALTH: 0x06,
@@ -247,6 +248,9 @@ function findMoments(recording, tracked, options = {}) {
   const uuidEid = new Map();      // uuid -> eid (newest)
   const samples = new Map();      // uuid -> [{ t, x, y, z, gone }]
   const events = [];
+  const lines = [];                // game chat, for the game summary
+  let startT = null;
+  let lastT = 0;
   let selfId = meta && meta.selfId != null ? meta.selfId : null;
   let dimension = 0;
   let sidebarTeam = null;
@@ -261,6 +265,7 @@ function findMoments(recording, tracked, options = {}) {
   };
 
   forEachPacket(recording, (t, id, bytes, at, bodyAt, end) => {
+    if (t > lastT) lastT = t;
     if (id !== P.CHAT && id !== P.JOIN && id !== P.POSITION && id !== P.SPAWN_PLAYER && id !== P.REL_MOVE && id !== P.LOOK_MOVE &&
         id !== P.TELEPORT && id !== P.DESTROY && id !== P.PLAYER_LIST && id !== P.TEAMS && id !== P.RESPAWN) return;
     const r = new Reader(bytes, bodyAt, end);
@@ -339,6 +344,8 @@ function findMoments(recording, tracked, options = {}) {
           if (pos === 2) break;
           const text = chatText(json).trim();
           if (!text || PRIVATE_CHAT.test(text)) break;
+          if (lines.length < 5000) lines.push({ t, text });
+          if (startT == null && /Protect your bed and destroy the enemy beds/.test(text)) startT = t;
           if (/FINAL KILL!\s*$/.test(text)) events.push({ kind: 'final', t, text });
           else if (/^BED DESTRUCTION\s*>/.test(text)) events.push({ kind: 'bed', t, text });
           break;
@@ -481,31 +488,38 @@ function findMoments(recording, tracked, options = {}) {
   }
 
   // /clip in game: the last 20 seconds before the moment you typed it,
-  // with everyone who came near you in them (they're who it's about).
+  // with everyone who came near you in them (they're who it's about). A
+  // clip made on the website can be about someone else (focusName): then
+  // it's around them, and who came near them.
+  const focusUuid = o.focusName ? uuidOfName(o.focusName) : null;
+  const centre = focusUuid && samples.has(focusUuid) ? focusUuid : (selfSeen ? selfUuid : null);
   for (const atMs of o.manual || []) {
     const t = Math.round(Number(atMs));
     if (!Number.isFinite(t) || t < 0) continue;
     const from = t - o.manualBeforeMs;
     const people = [];
-    if (selfSeen) {
+    if (centre) {
       for (const [u, nm] of names) {
-        if (u === selfUuid || !samples.has(u)) continue;
+        if (u === centre || !samples.has(u)) continue;
         let near = false;
         for (let tt = Math.max(0, from); tt <= t && !near; tt += 250) {
-          const a = at(selfUuid, tt); const b = at(u, tt);
+          const a = at(centre, tt); const b = at(u, tt);
           if (a && b && flat(a, b) <= o.nearBlocks) near = true;
         }
         if (near) people.push({ uuid: u, name: nm, team: teamOf.get(lc(nm)) || null });
       }
     }
-    const me = selfSeen ? at(selfUuid, t) || lastSeen(selfUuid, t) : serverPlaced(t);
+    const me = centre ? at(centre, t) || lastSeen(centre, t) || at(centre, from) : serverPlaced(t);
+    const centreName = centre ? names.get(centre) || null : selfName;
+    const centreTeam = centreName ? teamOf.get(lc(centreName)) || null : selfTeam;
     // Opponents first: they're who a clip is usually about.
-    people.sort((a, b) => (a.team === selfTeam) - (b.team === selfTeam));
+    people.sort((a, b) => (a.team === centreTeam) - (b.team === centreTeam));
     moments.push({ kind: 'manual', t, uuid: null, username: null, victim: null, team: null, by: selfName, people,
-      ok: true, reason: null, inView: null, distance: null, focus: me ? { x: me.x, y: me.y, z: me.z } : null, follow: selfName });
+      ok: true, reason: null, inView: null, distance: null, focus: me ? { x: me.x, y: me.y, z: me.z } : null, follow: centreName || selfName, followUuid: centre || null });
   }
 
-  return { self: { name: selfName, team: selfTeam, uuid: selfUuid }, moments };
+  const summary = summarizeGame({ lines, names, teamOf, self: { name: selfName, team: selfTeam }, startT, endT: lastT });
+  return { self: { name: selfName, team: selfTeam, uuid: selfUuid }, moments, summary };
 }
 
 // --- Writing ---

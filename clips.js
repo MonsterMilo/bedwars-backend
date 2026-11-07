@@ -14,6 +14,7 @@ const axios = require('axios');
 const { presign, b2Config } = require('./replays');
 const clipper = require('./clipper');
 const jobs = require('./replay-jobs');
+const { SUMMARY_VERSION } = require('./game-summary');
 
 // Bump to clip every replay again (e.g. after changing the rules).
 // 2 (2026-11-05): teams from the prefix colour, 60 blocks instead of 40.
@@ -26,6 +27,9 @@ const MAX_REPLAY_BYTES = 30 * 1024 * 1024;
 const BACKFILL_MS = 10 * 60 * 1000;
 const FIRST_BACKFILL_MS = 3 * 60 * 1000;
 const LIST_MAX = 60;
+// Clips made on the website: how long they can be.
+const SITE_CLIP_MIN_MS = 2000;
+const SITE_CLIP_MAX_MS = 60000;
 
 module.exports = function setupClips({
   app, mongoose, Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess = () => true,
@@ -58,6 +62,11 @@ module.exports = function setupClips({
     playedAt: Date,
     map: String,
     mode: String,
+    // 'site': made on the website (marked in the replay viewer), kept when
+    // the replay is clipped again. Automatic and /clip ones have none.
+    source: String,
+    title: String,
+    createdBy: String,
     status: { type: String, default: 'pending' }
   }, { timestamps: true }));
 
@@ -65,6 +74,7 @@ module.exports = function setupClips({
     id: c._id, replayId: c.replayId, uuid: c.uuid, username: c.username, victim: c.victim, by: c.by, team: c.team,
     kind: c.kind, at: c.at, markAt: c.markAt, durationMs: c.durationMs, sizeBytes: c.sizeBytes, distance: c.distance,
     follow: c.follow, playedAt: c.playedAt, map: c.map || null, mode: c.mode || null,
+    ...(c.source ? { source: c.source, title: c.title || null } : {}),
     ...(c.kind === 'manual' ? { people: (c.people || []).map(p => ({ uuid: p.uuid, name: p.name, team: p.team || null })) } : {})
   });
 
@@ -96,8 +106,10 @@ module.exports = function setupClips({
       const good = found.moments.filter(m => m.ok);
       const cut = found.cuts;
 
-      // Replace this replay's earlier automatic clips.
-      const old = await Clip.find({ replayId: rep._id }).lean();
+      if (found.summary) await Replay.updateOne({ _id: rep._id }, { $set: { summary: found.summary } });
+      // Replace this replay's earlier automatic clips (clips made on the
+      // website stay).
+      const old = await Clip.find({ replayId: rep._id, source: { $ne: 'site' } }).lean();
       for (const c of old) {
         await removeFile(c.key).catch(err => log.warn('Clips: removing an old clip failed', err.message));
         await Clip.deleteOne({ _id: c._id });
@@ -154,7 +166,39 @@ module.exports = function setupClips({
       .sort({ playedAt: 1 }).limit(limit).lean();
     for (const d of docs) enqueue(d._id);
     if (busy) await busy;
+    // Replays clipped before game summaries existed: just the summary.
+    if (!docs.length) {
+      const old = await Replay.find({ status: 'ready', 'clips.version': CLIP_VERSION, 'clips.error': null, $or: [{ summary: null }, { 'summary.v': { $lt: SUMMARY_VERSION } }] }, { _id: 1 })
+        .sort({ playedAt: -1 }).limit(limit).lean();
+      for (const d of old) await summarize(d._id).catch(err => log.warn('Clips: summary failed', err.message));
+      return old.length;
+    }
     return docs.length;
+  }
+
+  // Reads one replay for its game summary only (game-summary.js).
+  async function summarize(replayId) {
+    const rep = await Replay.findById(replayId).lean();
+    if (!rep || rep.status !== 'ready') return null;
+    const bytes = await download(rep);
+    let out;
+    try {
+      out = await jobs.exclusive(() => jobs.run({ kind: 'summary', bytes }, { inProcess }));
+    } catch (err) {
+      // A replay that can't be read keeps an empty summary, so it isn't tried again and again.
+      out = { summary: { v: SUMMARY_VERSION, error: String(err.message || err).slice(0, 200) } };
+    }
+    if (out && out.summary) await Replay.updateOne({ _id: rep._id }, { $set: { summary: out.summary } });
+    return out && out.summary;
+  }
+
+  async function download(rep) {
+    if ((rep.sizeBytes || 0) > MAX_REPLAY_BYTES) throw new Error('Replay too big to read on the server');
+    const r = await http.get(link('GET', rep.key, 60), { responseType: 'arraybuffer', timeout: 120000, validateStatus: () => true, maxContentLength: MAX_REPLAY_BYTES + 1 });
+    if (r.status !== 200) throw new Error(`Storage answered ${r.status}`);
+    const bytes = Buffer.isBuffer(r.data) ? r.data : Buffer.from(r.data);
+    jobs.checkSize(bytes);
+    return bytes;
   }
   if (env.CLIPS_BACKFILL !== 'off') {
     const first = setTimeout(() => backfill().catch(err => log.warn('Clips: backfill failed', err.message)), FIRST_BACKFILL_MS);
@@ -305,6 +349,67 @@ module.exports = function setupClips({
     }
   });
 
+  // A clip marked in the replay viewer on the website: the part of the game
+  // from `from` to `to` (ms into the replay), around the player the viewer
+  // was following. Any key can make one; it shows for everyone in it, like
+  // a /clip, and stays when the replay is clipped again.
+  app.post('/replays/:id/site-clips', requireWriteKey, writeLimiter, async (req, res) => {
+    if (!config()) return res.status(503).json({ error: 'Replay storage is not set up on the server' });
+    if (badId(req.params.id)) return res.status(400).json({ error: 'Bad id' });
+    const b = req.body || {};
+    const from = Math.round(Number(b.from)); const to = Math.round(Number(b.to));
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to <= from) return res.status(400).json({ error: 'Mark a start and an end first' });
+    if (to - from < SITE_CLIP_MIN_MS) return res.status(400).json({ error: 'A clip needs at least 2 seconds' });
+    if (to - from > SITE_CLIP_MAX_MS) return res.status(400).json({ error: 'A clip can be at most 60 seconds' });
+    const title = typeof b.title === 'string' ? b.title.replace(/[\u0000-\u001f]/g, '').trim().slice(0, 80) : '';
+    const follow = /^\w{1,16}$/.test(String(b.follow || '')) ? String(b.follow) : null;
+    try {
+      const rep = await Replay.findById(req.params.id).lean();
+      if (!rep || rep.status !== 'ready') return res.status(404).json({ error: 'No such replay' });
+      if (rep.durationMs && from > rep.durationMs + 5000) return res.status(400).json({ error: 'That is past the end of the game' });
+      const out = await jobs.exclusive(async () => {
+        const bytes = await download(rep);
+        return jobs.run({ kind: 'cut', bytes, from, to, follow, title: title || 'Clip' }, { inProcess });
+      });
+      const people = (out.people || []).slice(0, 16);
+      const doc = new Clip({
+        key: 'pending', replayId: rep._id, kind: 'manual', source: 'site', title: title || null, createdBy: req.keyOwner,
+        by: (out.self && out.self.name) || null, follow: follow || (out.self && out.self.name) || null,
+        at: to, markAt: 0, durationMs: out.durationMs, sizeBytes: out.bytes.length,
+        playedAt: rep.playedAt ? new Date(rep.playedAt.getTime() + from) : null, map: rep.map, mode: rep.mode,
+        people, peopleKeys: [...people.map(p => p.uuid), ...people.map(p => 'n:' + String(p.name).toLowerCase()), ...(out.followUuid ? [out.followUuid] : []), ...(follow ? ['n:' + follow.toLowerCase()] : [])]
+      });
+      doc.key = `clips/${doc._id}.mcpr`;
+      await doc.save();
+      const bytes = out.bytes;
+      await http.put(link('PUT', doc.key), Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength), {
+        headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length },
+        maxBodyLength: Infinity, timeout: 60000
+      });
+      doc.status = 'ready';
+      await doc.save();
+      return res.status(201).json(publicClip(doc));
+    } catch (err) {
+      log.error('/replays site-clips POST error', err.message);
+      return res.status(500).json({ error: 'Couldn\'t make the clip' });
+    }
+  });
+
+  // A site clip's maker (or Milo) can rename it.
+  app.patch('/clips/:id', requireWriteKey, writeLimiter, async (req, res) => {
+    if (badId(req.params.id)) return res.status(400).json({ error: 'Bad id' });
+    try {
+      const doc = await Clip.findById(req.params.id);
+      if (!doc || doc.status !== 'ready') return res.status(404).json({ error: 'No such clip' });
+      if (doc.source !== 'site' || (doc.createdBy !== req.keyOwner && !hasFullAccess(req.keyOwner))) return res.status(403).json({ error: 'Only who made this clip can rename it' });
+      doc.title = typeof req.body?.title === 'string' ? req.body.title.replace(/[\u0000-\u001f]/g, '').trim().slice(0, 80) || null : doc.title;
+      await doc.save();
+      return res.json(publicClip(doc));
+    } catch (err) {
+      return res.status(500).json({ error: 'DB write error' });
+    }
+  });
+
   async function usage() {
     const [row] = await Clip.aggregate([{ $match: { status: 'ready' } }, { $group: { _id: null, count: { $sum: 1 }, bytes: { $sum: '$sizeBytes' } } }]);
     return { count: row ? row.count : 0, bytes: row ? row.bytes : 0 };
@@ -312,5 +417,5 @@ module.exports = function setupClips({
 
   // Waits until no clip is being cut.
   const idle = async () => { while (busy) await busy; };
-  return { Clip, clipReplay, enqueue, backfill, usage, idle, CLIP_VERSION };
+  return { Clip, clipReplay, enqueue, backfill, summarize, usage, idle, CLIP_VERSION };
 };

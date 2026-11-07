@@ -89,7 +89,9 @@ module.exports = function setupReplays({
     // cuts the 20 s before each).
     manualClips: { type: [Number], default: undefined },
     // What clipping found (clips.js): { version, at, clips, moments, error }.
-    clips: { type: mongoose.Schema.Types.Mixed, default: undefined }
+    clips: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    // Who played and who killed whom (game-summary.js), for the Games page.
+    summary: { type: mongoose.Schema.Types.Mixed, default: undefined }
   }, { timestamps: true }));
 
   const plainUuid = (u) => String(u || '').replace(/-/g, '').toLowerCase();
