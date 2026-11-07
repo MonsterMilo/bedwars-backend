@@ -46,6 +46,9 @@
 //   TRACKED_LIST_CHANNEL_ID  optional: the channel every new sweat is posted
 //                       to as one short line (see tracked-list.js); defaults
 //                       to Milo's channel, "off" turns it off
+//   PARTY_CHAT_CHANNEL_ID  optional: where Prism's "Party chat to Discord"
+//                       lines go (see party-chat.js); defaults to Milo's
+//                       channel, "off" turns it off
 // Missing any of the first four just turns the bot off.
 
 const crypto = require('crypto');

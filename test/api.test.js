@@ -126,3 +126,13 @@ test('the theme is saved per key and comes back from /whoami', async () => {
   assert.deepEqual((await call('GET', '/whoami', { key: 'milo-key' })).json.prefs, {});
   assert.deepEqual((await call('GET', '/whoami')).json.prefs, {});
 });
+
+test('party chat relay takes only full-access keys', async () => {
+  const body = { lines: [{ name: 'A', text: 'hi' }] };
+  assert.equal((await call('POST', '/party-chat', { body })).status, 401);
+  assert.equal((await call('POST', '/party-chat', { key: 'potat-key', body })).status, 403);
+  assert.equal((await call('POST', '/party-chat', { key: 'milo-key', body: { lines: [] } })).status, 400);
+  assert.equal((await call('POST', '/party-chat', { key: 'milo-key', body: { lines: [{ text: 5 }] } })).status, 400);
+  // No bot token in the tests, so the relay is off.
+  assert.equal((await call('POST', '/party-chat', { key: 'milo-key', body })).status, 503);
+});
