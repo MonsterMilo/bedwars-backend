@@ -1242,6 +1242,21 @@ app.post('/tracked-nicks', requireWriteKey, writeLimiter, async (req, res) => {
   }
 });
 
+// Prism's "Party chat to Discord" switch: Milo's party chat lines, posted
+// by the bot to the party chat channel. Full-access keys only.
+// Body { lines: [{ name, rank, text }] } (1 to 50 lines).
+const partyChat = require('./party-chat')({ describeAxiosError });
+app.post('/party-chat', requireWriteKey, writeLimiter, (req, res) => {
+  if (!hasFullAccess(req.keyOwner)) return res.status(403).json({ error: 'Only Milo\'s key can relay party chat' });
+  const lines = (req.body || {}).lines;
+  if (!Array.isArray(lines) || !lines.length || lines.length > 50) return res.status(400).json({ error: 'Send 1 to 50 lines' });
+  const ok = lines.filter(l => l && typeof l === 'object' && typeof l.text === 'string'
+    && (l.name === undefined || typeof l.name === 'string') && (l.rank === undefined || typeof l.rank === 'string'));
+  if (ok.length !== lines.length) return res.status(400).json({ error: 'Each line needs text (and may have name and rank)' });
+  if (!partyChat.on) return res.status(503).json({ error: 'Party chat relay is off on the server' });
+  return res.json({ ok: true, posted: partyChat.add(ok) });
+});
+
 const discord = require('./discord')({
   app, Sweat, LIVE, ROSTER_FIELDS, NAME_RE, NOTE_MAX_LENGTH, NOTES_PER_SWEAT_MAX,
   cleanStat, cleanNoteText, logActivity, withinChangeWindow, canRemoveSweat, describeAxiosError,
