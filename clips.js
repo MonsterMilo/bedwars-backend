@@ -375,7 +375,7 @@ module.exports = function setupClips({
       const doc = new Clip({
         key: 'pending', replayId: rep._id, kind: 'manual', source: 'site', title: title || null, createdBy: req.keyOwner,
         by: (out.self && out.self.name) || null, follow: follow || (out.self && out.self.name) || null,
-        at: to, markAt: 0, durationMs: out.durationMs, sizeBytes: out.bytes.length,
+        at: from, markAt: 0, durationMs: out.durationMs, sizeBytes: out.bytes.length,
         playedAt: rep.playedAt ? new Date(rep.playedAt.getTime() + from) : null, map: rep.map, mode: rep.mode,
         people, peopleKeys: [...people.map(p => p.uuid), ...people.map(p => 'n:' + String(p.name).toLowerCase()), ...(out.followUuid ? [out.followUuid] : []), ...(follow ? ['n:' + follow.toLowerCase()] : [])]
       });
