@@ -1147,7 +1147,33 @@ const clips = require('./clips')({ app, mongoose, Replay: replays.Replay, requir
 // Prism Atlas (see atlas.js): every map, rebuilt from the replays' pre-game chunks.
 const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess });
 // Our team's stats in games with tracked players (see match-stats.js), kept after replays go.
-require('./match-stats')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess, UUID_RE, NAME_RE });
+const matchStats = require('./match-stats')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess, UUID_RE, NAME_RE });
+// The website's Games page (games.js).
+require('./games')({ app, mongoose, Replay: replays.Replay, Clip: clips.Clip, MatchStat: matchStats.MatchStat, requireWriteKey, proxyLimiter });
+// Minecraft's sound files for the replay viewer's video recording: Mojang's
+// sound server sends no CORS headers, so the browser can't mix its files
+// into a recording. Passed through here (small, and kept for a while).
+const mcSoundCache = new Map();
+const MC_SOUND_CACHE_MAX = 400;
+app.get('/mc-sounds/:hash', requireWriteKey, async (req, res) => {
+  const hash = String(req.params.hash || '');
+  if (!/^[0-9a-f]{40}$/.test(hash)) return res.status(400).json({ error: 'Bad sound' });
+  try {
+    let buf = mcSoundCache.get(hash);
+    if (!buf) {
+      const r = await axios.get(`https://resources.download.minecraft.net/${hash.slice(0, 2)}/${hash}`, { responseType: 'arraybuffer', timeout: 10000, maxContentLength: 2 * 1024 * 1024, validateStatus: () => true });
+      if (r.status !== 200) return res.status(404).json({ error: 'No such sound' });
+      buf = Buffer.from(r.data);
+      mcSoundCache.set(hash, buf);
+      if (mcSoundCache.size > MC_SOUND_CACHE_MAX) mcSoundCache.delete(mcSoundCache.keys().next().value);
+    }
+    res.set('Content-Type', 'audio/ogg');
+    res.set('Cache-Control', 'private, max-age=31536000, immutable');
+    return res.send(buf);
+  } catch (err) {
+    return res.status(502).json({ error: 'Couldn\'t load the sound' });
+  }
+});
 // Clips and the Atlas read replays one at a time (replay-jobs.js); the card
 // drawing worker lets go of its memory first when it has nothing to draw.
 require('./replay-jobs').beforeEach(() => require('./cards').stopIdleWorker());
