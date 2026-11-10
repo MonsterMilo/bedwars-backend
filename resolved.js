@@ -9,7 +9,10 @@
 // Milo's rules (Oct 2026): never a duplicate, and a nick always shows whoever
 // had it most recently. So there is one row (and one message) per nick:
 //   - a new nick is posted
-//   - a newer sighting of the same player just moves its time on, quietly
+//   - a newer sighting of the same player is posted again as reconfirmed
+//     (Milo, Nov 2026: "any new or reconfirmed denick should be added"),
+//     its old message taken out so the nick still shows once. Quiet loads
+//     (gists) and sightings within REPOST_GAP_MS of the last one don't repost.
 //   - a newer sighting of a different player takes the nick over: the old
 //     message is deleted and a new one says who has it now and who had it
 //   - an older sighting of a different player only goes in the history
@@ -32,6 +35,7 @@ const UUID_RE = /^[0-9a-f]{32}$/;
 // October"). It runs unless RESOLVED_NICKS_CATCHUP=off, which makes it just
 // log how much it would post.
 const CATCHUP_SINCE = Date.UTC(2026, 9, 1);
+const REPOST_GAP_MS = 60 * 60 * 1000; // a reconfirm this soon after the last sighting stays quiet
 const STYLE = 2; // messages in an older look (1: plain text) get redrawn
 
 // Milliseconds from whatever a source gives: ms, Unix seconds or a date string.
@@ -63,6 +67,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     messageId: { type: String, default: null },
     needsPost: { type: Boolean, default: false, index: true },
     taken: { type: Boolean, default: false }, // the waiting post is a takeover ("was ...")
+    again: { type: Boolean, default: false }, // its message is a reconfirm of the same player
     style: { type: Number, default: 1 },      // which look its message was drawn in (STYLE)
     slot: { type: Number, default: 0 }        // its place among the embeds of a shared message
   }, { timestamps: true, versionKey: false }));
@@ -137,10 +142,11 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
     const was = row.taken && row.history[0];
     const lines = [`→ ${playerLink(row)}`];
     if (was) lines.push(`-# was ${was.player}`);
+    else if (row.again) lines.push('-# reconfirmed');
     const also = row.alsoIn.length ? ` · also ${row.alsoIn.join(', ')}` : '';
     lines.push(`-# ${row.source || 'Unknown'}${also} · seen ${stamp(row.seenAt)}`);
     return {
-      title: `${was ? '🔁' : '🔓'}  ${row.nick}`,
+      title: `${was ? '🔁' : row.again ? '✅' : '🔓'}  ${row.nick}`,
       description: lines.join('\n'),
       color: SOURCE_COLORS[row.source] ?? OTHER_COLOR,
       ...(row.uuid ? {
@@ -367,6 +373,14 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
             touched = true;
           }
           if (e.seenAt > row.seenAt) {
+            // Reconfirmed: posted again (or posted at last, if it was only
+            // ever taken in quietly), unless this is a quiet load or the
+            // last sighting was moments ago.
+            if (!quiet && !row.needsPost && (!row.messageId || e.seenAt - row.seenAt >= REPOST_GAP_MS)) {
+              row.needsPost = true;
+              row.taken = false;
+              row.again = true;
+            }
             if (e.source !== row.source) {
               row.alsoIn = [row.source, ...row.alsoIn.filter(s => s !== row.source && s !== e.source)];
               row.source = e.source;
@@ -387,7 +401,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
           moved.push({ player: row.player, uuid: row.uuid || null, nick: row.nick }, { player: e.player, uuid: e.uuid, nick: row.nick });
           row.history = [{ player: row.player, source: row.source, seenAt: row.seenAt },
             ...row.history.filter(h => h.player.toLowerCase() !== playerLower && h.player.toLowerCase() !== row.playerLower)].slice(0, HISTORY_MAX);
-          Object.assign(row, { player: e.player, playerLower, source: e.source, alsoIn: [], seenAt: e.seenAt, uuid: e.uuid, uuidTried: false });
+          Object.assign(row, { player: e.player, playerLower, source: e.source, alsoIn: [], seenAt: e.seenAt, uuid: e.uuid, uuidTried: false, again: false });
           if (!quiet || row.messageId) { row.needsPost = true; row.taken = true; }
           changed.set(key, row);
         } else {
@@ -407,7 +421,7 @@ module.exports = function setupResolved({ mongoose, resolvePlayer = null, http =
             filter: { nickLower: r.nickLower },
             update: { $set: {
               nick: r.nick, player: r.player, playerLower: r.playerLower, source: r.source, alsoIn: r.alsoIn,
-              seenAt: r.seenAt, history: r.history, needsPost: r.needsPost, taken: !!r.taken,
+              seenAt: r.seenAt, history: r.history, needsPost: r.needsPost, taken: !!r.taken, again: !!r.again,
               uuid: r.uuid || null, uuidTried: !!r.uuidTried
             } },
             upsert: true
