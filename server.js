@@ -1149,7 +1149,7 @@ const atlas = require('./atlas')({ app, mongoose, Replay: replays.Replay, requir
 // Our team's stats in games with tracked players (see match-stats.js), kept after replays go.
 const matchStats = require('./match-stats')({ app, mongoose, requireWriteKey, writeLimiter, proxyLimiter, hasFullAccess, UUID_RE, NAME_RE });
 // The website's Games page (games.js).
-require('./games')({ app, mongoose, Replay: replays.Replay, Clip: clips.Clip, MatchStat: matchStats.MatchStat, requireWriteKey, proxyLimiter });
+require('./games')({ app, mongoose, Replay: replays.Replay, Clip: clips.Clip, MatchStat: matchStats.MatchStat, requireWriteKey, proxyLimiter, resolved });
 // Minecraft's sound files for the replay viewer's video recording: Mojang's
 // sound server sends no CORS headers, so the browser can't mix its files
 // into a recording. Passed through here (small, and kept for a while).

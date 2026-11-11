@@ -36,7 +36,10 @@ test.before(async () => {
   replays = setupReplays({ ...opts, keyOwner: () => null });
   clips = setupClips({ ...opts, Replay: replays.Replay, log: quiet });
   matchStats = setupMatchStats(opts);
-  setupGames({ ...opts, Replay: replays.Replay, Clip: clips.Clip, MatchStat: matchStats.MatchStat, log: quiet });
+  // The resolved nicks list (resolved.js): 'Sweaty' is RealSweat's nick.
+  const owners = { sweaty: { player: 'RealSweat', uuid: 'dddddddddddd4ddddddddddddddddddd' } };
+  const resolved = { ownerOf: async (nick) => owners[String(nick).toLowerCase()] || null };
+  setupGames({ ...opts, Replay: replays.Replay, Clip: clips.Clip, MatchStat: matchStats.MatchStat, resolved, log: quiet });
   server = app.listen(0);
   base = `http://127.0.0.1:${server.address().port}`;
 });
@@ -152,4 +155,17 @@ test('replays clipped before summaries existed get one from the backfill', async
   assert.equal(await clips.backfill(), 1);
   assert.equal((await replays.Replay.findById(id).lean()).summary.winner, 'Blue');
   assert.equal(await clips.backfill(), 0);
+});
+
+test('a tracked player who was nicked is matched to their nick in the game', async () => {
+  const name = '2026-11-04_21-00-00_game.mcpr';
+  // Known only from the resolved nicks list.
+  await upload(name, [{ uuid: 'dddddddddddd4ddddddddddddddddddd', username: 'RealSweat' }], { playedAt: '2026-11-04T21:00:00Z' });
+  // The plugin knew this one's nick; a stale nick not in the game is dropped.
+  await upload(name, [{ uuid: 'eeeeeeeeeeee4eeeeeeeeeeeeeeeeeee', username: 'Hidden', nick: 'Mate' }, { uuid: 'ffffffffffff4fffffffffffffffffff', username: 'Elsewhere', nick: 'NotHere' }], { playedAt: '2026-11-04T21:00:00Z' });
+  const g = (await call('GET', '/games')).json.games.find(x => x.name === name);
+  const by = Object.fromEntries(g.tracked.map(p => [p.username, p.nick || null]));
+  assert.deepEqual(by, { RealSweat: 'Sweaty', Hidden: 'Mate', Elsewhere: null });
+  const page = await call('GET', `/games/${g.id}`);
+  assert.equal(page.json.tracked.find(p => p.username === 'RealSweat').nick, 'Sweaty');
 });
