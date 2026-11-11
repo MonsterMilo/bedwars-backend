@@ -10,7 +10,7 @@ const SCAN_MAX = 2000;
 
 const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-module.exports = function setupGames({ app, mongoose, Replay, Clip, MatchStat, requireWriteKey, proxyLimiter, log = console }) {
+module.exports = function setupGames({ app, mongoose, Replay, Clip, MatchStat, requireWriteKey, proxyLimiter, resolved = null, log = console }) {
   const gameKey = (r) => (r.name ? `${r.uploadedBy || ''}/${r.name}` : String(r._id));
 
   // One row of the list: what the page needs without the kill log.
@@ -21,7 +21,7 @@ module.exports = function setupGames({ app, mongoose, Replay, Clip, MatchStat, r
       replayIds: copies.map(c => String(c._id)),
       name: r.name || null,
       playedAt: r.playedAt, durationMs: r.durationMs || 0, map: r.map || null, mode: r.mode || null,
-      tracked: dedupe(copies.flatMap(c => (c.players || []).map(p => ({ uuid: p.uuid, username: p.username })))),
+      tracked: dedupe(copies.flatMap(c => (c.players || []).map(p => ({ uuid: p.uuid, username: p.username, ...(p.nick ? { nick: p.nick } : {}) })))),
       summary: s ? {
         self: s.self, winner: s.winner, result: s.result, totals: s.totals,
         teams: (s.teams || []).map(t => ({ team: t.team, bedBrokenAt: t.bedBrokenAt, eliminatedAt: t.eliminatedAt, players: t.players.map(p => p.name) }))
@@ -29,9 +29,46 @@ module.exports = function setupGames({ app, mongoose, Replay, Clip, MatchStat, r
     };
   };
   const dedupe = (list) => {
-    const seen = new Set();
-    return list.filter(p => { if (!p.uuid || seen.has(p.uuid)) return false; seen.add(p.uuid); return true; });
+    const byUuid = new Map();
+    for (const p of list) {
+      if (!p.uuid) continue;
+      const had = byUuid.get(p.uuid);
+      if (!had) byUuid.set(p.uuid, p);
+      else if (!had.nick && p.nick) had.nick = p.nick; // one copy may know the nick
+    }
+    return [...byUuid.values()];
   };
+
+  // A tracked player who was nicked in the game shows up in its teams under
+  // the nick, so the page couldn't find them. Each target gets the name they
+  // played under (nick): from the upload when the plugin knew it, otherwise
+  // from the resolved nicks list (resolved.js) when one of the game's names
+  // is a nick that belongs to them (same uuid, or same name).
+  const low = (s) => String(s || '').toLowerCase();
+  async function linkNicks(row) {
+    if (!row.summary || !row.tracked.length) return;
+    const names = new Set(row.summary.teams.flatMap(t => t.players.map(low)));
+    for (const p of row.tracked) {
+      if (names.has(low(p.username))) { delete p.nick; continue; } // played as themselves
+      if (p.nick && names.has(low(p.nick))) continue;
+      delete p.nick;
+    }
+    if (!resolved) return;
+    const open = row.tracked.filter(p => !p.nick && !names.has(low(p.username)));
+    if (!open.length) return;
+    const taken = new Set(row.tracked.flatMap(p => [low(p.username), low(p.nick)]));
+    const selfName = low(row.summary.self && row.summary.self.name);
+    for (const name of names) {
+      if (taken.has(name) || name === selfName) continue;
+      let owner = null;
+      try { owner = await resolved.ownerOf(name); } catch { owner = null; }
+      if (!owner) continue;
+      const p = open.find(t => !t.nick && ((owner.uuid && t.uuid && owner.uuid === t.uuid) || low(owner.player) === low(t.username)));
+      if (!p) continue;
+      // keep the spelling used in the game
+      for (const t of row.summary.teams) for (const n of t.players) if (low(n) === name) p.nick = n;
+    }
+  }
 
   // The list, newest first: ?page=1&q=text (map, mode or a player's name).
   app.get('/games', requireWriteKey, proxyLimiter, async (req, res) => {
@@ -68,6 +105,7 @@ module.exports = function setupGames({ app, mongoose, Replay, Clip, MatchStat, r
         : [];
       const clipsOf = new Map(clipCounts.map(c => [String(c._id), c.n]));
       for (const r of slice) {
+        await linkNicks(r);
         const st = r.name && statOf.get(r.name);
         r.result = (r.summary && r.summary.result) || (st && st.result) || null;
         r.matchStats = !!st;
@@ -91,6 +129,7 @@ module.exports = function setupGames({ app, mongoose, Replay, Clip, MatchStat, r
         : [rep];
       const lead = copies.find(c => c.summary && !c.summary.error) || rep;
       const row = listRow(lead, copies);
+      await linkNicks(row);
       const st = rep.name ? await MatchStat.findOne({ game: rep.name }).lean() : null;
       const clips = await Clip.find({ status: 'ready', replayId: { $in: copies.map(c => c._id) } }).sort({ at: 1 }).lean();
       const seen = new Set();
