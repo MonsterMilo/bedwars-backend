@@ -52,7 +52,7 @@ module.exports = function setupStatus({
       }
     },
     {
-      id: 'bordic', name: 'Bordic (player stats)',
+      id: 'bordic', name: 'Bordic (backup stats)',
       async run() {
         const t0 = Date.now();
         try {
@@ -66,19 +66,19 @@ module.exports = function setupStatus({
       }
     },
     {
-      // Only a backup for Bordic, and a temporary key that's usually
-      // expired, so a dead key is "off", not a problem.
-      id: 'hypixel', name: 'Hypixel key (backup)',
+      // Milo's developer key (2026-11-13): live stats first, Bordic as backup.
+      id: 'hypixel', name: 'Hypixel (live stats)',
       async run() {
-        if (!hypixelKey()) return { state: 'off', detail: 'Not set. Bordic covers it' };
+        if (!hypixelKey()) return { state: 'warn', detail: 'No key set. Using Bordic' };
         const t0 = Date.now();
         try {
-          await http.get('https://api.hypixel.net/v2/punishmentstats', { headers: { 'API-Key': hypixelKey() }, timeout: TIMEOUT_MS });
-          return timed(Date.now() - t0, 'Working (temporary key)');
+          const res = await http.get('https://api.hypixel.net/v2/punishmentstats', { headers: { 'API-Key': hypixelKey() }, timeout: TIMEOUT_MS });
+          const left = Number(res && res.headers && res.headers['ratelimit-remaining']);
+          return timed(Date.now() - t0, Number.isFinite(left) ? `Working (${left} left)` : 'Working');
         } catch (err) {
           const code = statusOf(err);
-          if (code === 403) return { state: 'off', detail: 'Expired. It\'s a temporary backup, Bordic covers it' };
-          if (code === 429) return { state: 'warn', detail: 'Rate limited' };
+          if (code === 403) return { state: 'down', detail: 'Key refused. Using Bordic' };
+          if (code === 429) return { state: 'warn', detail: 'Rate limited. Using Bordic' };
           return { state: 'warn', detail: code ? `Hypixel error ${code}` : 'Hypixel not answering', log: describeAxiosError(err) };
         }
       }

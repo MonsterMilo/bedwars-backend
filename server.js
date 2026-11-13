@@ -96,7 +96,7 @@ if (!MONGODB_URI) {
   console.warn('Warning: MONGODB_URI not set. DB features will fail until set.');
 }
 if (!HYPIXEL_API_KEY) {
-  console.warn('Warning: HYPIXEL_API_KEY not set. Player data still works via Bordic, but the direct-Hypixel fallback will be unavailable if Bordic errors.');
+  console.warn('Warning: HYPIXEL_API_KEY not set. Player data comes from Bordic\'s cached copy instead of live Hypixel.');
 }
 const missingPersonalKeys = Object.keys(PERSONAL_KEY_ENV).filter(k => !process.env[k]);
 if (missingPersonalKeys.length) {
@@ -517,63 +517,96 @@ function isRetryable(err) {
   return !status || status === 429 || status >= 500;
 }
 
-// Get Hypixel's raw player payload (wrapped as { player }), trying Bordic first.
-// Bordic can also answer with no player (not cached yet, or never played):
-// then our own key is tried too, and if that can't help either the answer
-// stays "no player" rather than an error.
-// Bordic answers straight from its cache for players it has seen lately, but
-// has to go to Hypixel for one it hasn't, which can be slow or briefly fail.
-// That's why a player that loaded fine when added (cache warm) could later
-// fail: so Bordic gets a longer timeout and one retry before we fall back to
-// our own Hypixel key, which is a temporary one and often expired.
+// Get Hypixel's raw player payload (wrapped as { player }): live from
+// Hypixel with Milo's developer key (2026-11-13), Bordic's cached copy as the
+// backup. The key's 300 requests / 5 min are shared with Prism (Milo's
+// in-game plugins), which needs them more, so the backend only asks Hypixel
+// while plenty are left (HYPIXEL_BACKEND_FLOOR) and uses Bordic otherwise.
+// Answers are kept HYPIXEL_CACHE_MS (Hypixel also refuses the same player
+// twice within about a minute).
+const HYPIXEL_CACHE_MS = 2 * 60 * 1000;
+const HYPIXEL_CACHE_MAX = 500;
+const HYPIXEL_BACKEND_FLOOR = 100;
+const hypixelState = { remaining: null, resetAt: 0, blockedUntil: 0, keyRefused: false, lastError: null };
+const hypixelCache = new Map(); // uuid -> { at, data }
+
+function hypixelBudgetOk() {
+  if (!HYPIXEL_API_KEY || hypixelState.keyRefused) return false;
+  const now = Date.now();
+  if (now < hypixelState.blockedUntil) return false;
+  if (hypixelState.remaining != null && now < hypixelState.resetAt && hypixelState.remaining < HYPIXEL_BACKEND_FLOOR) return false;
+  return true;
+}
+
+function readHypixelLimits(headers) {
+  if (!headers) return;
+  const remaining = Number(headers['ratelimit-remaining']);
+  const reset = Number(headers['ratelimit-reset']);
+  if (Number.isFinite(remaining)) hypixelState.remaining = remaining;
+  if (Number.isFinite(reset)) hypixelState.resetAt = Date.now() + reset * 1000;
+}
+
+async function hypixelGet(path, params) {
+  try {
+    const res = await axios.get(`https://api.hypixel.net${path}`, {
+      params,
+      headers: { 'API-Key': HYPIXEL_API_KEY },
+      timeout: 10_000
+    });
+    readHypixelLimits(res.headers);
+    hypixelState.lastError = null;
+    return res.data;
+  } catch (err) {
+    const status = err.response && err.response.status;
+    readHypixelLimits(err.response && err.response.headers);
+    if (status === 403) hypixelState.keyRefused = true; // wrong/expired key: Bordic until restart
+    if (status === 429) {
+      const wait = Number(err.response.headers && err.response.headers['retry-after']) || 60;
+      hypixelState.blockedUntil = Date.now() + wait * 1000;
+    }
+    hypixelState.lastError = describeAxiosError(err);
+    throw err;
+  }
+}
+
 async function getHypixelPlayer(identifier) {
-  const uuid = String(identifier).replace(/-/g, '');
+  const uuid = String(identifier).replace(/-/g, '').toLowerCase();
+  const hit = hypixelCache.get(uuid);
+  if (hit && Date.now() - hit.at < HYPIXEL_CACHE_MS) return hit.data;
   const fromBordic = async () => {
     const data = await bordicGet('/v3/cache/hypixel', { uuid }, 15_000);
     return { player: data.player };
   };
-  const fromHypixel = async () => {
-    // Hypixel's v2 API, with the key in the API-Key header (the old
-    // /player?key= form is deprecated).
-    const hypRes = await axios.get('https://api.hypixel.net/v2/player', {
-      params: { uuid },
-      headers: { 'API-Key': HYPIXEL_API_KEY },
-      timeout: 15_000
-    });
-    return hypRes.data;
+  const remember = (data) => {
+    hypixelCache.delete(uuid);
+    hypixelCache.set(uuid, { at: Date.now(), data });
+    if (hypixelCache.size > HYPIXEL_CACHE_MAX) hypixelCache.delete(hypixelCache.keys().next().value);
+    return data;
   };
-  let bordicAnswer;
-  try {
+  let hypixelErr = null;
+  if (hypixelBudgetOk()) {
     try {
-      bordicAnswer = await fromBordic();
-    } catch (firstErr) {
-      if (!isRetryable(firstErr)) throw firstErr;
-      console.warn('Bordic hypixel/player failed, retrying once:', describeAxiosError(firstErr));
-      await new Promise(r => setTimeout(r, 1_500));
-      bordicAnswer = await fromBordic();
-    }
-  } catch (bordicErr) {
-    const bordicDetail = describeAxiosError(bordicErr);
-    console.warn('Bordic hypixel/player failed, falling back to direct Hypixel:', bordicDetail);
-    if (!HYPIXEL_API_KEY) {
-      bordicErr.bordicDetail = bordicDetail;
-      throw bordicErr;
-    }
-    try {
-      return await fromHypixel();
-    } catch (hypErr) {
-      // Surface both failure reasons - the fallback failing (often just an
-      // expired temp key) shouldn't hide why the primary source failed too.
-      hypErr.bordicDetail = bordicDetail;
-      throw hypErr;
+      const data = await hypixelGet('/v2/player', { uuid });
+      // A valid account that never joined Hypixel answers { player: null }:
+      // that's the real answer, Bordic wouldn't know more.
+      return remember({ player: data && data.player ? data.player : null });
+    } catch (err) {
+      hypixelErr = err;
+      console.warn('Hypixel player lookup failed, using Bordic:', describeAxiosError(err));
     }
   }
-  if (bordicAnswer.player || !HYPIXEL_API_KEY) return bordicAnswer;
   try {
-    const direct = await fromHypixel();
-    return direct && direct.player ? direct : bordicAnswer;
-  } catch {
-    return bordicAnswer; // the backup key is often expired: keep "no player"
+    try {
+      return remember(await fromBordic());
+    } catch (firstErr) {
+      if (!isRetryable(firstErr)) throw firstErr;
+      await new Promise(r => setTimeout(r, 1_500));
+      return remember(await fromBordic());
+    }
+  } catch (bordicErr) {
+    if (hypixelErr) bordicErr.bordicDetail = `${describeAxiosError(bordicErr)}; Hypixel: ${describeAxiosError(hypixelErr)}`;
+    else bordicErr.bordicDetail = describeAxiosError(bordicErr);
+    throw bordicErr;
   }
 }
 
@@ -1132,6 +1165,7 @@ const denick = require('./denick')({
 const status = require('./status')({
   mongoose, Sweat, LIVE, bordicGet, coralGet, denickerGet, bedlifyPing, denick, describeAxiosError,
   hypixelKey: () => HYPIXEL_API_KEY,
+  hypixelState: () => ({ ...hypixelState }),
   urchinOn: () => !!URCHIN_KEY,
   denickerOn: () => !!DENICKER_API_KEY,
   bedlifyOn: () => !!BEDLIFY_API_KEY,
