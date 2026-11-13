@@ -169,3 +169,31 @@ test('a game uploaded twice (again for a player tracked later) is one game', asy
   const unturned = [...sweat.clips, ...sweat.sameGame].filter(c => c.map === 'Unturned');
   assert.deepEqual(unturned.map(c => c.kind).sort(), ['bed', 'final']);
 });
+
+test('Match stats come out of the clip job, and older replays get them from the backfill', async () => {
+  const seen = [];
+  clips.onStats = async (rep, stats) => { seen.push([String(rep._id), stats]); };
+  try {
+    const file = Buffer.from(game());
+    const doc = await replays.Replay.create({ key: 'replays/stats.mcpr', name: 'stats.mcpr', status: 'ready', sizeBytes: file.length, players: [{ uuid: SWEAT, username: 'Sweaty' }] });
+    store.set('replays/stats.mcpr', file);
+    await clips.enqueue(doc._id);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0][0], String(doc._id));
+    assert.equal(seen[0][1].team, 'Blue');
+    assert.deepEqual(seen[0][1].players.map(p => [p.name, p.finals, p.beds]).sort(), [['Mate', 1, 1], ['Milo', 1, 1]]);
+    assert.equal((await replays.Replay.findById(doc._id).lean()).matchStatsV, 1);
+    // Clipped before Match stats came from replays: read once more for them
+    // only (no clips cut again), then left alone.
+    await replays.Replay.updateOne({ _id: doc._id }, { $unset: { matchStatsV: 1 } });
+    const clipsBefore = (await replays.Replay.findById(doc._id).lean()).clips.at;
+    assert.equal(await clips.backfill(), 1);
+    assert.equal(seen.length, 2);
+    const after = await replays.Replay.findById(doc._id).lean();
+    assert.equal(after.matchStatsV, 1);
+    assert.equal(String(after.clips.at), String(clipsBefore));
+    assert.equal(await clips.backfill(), 0);
+  } finally {
+    clips.onStats = null;
+  }
+});

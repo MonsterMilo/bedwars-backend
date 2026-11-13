@@ -15,6 +15,7 @@ const { presign, b2Config } = require('./replays');
 const clipper = require('./clipper');
 const jobs = require('./replay-jobs');
 const { SUMMARY_VERSION } = require('./game-summary');
+const { STATS_VERSION } = require('./match-replay');
 
 // Bump to clip every replay again (e.g. after changing the rules).
 // 2 (2026-11-05): teams from the prefix colour, 60 blocks instead of 40.
@@ -107,6 +108,7 @@ module.exports = function setupClips({
       const cut = found.cuts;
 
       if (found.summary) await Replay.updateOne({ _id: rep._id }, { $set: { summary: found.summary } });
+      await saveStats(rep, found.stats);
       // Replace this replay's earlier automatic clips (clips made on the
       // website stay).
       const old = await Clip.find({ replayId: rep._id, source: { $ne: 'site' } }).lean();
@@ -159,6 +161,16 @@ module.exports = function setupClips({
     }
   }
 
+  // Match stats worked out from the replay (match-replay.js), saved for its
+  // tracked players (match-stats.js, through api.onStats). The replay is
+  // marked either way, so the backfill doesn't read it again.
+  async function saveStats(rep, stats) {
+    if (stats && api.onStats) {
+      try { await api.onStats(rep, stats); } catch (err) { log.warn(`Clips: match stats for ${rep._id} not saved:`, err.message); return; }
+    }
+    await Replay.updateOne({ _id: rep._id }, { $set: { matchStatsV: STATS_VERSION } });
+  }
+
   // Replays never clipped (or clipped under older rules), oldest first.
   async function backfill(limit = 5) {
     if (!config() || mongoose.connection.readyState !== 1) return 0;
@@ -166,9 +178,10 @@ module.exports = function setupClips({
       .sort({ playedAt: 1 }).limit(limit).lean();
     for (const d of docs) enqueue(d._id);
     if (busy) await busy;
-    // Replays clipped before game summaries existed: just the summary.
+    // Replays clipped before game summaries or Match stats from replays
+    // existed: just those (one read each, no clips cut).
     if (!docs.length) {
-      const old = await Replay.find({ status: 'ready', 'clips.version': CLIP_VERSION, 'clips.error': null, $or: [{ summary: null }, { 'summary.v': { $lt: SUMMARY_VERSION } }] }, { _id: 1 })
+      const old = await Replay.find({ status: 'ready', 'clips.version': CLIP_VERSION, 'clips.error': null, $or: [{ summary: null }, { 'summary.v': { $lt: SUMMARY_VERSION } }, { matchStatsV: { $ne: STATS_VERSION }, 'players.0': { $exists: true } }] }, { _id: 1 })
         .sort({ playedAt: -1 }).limit(limit).lean();
       for (const d of old) await summarize(d._id).catch(err => log.warn('Clips: summary failed', err.message));
       return old.length;
@@ -176,19 +189,24 @@ module.exports = function setupClips({
     return docs.length;
   }
 
-  // Reads one replay for its game summary only (game-summary.js).
+  // Reads one replay for its game summary and Match stats only
+  // (game-summary.js, match-replay.js).
   async function summarize(replayId) {
     const rep = await Replay.findById(replayId).lean();
     if (!rep || rep.status !== 'ready') return null;
-    const bytes = await download(rep);
-    let out;
-    try {
-      out = await jobs.exclusive(() => jobs.run({ kind: 'summary', bytes }, { inProcess }));
-    } catch (err) {
-      // A replay that can't be read keeps an empty summary, so it isn't tried again and again.
-      out = { summary: { v: SUMMARY_VERSION, error: String(err.message || err).slice(0, 200) } };
-    }
+    // (The download waits its turn too: one replay in memory at a time. A
+    // failed download is tried again at the next backfill.)
+    const out = await jobs.exclusive(async () => {
+      const bytes = await download(rep);
+      try {
+        return await jobs.run({ kind: 'summary', bytes }, { inProcess });
+      } catch (err) {
+        // A replay that can't be read keeps an empty summary, so it isn't tried again and again.
+        return { summary: { v: SUMMARY_VERSION, error: String(err.message || err).slice(0, 200) }, stats: null };
+      }
+    });
     if (out && out.summary) await Replay.updateOne({ _id: rep._id }, { $set: { summary: out.summary } });
+    await saveStats(rep, out && out.stats);
     return out && out.summary;
   }
 
@@ -417,5 +435,6 @@ module.exports = function setupClips({
 
   // Waits until no clip is being cut.
   const idle = async () => { while (busy) await busy; };
-  return { Clip, clipReplay, enqueue, backfill, summarize, usage, idle, CLIP_VERSION };
+  const api = { Clip, clipReplay, enqueue, backfill, summarize, usage, idle, CLIP_VERSION, onStats: null };
+  return api;
 };

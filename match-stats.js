@@ -1,8 +1,14 @@
 // Match stats: how Milo's team did in a game with a tracked player
 // (kills, deaths, finals, beds, diamonds/emeralds picked up, pressure
-// time), sent by the plugin from its game recording. Kept on their own, so
-// they stay after the game's replay is deleted. Shown as "Match stats" on
-// the player's popup.
+// time). Kept on their own, so they stay after the game's replay is
+// deleted. Shown as "Match stats" on the player's popup.
+//
+// One source of truth: the server works them out from the uploaded replay
+// (match-replay.js, in the clip job), so rejoined and recovered games get
+// them too. The plugin still sends its own copy (POST below); it's kept only
+// for a game whose replay couldn't be read, and for what a replay can't
+// show (`missing`, e.g. your pressure time in old recordings without your
+// own moves). A replay's numbers are never overwritten by the plugin's.
 
 const PLAYERS_MAX = 16; // tracked players a game is for
 const TEAM_MAX = 8;     // our team's rows
@@ -20,7 +26,9 @@ module.exports = function setupMatchStats({ app, mongoose, requireWriteKey, writ
     map: String,
     durationMs: Number,
     team: String,
-    result: String,                       // 'win' | 'loss' | null
+    result: String,                       // 'win' | 'loss' | 'left' (left before the end, still in it) | null
+    missing: { type: [String], default: undefined }, // what the replay couldn't show (the plugin's value is kept)
+    source: String,                       // 'replay' (worked out here) | 'plugin' (sent by the plugin)
     players: [{
       _id: false, name: String, me: Boolean, finalDeath: Boolean,
       kills: Number, deaths: Number, finals: Number, beds: Number,
@@ -37,6 +45,7 @@ module.exports = function setupMatchStats({ app, mongoose, requireWriteKey, writ
     return Number.isFinite(n) && n >= 0 ? Math.min(n, max) : 0;
   };
 
+  const RESULTS = ['win', 'loss', 'left'];
   const publicStat = (s) => ({
     game: s.game, playedAt: s.playedAt, mode: s.mode || null, map: s.map || null, durationMs: s.durationMs || 0,
     team: s.team || null, result: s.result || null, nick: s.nick || null,
@@ -70,11 +79,20 @@ module.exports = function setupMatchStats({ app, mongoose, requireWriteKey, writ
       game, playedAt: isNaN(playedAt) ? new Date() : playedAt,
       mode: text(b.mode || s.mode, 30), map: text(b.map || s.map, 40),
       durationMs: count(s.durationMs ?? b.durationMs, 6 * 3600000),
-      team: text(s.team, 12), result: ['win', 'loss'].includes(s.result) ? s.result : null,
-      players: rows, uploadedBy: req.keyOwner
+      team: text(s.team, 12), result: RESULTS.includes(s.result) ? s.result : null,
+      players: rows, uploadedBy: req.keyOwner, source: 'plugin'
     };
     try {
       for (const t of tracked) {
+        const had = await MatchStat.findOne({ uuid: t.uuid, game }).lean();
+        if (had && had.source === 'replay') {
+          // Worked out from the replay already: only what it couldn't show.
+          const set = { ...(NAME_RE.test(t.username) ? { username: t.username } : {}), ...(t.nick && !had.nick ? { nick: t.nick } : {}) };
+          const players = fillMissing(had.players, rows, had.missing);
+          if (players) set.players = players;
+          if (Object.keys(set).length) await MatchStat.updateOne({ _id: had._id }, { $set: set });
+          continue;
+        }
         await MatchStat.updateOne(
           { uuid: t.uuid, game },
           { $set: { ...base, uuid: t.uuid, username: NAME_RE.test(t.username) ? t.username : null, nick: t.nick } },
@@ -101,5 +119,57 @@ module.exports = function setupMatchStats({ app, mongoose, requireWriteKey, writ
     }
   });
 
-  return { MatchStat };
+  // 'me.pressureMs' -> your row's pressure time from the plugin's rows (the
+  // replay couldn't show it). Null when nothing changes.
+  function fillMissing(players, from, missing) {
+    if (!Array.isArray(missing) || !missing.length || !Array.isArray(from) || !from.length) return null;
+    let changed = false;
+    const out = (players || []).map(p => ({ ...p }));
+    for (const m of missing) {
+      const [who, field] = String(m).split('.');
+      if (who !== 'me' || !NUM_FIELDS.includes(field)) continue;
+      const mine = out.find(p => p.me); const theirs = from.find(p => p.me);
+      if (mine && theirs && theirs[field] != null && mine[field] !== theirs[field]) { mine[field] = theirs[field]; changed = true; }
+    }
+    return changed ? out : null;
+  }
+
+  /**
+   * A game's stats worked out from its replay (clips.js, match-replay.js),
+   * saved for each tracked player of that upload. They replace what the
+   * plugin sent, except where the replay couldn't show something.
+   * rep: the Replay row; stats: statsFromReplay's output.
+   */
+  async function saveFromReplay(rep, stats) {
+    if (!rep || !rep.name || !stats || !Array.isArray(stats.players) || !stats.players.length) return 0;
+    const rows = stats.players.slice(0, TEAM_MAX).filter(p => NAME_RE.test(String(p.name || ''))).map(p => ({
+      name: String(p.name), me: !!p.me, finalDeath: !!p.finalDeath,
+      ...Object.fromEntries(NUM_FIELDS.map(k => [k, count(p[k], k === 'pressureMs' ? 6 * 3600000 : 100000)]))
+    }));
+    if (!rows.length) return 0;
+    const missing = Array.isArray(stats.missing) ? stats.missing.map(String).slice(0, 10) : [];
+    let saved = 0;
+    for (const t of rep.players || []) {
+      const uuid = plainUuid(t.uuid);
+      if (!UUID_RE.test(uuid)) continue;
+      const had = await MatchStat.findOne({ uuid, game: rep.name }).lean();
+      const players = (had && fillMissing(rows, had.players, missing)) || rows;
+      await MatchStat.updateOne({ uuid, game: rep.name }, {
+        $set: {
+          uuid, game: rep.name,
+          username: NAME_RE.test(String(t.username || '')) ? t.username : (had && had.username) || null,
+          nick: (NAME_RE.test(String(t.nick || '')) ? t.nick : null) || (had && had.nick) || null,
+          playedAt: rep.playedAt || (had && had.playedAt) || new Date(),
+          mode: text(rep.mode, 30) || (had && had.mode) || null, map: text(rep.map, 40) || (had && had.map) || null,
+          durationMs: count(stats.durationMs, 6 * 3600000), team: text(stats.team, 12),
+          result: RESULTS.includes(stats.result) ? stats.result : null,
+          players, missing, source: 'replay', uploadedBy: rep.uploadedBy || (had && had.uploadedBy) || null
+        }
+      }, { upsert: true });
+      saved++;
+    }
+    return saved;
+  }
+
+  return { MatchStat, saveFromReplay };
 };

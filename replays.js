@@ -92,7 +92,10 @@ module.exports = function setupReplays({
     // What clipping found (clips.js): { version, at, clips, moments, error }.
     clips: { type: mongoose.Schema.Types.Mixed, default: undefined },
     // Who played and who killed whom (game-summary.js), for the Games page.
-    summary: { type: mongoose.Schema.Types.Mixed, default: undefined }
+    summary: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    // Match stats worked out from this replay (match-replay.js STATS_VERSION;
+    // saved in match-stats.js).
+    matchStatsV: Number
   }, { timestamps: true }));
 
   const plainUuid = (u) => String(u || '').replace(/-/g, '').toLowerCase();
