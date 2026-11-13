@@ -78,15 +78,17 @@ test('summarizeGame: kills, finals, beds, who won', () => {
       { t: 4000, text: 'Sweaty had a small brain moment while fighting Mate.' }, // cosmetic wording
       { t: 5000, text: 'Milo fell into the void.' },
       { t: 6000, text: 'BED DESTRUCTION > Red Bed was destroyed by Milo!' },
-      { t: 7000, text: 'Sweaty was knocked into the void by Milo. FINAL KILL!' }
+      { t: 7000, text: 'Sweaty was knocked into the void by Milo. FINAL KILL!' },
+      { t: 8000, text: 'Sweaty, Mate' } // a list, not a kill
     ]
   });
   const row = (n) => s.teams.flatMap(t => t.players).find(p => p.name === n);
-  assert.deepEqual([row('Milo').kills, row('Milo').finals, row('Milo').deaths, row('Milo').beds], [1, 1, 1, 1]);
+  // A final kill isn't also a kill (as in Match stats and on Hypixel).
+  assert.deepEqual([row('Milo').kills, row('Milo').finals, row('Milo').deaths, row('Milo').beds], [0, 1, 1, 1]);
   assert.deepEqual([row('Mate').kills, row('Sweaty').deaths, row('Sweaty').finalDeath], [1, 2, true]);
   assert.equal(s.winner, 'Blue');
   assert.equal(s.result, 'win');
-  assert.deepEqual(s.totals, { kills: 3, finals: 1, beds: 1 });
+  assert.deepEqual(s.totals, { kills: 1, finals: 1, beds: 1 });
   assert.deepEqual(s.events.map(e => e.kind), ['kill', 'kill', 'bed', 'final']);
   assert.equal(s.events[0].firstBlood, true);
   assert.ok(!s.teams.some(t => t.players.some(p => p.name === 'Lobby')));
@@ -168,4 +170,24 @@ test('a tracked player who was nicked is matched to their nick in the game', asy
   assert.deepEqual(by, { RealSweat: 'Sweaty', Hidden: 'Mate', Elsewhere: null });
   const page = await call('GET', `/games/${g.id}`);
   assert.equal(page.json.tracked.find(p => p.username === 'RealSweat').nick, 'Sweaty');
+});
+
+test('a game uploaded before takes new players and clips without a second upload', async () => {
+  const name = '2026-11-06_12-00-00_game.mcpr';
+  assert.deepEqual((await call('POST', '/replays/attach', { body: { name, players: [{ uuid: MATE, username: 'Mate' }] } })).json, { existing: false });
+  const id = await upload(name, [{ uuid: SWEAT, username: 'Sweaty' }]);
+  const before = await replays.Replay.countDocuments({ name });
+  assert.equal((await call('POST', '/replays/attach', { key: 'potat', body: { name, players: [{ uuid: MATE, username: 'Mate' }] } })).status, 403);
+  const att = await call('POST', '/replays/attach', { body: { name, players: [{ uuid: MATE, username: 'Mate', nick: 'Matey' }, { uuid: SWEAT, username: 'Sweaty' }], clips: [{ at: 20000 }] } });
+  assert.equal(att.status, 200);
+  assert.equal(att.json.existing, true);
+  assert.equal(String(att.json.id), id);
+  assert.deepEqual(att.json.added, { players: 1, clips: 1 });
+  // The same again: nothing new.
+  const again = await call('POST', '/replays/attach', { body: { name, players: [{ uuid: MATE, username: 'Mate' }], clips: [{ at: 20400 }] } });
+  assert.deepEqual(again.json.added, { players: 0, clips: 0 });
+  assert.equal(await replays.Replay.countDocuments({ name }), before);
+  const rep = await replays.Replay.findById(id).lean();
+  assert.deepEqual(rep.players.map(p => [p.username, p.nick || null]), [['Sweaty', null], ['Mate', 'Matey']]);
+  assert.deepEqual(rep.manualClips, [20000]);
 });

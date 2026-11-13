@@ -8,8 +8,13 @@
 // messages free to change the words in between. So a line counts as a
 // death when it starts with a player's name and isn't someone talking
 // ("Steve: gg"), and its killer is the other player named in it, if any.
+// The plugin's Match stats (lib/matches/stats.js deathOf) use the same rule.
+//
+// kills are normal kills; finals are counted on their own, as on Hypixel
+// and in Match stats (a final kill isn't also a kill).
 
-const SUMMARY_VERSION = 1;
+// 2 (2026-11-13): kills no longer include finals; kill lines end in . or !
+const SUMMARY_VERSION = 2;
 const EVENTS_MAX = 600;
 const TEAM_ORDER = ['Red', 'Blue', 'Green', 'Yellow', 'Aqua', 'White', 'Pink', 'Gray'];
 
@@ -78,7 +83,8 @@ function summarizeGame({ lines = [], names = new Map(), teamOf = new Map(), self
     // A death: starts with a player, isn't them talking.
     const first = word(text.split(/\s+/)[0]);
     const victim = row(first);
-    if (!victim || /^\S+:/.test(text) || text.includes(':')) continue;
+    // (Kill lines end in "." or "!": "Steve, Alex" is a list.)
+    if (!victim || /^\S+:/.test(text) || text.includes(':') || !/[.!]$/.test(text)) continue;
     const final = /FINAL KILL!\s*$/.test(text);
     const killer = mention(text.slice(text.split(/\s+/)[0].length), victim.name);
     // Without a killer or FINAL KILL it has to read like a death ("fell
@@ -87,7 +93,7 @@ function summarizeGame({ lines = [], names = new Map(), teamOf = new Map(), self
     victim.deaths++;
     if (final) victim.finalDeath = true;
     const k = row(killer);
-    if (k && k.team !== victim.team) { k.kills++; if (final) k.finals++; }
+    if (k && k.team !== victim.team) { if (final) k.finals++; else k.kills++; }
     push({ t, kind: final ? 'final' : 'kill', victim: victim.name, team: victim.team, by: k ? k.name : null, byTeam: k ? k.team : null, firstBlood: !!k && firstBlood, text });
     if (k) firstBlood = false;
   }
@@ -127,7 +133,7 @@ function summarizeGame({ lines = [], names = new Map(), teamOf = new Map(), self
     startT, endT: ended ?? endT,
     self: { name: self.name || null, team: self.team || null },
     winner, result,
-    totals: { kills: events.filter(e => e.kind === 'kill' || e.kind === 'final').length, finals: total('finals') || events.filter(e => e.kind === 'final').length, beds: bedGone.size },
+    totals: { kills: total('kills'), finals: total('finals'), beds: bedGone.size },
     teams: sortedTeams.map(tm => ({
       team: tm.team, bedBrokenAt: tm.bedBrokenAt, eliminatedAt: tm.eliminatedAt,
       players: tm.players.map(p => ({ name: p.name, kills: p.kills, finals: p.finals, deaths: p.deaths, finalDeath: p.finalDeath, beds: p.beds, left: p.left }))

@@ -25,6 +25,7 @@ const FREE_BYTES = 10 * 1e9;
 const DOWNLOAD_LINK_SECONDS = 10 * 60;
 const MAX_BYTES = 400 * 1024 * 1024;
 const PLAYERS_MAX = 16;
+const CLIPS_MAX = 10;
 const LIST_MAX = 50;
 
 /** An S3 (SigV4) presigned URL: method on bucket/key, good for `expires` s.
@@ -113,19 +114,61 @@ module.exports = function setupReplays({
     if (r.status >= 300 && r.status !== 404) throw new Error(`B2 delete answered ${r.status}`);
   }
 
+  // What an upload says it's for: its tracked players and /clip moments.
+  const playersOf = (b) => (Array.isArray(b.players) ? b.players : []).slice(0, PLAYERS_MAX)
+    .map(p => ({ uuid: plainUuid(p?.uuid), username: String(p?.username || ''), ...(NAME_RE.test(String(p?.nick || '')) ? { nick: String(p.nick) } : {}) }))
+    .filter(p => UUID_RE.test(p.uuid) && NAME_RE.test(p.username));
+  const clipsOf = (b) => (Array.isArray(b.clips) ? b.clips : []).slice(0, CLIPS_MAX)
+    .map(c => Math.round(Number(c && typeof c === 'object' ? c.at : c)))
+    .filter(n => Number.isFinite(n) && n >= 0 && n < 6 * 60 * 60 * 1000);
+
+  // The plugin, before uploading a game again (for a player tracked later,
+  // or another /clip): when this game (same file name, same uploader) is
+  // already here, the new players and clips are added to it and nothing is
+  // uploaded. { existing: false } when it isn't (then it's uploaded as usual).
+  app.post('/replays/attach', requireWriteKey, requireFullAccess, writeLimiter, async (req, res) => {
+    const b = req.body || {};
+    const name = typeof b.name === 'string' ? b.name.slice(0, 80) : '';
+    if (!name) return res.status(400).json({ error: 'Which game is it?' });
+    try {
+      const doc = await Replay.findOne({ name, uploadedBy: req.keyOwner, status: 'ready' }).sort({ createdAt: 1 });
+      if (!doc) return res.json({ existing: false });
+      let players = 0;
+      for (const p of playersOf(b)) {
+        const had = (doc.players || []).find(x => x.uuid === p.uuid);
+        if (!had) {
+          if (doc.players.length >= PLAYERS_MAX) continue;
+          doc.players.push(p);
+          players++;
+        } else if (!had.nick && p.nick) {
+          had.nick = p.nick;
+          players++;
+        }
+      }
+      const had = Array.from(doc.manualClips || [], Number);
+      const clips = clipsOf(b).filter(at => !had.some(x => Math.abs(x - at) < 1000)).slice(0, Math.max(0, CLIPS_MAX - had.length));
+      if (clips.length) doc.manualClips = [...had, ...clips];
+      if (players || clips.length) {
+        await doc.save();
+        // Clipped again for the new players and clips (clips.js).
+        if (api.onReady) Promise.resolve().then(() => api.onReady(doc._id)).catch(err => console.warn('Replays: after-attach step failed', err.message));
+      }
+      return res.json({ existing: true, id: doc._id, added: { players, clips: clips.length } });
+    } catch (err) {
+      console.error('/replays attach error', err.message);
+      return res.status(500).json({ error: 'DB error' });
+    }
+  });
+
   // The plugin: "a game for these players" -> an upload link for it.
   app.post('/replays', requireWriteKey, requireFullAccess, writeLimiter, async (req, res) => {
     if (!config()) return res.status(503).json({ error: 'Replay storage is not set up on the server' });
     const b = req.body || {};
     const sizeBytes = Number(b.sizeBytes);
     if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_BYTES) return res.status(400).json({ error: 'Bad file size' });
-    const players = (Array.isArray(b.players) ? b.players : []).slice(0, PLAYERS_MAX)
-      .map(p => ({ uuid: plainUuid(p?.uuid), username: String(p?.username || ''), ...(NAME_RE.test(String(p?.nick || '')) ? { nick: String(p.nick) } : {}) }))
-      .filter(p => UUID_RE.test(p.uuid) && NAME_RE.test(p.username));
+    const players = playersOf(b);
     // /clip moments: a game with one goes up even with nobody tracked in it.
-    const manualClips = (Array.isArray(b.clips) ? b.clips : []).slice(0, 10)
-      .map(c => Math.round(Number(c && typeof c === 'object' ? c.at : c)))
-      .filter(n => Number.isFinite(n) && n >= 0 && n < 6 * 60 * 60 * 1000);
+    const manualClips = clipsOf(b);
     if (!players.length && !manualClips.length) return res.status(400).json({ error: 'Which tracked players is it for?' });
     const text = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
     const playedAt = new Date(b.playedAt);
