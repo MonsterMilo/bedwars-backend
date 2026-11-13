@@ -2,8 +2,8 @@
 // it, one at a time. Gets { id, msg } and answers { id, out } or { id, error }:
 //
 //   { kind: 'clips', bytes, players, manual }
-//     -> { moments, cuts: [{ bytes, durationMs }] }   (clipper.js)
-//   { kind: 'summary', bytes } -> { summary }           (game-summary.js)
+//     -> { moments, cuts: [{ bytes, durationMs }], summary, stats }   (clipper.js)
+//   { kind: 'summary', bytes } -> { summary, stats }    (game-summary.js, match-replay.js)
 //   { kind: 'cut', bytes, from, to, follow, title }
 //     -> { bytes, durationMs, people }                  (one clip, clipper.js)
 //   { kind: 'replay' | 'capture', bytes, map, source, fallbackName }
@@ -21,15 +21,16 @@ function clips(msg) {
   const found = clipper.findMoments(rec, msg.players || [], { manual: msg.manual || [] });
   const good = found.moments.filter(m => m.ok);
   const cuts = good.length ? clipper.cutClips(rec, clipper.windowsFor(good)) : [];
-  return { moments: found.moments, cuts, summary: found.summary };
+  return { moments: found.moments, cuts, summary: found.summary, stats: found.stats || null };
 }
 
-// Only the game summary (game-summary.js), for replays clipped before it
-// existed.
+// Only the game summary (game-summary.js) and Match stats (match-replay.js),
+// for replays clipped before they existed.
 function summary(msg) {
   const clipper = require('./clipper');
   const rec = clipper.openRecording(asBuffer(msg.bytes));
-  return { summary: clipper.findMoments(rec, []).summary };
+  const found = clipper.findMoments(rec, []);
+  return { summary: found.summary, stats: found.stats || null };
 }
 
 // One window cut on request (a clip made on the website): who was near the

@@ -21,17 +21,18 @@ const zlib = require('zlib');
 const { unzipSync } = require('fflate');
 const stream = require('./tmcpr-stream');
 const { summarizeGame } = require('./game-summary');
+const { statsFromReplay } = require('./match-replay');
 
 const P = {
   KEEPALIVE: 0x00, JOIN: 0x01, CHAT: 0x02, TIME: 0x03, EQUIP: 0x04, SPAWN_POS: 0x05, HEALTH: 0x06,
-  RESPAWN: 0x07, POSITION: 0x08, HELD: 0x09, ANIMATION: 0x0b, SPAWN_PLAYER: 0x0c,
+  RESPAWN: 0x07, POSITION: 0x08, HELD: 0x09, ANIMATION: 0x0b, SPAWN_PLAYER: 0x0c, COLLECT: 0x0d,
   SPAWN_OBJECT: 0x0e, SPAWN_MOB: 0x0f, SPAWN_PAINTING: 0x10, SPAWN_XP: 0x11, VELOCITY: 0x12, DESTROY: 0x13,
   ENTITY: 0x14, REL_MOVE: 0x15, LOOK: 0x16, LOOK_MOVE: 0x17, TELEPORT: 0x18, HEAD_LOOK: 0x19, STATUS: 0x1a,
   ATTACH: 0x1b, METADATA: 0x1c, EFFECT_ADD: 0x1d, EFFECT_REMOVE: 0x1e, XP: 0x1f, PROPERTIES: 0x20,
   CHUNK: 0x21, MULTI_BLOCK: 0x22, BLOCK: 0x23, CHUNK_BULK: 0x26, GAME_STATE: 0x2b,
   WINDOW_ITEMS: 0x30, SET_SLOT: 0x2f, SIGN: 0x33, TILE: 0x35, PLAYER_LIST: 0x38, ABILITIES: 0x39,
   OBJECTIVE: 0x3b, SCORE: 0x3c, DISPLAY: 0x3d, TEAMS: 0x3e, CUSTOM_PAYLOAD: 0x3f, DISCONNECT: 0x40,
-  DIFFICULTY: 0x41, BORDER: 0x44, COMPRESSION: 0x46, HEADER_FOOTER: 0x47, RESOURCE_PACK: 0x48, ENTITY_NBT: 0x49
+  DIFFICULTY: 0x41, BORDER: 0x44, TITLE: 0x45, COMPRESSION: 0x46, HEADER_FOOTER: 0x47, RESOURCE_PACK: 0x48, ENTITY_NBT: 0x49
 };
 
 // Window packets that never go in a clip.
@@ -255,6 +256,11 @@ function findMoments(recording, tracked, options = {}) {
   let dimension = 0;
   let sidebarTeam = null;
   const selfMoves = [];           // where the server put you (0x08), for old recordings
+  // For Match stats (match-replay.js): items on the ground (eid -> { id, n }),
+  // who picked them up, and the VICTORY / GAME OVER titles.
+  const items = new Map();
+  const pickups = [];
+  const titles = [];
 
   const sample = (uuid, t, pos, gone = false) => {
     let list = samples.get(uuid);
@@ -267,7 +273,8 @@ function findMoments(recording, tracked, options = {}) {
   forEachPacket(recording, (t, id, bytes, at, bodyAt, end) => {
     if (t > lastT) lastT = t;
     if (id !== P.CHAT && id !== P.JOIN && id !== P.POSITION && id !== P.SPAWN_PLAYER && id !== P.REL_MOVE && id !== P.LOOK_MOVE &&
-        id !== P.TELEPORT && id !== P.DESTROY && id !== P.PLAYER_LIST && id !== P.TEAMS && id !== P.RESPAWN) return;
+        id !== P.TELEPORT && id !== P.DESTROY && id !== P.PLAYER_LIST && id !== P.TEAMS && id !== P.RESPAWN &&
+        id !== P.SPAWN_OBJECT && id !== P.METADATA && id !== P.COLLECT && id !== P.TITLE) return;
     const r = new Reader(bytes, bodyAt, end);
     try {
       switch (id) {
@@ -284,6 +291,7 @@ function findMoments(recording, tracked, options = {}) {
           dimension = dim;
           for (const [eid, e] of live) if (eid !== selfId) sample(e.uuid, t, null, true);
           for (const eid of [...live.keys()]) if (eid !== selfId) live.delete(eid);
+          items.clear();
           break;
         }
         case P.SPAWN_PLAYER: {
@@ -308,7 +316,42 @@ function findMoments(recording, tracked, options = {}) {
         }
         case P.DESTROY: {
           const cnt = r.varint();
-          for (let q = 0; q < cnt; q++) { const eid = r.varint(); const e = live.get(eid); if (e) { sample(e.uuid, t, e.pos, true); live.delete(eid); } }
+          for (let q = 0; q < cnt; q++) { const eid = r.varint(); items.delete(eid); const e = live.get(eid); if (e) { sample(e.uuid, t, e.pos, true); live.delete(eid); } }
+          break;
+        }
+        case P.SPAWN_OBJECT: {
+          // A dropped item (type 2); what it is comes in its metadata.
+          const eid = r.varint();
+          if (r.i8() === 2) items.set(eid, { id: null, n: 1 });
+          break;
+        }
+        case P.METADATA: {
+          const it = items.get(r.varint());
+          if (!it) break;
+          // Entry 10, a slot: the item stack.
+          for (;;) {
+            const h = r.u8();
+            if (h === 0x7f) break;
+            const type = h >> 5;
+            if ((h & 0x1f) === 10 && type === 5) { const itemId = r.i16(); if (itemId >= 0) { it.id = itemId; it.n = r.u8(); } break; }
+            if (type === 0) r.skip(1); else if (type === 1) r.skip(2); else if (type === 2 || type === 3) r.skip(4);
+            else if (type === 4) r.skipStr(); else if (type === 5) r.skipSlot(); else if (type === 6 || type === 7) r.skip(12); else break;
+          }
+          break;
+        }
+        case P.COLLECT: {
+          // Someone picked an item up (only seen near you, or by you).
+          const eid = r.varint(); const by = r.varint();
+          const it = items.get(eid);
+          if (!it || it.id == null) break;
+          items.delete(eid);
+          const e = live.get(by);
+          if (pickups.length < 20000) pickups.push({ t, id: it.id, n: it.n, self: by === selfId, uuid: e ? e.uuid : null });
+          break;
+        }
+        case P.TITLE: {
+          const action = r.varint();
+          if (action === 0 || action === 1) { const text = chatText(r.str()).trim(); if (text && titles.length < 200) titles.push({ t, text }); }
           break;
         }
         case P.PLAYER_LIST: {
@@ -519,7 +562,11 @@ function findMoments(recording, tracked, options = {}) {
   }
 
   const summary = summarizeGame({ lines, names, teamOf, self: { name: selfName, team: selfTeam }, startT, endT: lastT });
-  return { self: { name: selfName, team: selfTeam, uuid: selfUuid }, moments, summary };
+  let stats = null;
+  try {
+    stats = statsFromReplay({ names, teamOf, self: { name: selfName, team: selfTeam, uuid: selfUuid, seen: !!selfSeen }, samples, pickups, titles, lines, summary, startT, endT: lastT });
+  } catch { /* no stats then; clips and the summary still count */ }
+  return { self: { name: selfName, team: selfTeam, uuid: selfUuid }, moments, summary, stats };
 }
 
 // --- Writing ---
