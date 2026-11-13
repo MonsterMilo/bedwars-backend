@@ -518,8 +518,8 @@ function isRetryable(err) {
 }
 
 // Get Hypixel's raw player payload (wrapped as { player }): live from
-// Hypixel with Milo's developer key (2026-11-13), Bordic's cached copy as the
-// backup. The key's 300 requests / 5 min are shared with Prism (Milo's
+// Hypixel with Milo's developer key (2026-11-13) for callers with a site key,
+// Bordic's cached copy as the backup and for everyone else. The key's 300 requests / 5 min are shared with Prism (Milo's
 // in-game plugins), which needs them more, so the backend only asks Hypixel
 // while plenty are left (HYPIXEL_BACKEND_FLOOR) and uses Bordic otherwise.
 // Answers are kept HYPIXEL_CACHE_MS (Hypixel also refuses the same player
@@ -569,41 +569,56 @@ async function hypixelGet(path, params) {
   }
 }
 
-async function getHypixelPlayer(identifier) {
+// live: the caller has a site key (Milo 2026-11-13). Without one (anonymous
+// visitors, the Discord bot) the key is never spent: Bordic's copy, or a
+// live answer someone with a key already fetched when that one is newer.
+const HYPIXEL_KEEP_MS = 60 * 60 * 1000; // live answers kept this long for keyless lookups
+
+function bordicTime(v) {
+  const n = Number(v) || 0;
+  return n > 0 && n < 1e12 ? n * 1000 : n; // seconds or ms
+}
+
+async function getHypixelPlayer(identifier, { live = false } = {}) {
   const uuid = String(identifier).replace(/-/g, '').toLowerCase();
   const hit = hypixelCache.get(uuid);
-  if (hit && Date.now() - hit.at < HYPIXEL_CACHE_MS) return hit.data;
+  const fresh = hit && Date.now() - hit.at < HYPIXEL_CACHE_MS ? hit : null;
+  const kept = hit && Date.now() - hit.at < HYPIXEL_KEEP_MS ? hit : null;
+  if (fresh) return fresh.data;
   const fromBordic = async () => {
-    const data = await bordicGet('/v3/cache/hypixel', { uuid }, 15_000);
-    return { player: data.player };
-  };
-  const remember = (data) => {
-    hypixelCache.delete(uuid);
-    hypixelCache.set(uuid, { at: Date.now(), data });
-    if (hypixelCache.size > HYPIXEL_CACHE_MAX) hypixelCache.delete(hypixelCache.keys().next().value);
-    return data;
+    let data;
+    try {
+      data = await bordicGet('/v3/cache/hypixel', { uuid }, 15_000);
+    } catch (firstErr) {
+      if (!isRetryable(firstErr)) throw firstErr;
+      await new Promise(r => setTimeout(r, 1_500));
+      data = await bordicGet('/v3/cache/hypixel', { uuid }, 15_000);
+    }
+    return { data: { player: data.player }, at: bordicTime(data.lastUpdated) };
   };
   let hypixelErr = null;
-  if (hypixelBudgetOk()) {
+  if (live && hypixelBudgetOk()) {
     try {
       const data = await hypixelGet('/v2/player', { uuid });
       // A valid account that never joined Hypixel answers { player: null }:
       // that's the real answer, Bordic wouldn't know more.
-      return remember({ player: data && data.player ? data.player : null });
+      const answer = { player: data && data.player ? data.player : null };
+      hypixelCache.delete(uuid);
+      hypixelCache.set(uuid, { at: Date.now(), data: answer });
+      if (hypixelCache.size > HYPIXEL_CACHE_MAX) hypixelCache.delete(hypixelCache.keys().next().value);
+      return answer;
     } catch (err) {
       hypixelErr = err;
       console.warn('Hypixel player lookup failed, using Bordic:', describeAxiosError(err));
     }
   }
   try {
-    try {
-      return remember(await fromBordic());
-    } catch (firstErr) {
-      if (!isRetryable(firstErr)) throw firstErr;
-      await new Promise(r => setTimeout(r, 1_500));
-      return remember(await fromBordic());
-    }
+    const b = await fromBordic();
+    // Our own live answer wins when it's newer than Bordic's copy.
+    if (kept && kept.data.player && (!b.data.player || kept.at > b.at)) return kept.data;
+    return b.data;
   } catch (bordicErr) {
+    if (kept) return kept.data;
     if (hypixelErr) bordicErr.bordicDetail = `${describeAxiosError(bordicErr)}; Hypixel: ${describeAxiosError(hypixelErr)}`;
     else bordicErr.bordicDetail = describeAxiosError(bordicErr);
     throw bordicErr;
@@ -906,7 +921,7 @@ app.get('/mojang/:username', validName('username'), publicProxyLimiter, proxyLim
 // --- Hypixel proxy: get player data by UUID (via Bordic, falling back to Hypixel directly) ---
 app.get('/player/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter, async (req, res) => {
   try {
-    const data = await getHypixelPlayer(req.params.uuid);
+    const data = await getHypixelPlayer(req.params.uuid, { live: !!keyOwner(req) });
     return res.json(data);
   } catch (err) {
     console.error('/player error', err.message, err.bordicDetail || '');
@@ -1782,7 +1797,7 @@ app.get('/stats/uuid/:uuid', validUuid('uuid'), publicProxyLimiter, proxyLimiter
   try {
     const uuid = req.params.uuid;
 
-    const { player } = await getHypixelPlayer(uuid);
+    const { player } = await getHypixelPlayer(uuid, { live: !!keyOwner(req) });
     if (!player) {
       return res.status(404).json({ error: 'No Hypixel data' });
     }
