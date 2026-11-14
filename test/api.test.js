@@ -85,7 +85,13 @@ test('guest denick reports are capped at 5 a minute and expire', async () => {
   for (let i = 0; i < 6; i++) codes.push((await call('POST', '/activity/denick', { body: { mode: 'nick', query: 'abc' } })).status);
   assert.deepEqual(codes, [204, 204, 204, 204, 204, 429]);
   assert.equal((await call('POST', '/activity/denick', { key: 'potat-key', body: { mode: 'nick', query: 'abc' } })).status, 204);
-  const log = await call('GET', '/activity?action=denick.search&limit=1', { key: 'admin-key' });
+  // The log is written after the 204 goes out, so wait for it to land.
+  let log;
+  for (let i = 0; i < 40; i++) {
+    log = await call('GET', '/activity?action=denick.search&limit=1', { key: 'admin-key' });
+    if (log.json.entries.length) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
   assert.ok(new Date(log.json.entries[0].expiresAt) > new Date(Date.now() + 300 * 86400000));
 });
 
